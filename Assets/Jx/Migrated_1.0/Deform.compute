@@ -1,0 +1,158 @@
+// Deform.compute
+// Surface mesh deformation from PBD particle positions
+// Ported from deform.comp, tetrahedral_deform.comp,
+//             recalculate_normals.comp, normalize_normals.comp
+// Target: Unity 2022.3 | Built-in RP | SM 6.5
+
+#pragma kernel DirectDeform        // deform.comp          (same-res: 1-to-1 index map)
+#pragma kernel TetDeform           // tetrahedral_deform.comp (barycentric skinning)
+#pragma kernel RecalcNormals       // recalculate_normals.comp
+#pragma kernel NormalizeNormals    // normalize_normals.comp
+
+#pragma target 5.0
+
+#define GROUP_SIZE 32
+
+// ─── Deform info UBO ──────────────────────────────────────────────────────────
+cbuffer DeformInfoUBO : register(b0)
+{
+    uint  _VertexCount;
+    uint  _IndexCount;
+    float2 _DeformPad;
+};
+
+// ─── PBD position source ──────────────────────────────────────────────────────
+struct PbdPositions
+{
+    float3 predict;
+    float  _pad0;
+    float3 delta;
+    float  _pad1;
+};
+
+struct Tetrahedral
+{
+    uint4  indices;
+    float  restVolume;
+    float3 _pad;
+};
+
+// Barycentric skinning info (one entry per high-res vertex)
+struct SkinningInfo
+{
+    float3 weights;   // barycentric coords for tets[0..2]; w4 = 1 - (x+y+z)
+    uint   tetIndex;
+};
+
+// ─── Buffers ──────────────────────────────────────────────────────────────────
+RWStructuredBuffer<float3>    _VertexPositions : register(u0);
+RWStructuredBuffer<float3>    _VertexNormals   : register(u1);
+
+StructuredBuffer<PbdPositions>  _Positions     : register(t0); // read-only predict
+StructuredBuffer<uint>          _OrigIndices   : register(t1); // DirectDeform: vertex→particle map
+StructuredBuffer<SkinningInfo>  _Skinning      : register(t2); // TetDeform: barycentric data
+StructuredBuffer<Tetrahedral>   _Tetrahedrals  : register(t3); // TetDeform: tet index data
+
+// Index buffer for RecalcNormals (shared with face iteration)
+StructuredBuffer<uint>          _Indices       : register(t4);
+
+// Normal accumulation uses int bit-cast atomic (same pattern as delta)
+RWBuffer<int> _NormalInt : register(u2); // size = vertexCount * 3
+
+void AtomicAddNormal(uint vtxIdx, float3 v)
+{
+    uint base = vtxIdx * 3;
+    int dummy;
+    InterlockedAdd(_NormalInt[base + 0], asint(v.x), dummy);
+    InterlockedAdd(_NormalInt[base + 1], asint(v.y), dummy);
+    InterlockedAdd(_NormalInt[base + 2], asint(v.z), dummy);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: DirectDeform
+// Equivalent of deform.comp
+// Used when the render mesh and tet mesh share the same resolution.
+// _OrigIndices[renderVertIdx] = tetMesh particle index.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void DirectDeform(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _VertexCount) return;
+
+    _VertexPositions[i] = _Positions[_OrigIndices[i]].predict;
+    // Normals are zeroed before RecalcNormals is dispatched (C# side)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: TetDeform
+// Equivalent of tetrahedral_deform.comp
+// Used when the render mesh is higher resolution than the tet mesh.
+// Interpolates render vertex position from barycentric coordinates within
+// its containing tetrahedron.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void TetDeform(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _VertexCount) return;
+
+    SkinningInfo skin = _Skinning[i];
+    uint4  tets = _Tetrahedrals[skin.tetIndex].indices;
+    float3 w    = skin.weights;
+    float  w4   = 1.0 - (w.x + w.y + w.z);
+
+    _VertexPositions[i] =
+        _Positions[tets.x].predict * w.x +
+        _Positions[tets.y].predict * w.y +
+        _Positions[tets.z].predict * w.z +
+        _Positions[tets.w].predict * w4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: RecalcNormals
+// Equivalent of recalculate_normals.comp
+// One thread per face (triangle). Accumulates face normal into the
+// three corner vertices using atomic int add (bit-cast float trick).
+// C# must zero _NormalInt before dispatch and set _VertexNormals to zero.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void RecalcNormals(uint3 id : SV_DispatchThreadID)
+{
+    uint faceBase = id.x * 3;
+    if (faceBase >= _IndexCount) return;
+
+    uint i0 = _Indices[faceBase + 0];
+    uint i1 = _Indices[faceBase + 1];
+    uint i2 = _Indices[faceBase + 2];
+
+    float3 e1     = _VertexPositions[i1] - _VertexPositions[i0];
+    float3 e2     = _VertexPositions[i2] - _VertexPositions[i0];
+    float3 normal = normalize(cross(e1, e2));
+
+    AtomicAddNormal(i0, normal);
+    AtomicAddNormal(i1, normal);
+    AtomicAddNormal(i2, normal);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: NormalizeNormals
+// Equivalent of normalize_normals.comp
+// One thread per vertex. Reads accumulated int normals, converts to float,
+// normalizes, and writes the final smooth normal.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void NormalizeNormals(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _VertexCount) return;
+
+    uint   base = i * 3;
+    float3 n    = float3(
+        asfloat(_NormalInt[base + 0]),
+        asfloat(_NormalInt[base + 1]),
+        asfloat(_NormalInt[base + 2])
+    );
+
+    _VertexNormals[i] = normalize(n);
+}

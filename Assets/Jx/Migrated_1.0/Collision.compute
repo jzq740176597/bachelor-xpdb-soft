@@ -1,0 +1,158 @@
+// Collision.compute
+// Static mesh collision detection + constraint solve
+// Ported from static_collision_detection.comp + collision_constraint.comp
+// Target: Unity 2022.3 | Built-in RP | SM 6.5
+
+#pragma kernel DetectCollisions
+#pragma kernel SolveCollisions
+
+#pragma target 5.0
+
+#define GRAVITY         -9.82
+#define EPSILON         0.000001
+#define MAX_CONSTRAINTS 10000
+#define GROUP_SIZE      32
+
+// ─── Structs ──────────────────────────────────────────────────────────────────
+struct Particle
+{
+    float3 position;
+    float  _pad0;
+    float3 velocity;
+    float  invMass;
+};
+
+struct PbdPositions
+{
+    float3 predict;
+    float  _pad0;
+    float3 delta;
+    float  _pad1;
+};
+
+// ColConstraint: matches C# struct with explicit padding to match std140
+struct ColConstraint
+{
+    float3 orig;          // 12 bytes
+    uint   particleIndex; // 4  bytes  → 16 bytes
+    float3 normal;        // 12 bytes
+    float  _pad;          // 4  bytes  → 32 bytes total
+};
+
+// ─── Collision detection UBO ──────────────────────────────────────────────────
+cbuffer ColDetectionUBO : register(b0)
+{
+    float _ColDeltaTime;
+    uint  _TriCount;
+    float2 _ColPad;
+};
+
+// ─── Per-body info UBO ────────────────────────────────────────────────────────
+cbuffer InfoUBO : register(b1)
+{
+    uint _ParticleCount;
+    uint _EdgeCount;
+    uint _TetCount;
+    uint _InfoPad;
+};
+
+// ─── Collision geometry (static mesh) ────────────────────────────────────────
+StructuredBuffer<float3>  _ColPositions : register(t0);  // read-only
+StructuredBuffer<uint>    _TriIndices   : register(t1);  // read-only
+
+// ─── Per-body particle data ───────────────────────────────────────────────────
+RWStructuredBuffer<Particle>    _Particles   : register(u0);
+RWStructuredBuffer<PbdPositions> _Positions  : register(u1);
+
+// ─── Collision output ─────────────────────────────────────────────────────────
+RWStructuredBuffer<uint>          _ColSize        : register(u2); // single uint counter
+RWStructuredBuffer<ColConstraint> _ColConstraints : register(u3);
+
+// ─── Delta int buffer (shared with SoftBodySim kernels) ───────────────────────
+RWBuffer<int> _DeltaInt : register(u4);
+
+void AtomicAddDelta(uint particleIdx, float3 v)
+{
+    uint base = particleIdx * 3;
+    int dummy;
+    InterlockedAdd(_DeltaInt[base + 0], asint(v.x), dummy);
+    InterlockedAdd(_DeltaInt[base + 1], asint(v.y), dummy);
+    InterlockedAdd(_DeltaInt[base + 2], asint(v.z), dummy);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: DetectCollisions
+// Equivalent of static_collision_detection.comp
+// One thread per triangle of the collision mesh.
+// Inner loop walks all particles to find penetrations (same as original).
+// NOTE: For many-body or large meshes this O(tris × particles) loop becomes
+// the bottleneck — upgrade to a GPU spatial hash if needed.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void DetectCollisions(uint3 id : SV_DispatchThreadID)
+{
+    uint triIdx = id.x;
+    if (triIdx >= _TriCount) return;
+
+    uint baseIdx = triIdx * 3;
+
+    float3 v0 = _ColPositions[_TriIndices[baseIdx + 0]];
+    float3 e1 = _ColPositions[_TriIndices[baseIdx + 1]] - v0;
+    float3 e2 = _ColPositions[_TriIndices[baseIdx + 2]] - v0;
+
+    for (uint p = 0; p < _ParticleCount; p++)
+    {
+        float3 p0 = _Positions[p].predict;
+        // Project a step ahead to catch fast-moving particles
+        float3 p1 = p0 + (_Particles[p].velocity + float3(0.0, _ColDeltaTime * GRAVITY, 0.0)) * _ColDeltaTime;
+
+        float3 dir   = normalize(p1 - p0);
+        float3 pvec  = cross(dir, e2);
+        float  det   = dot(e1, pvec);
+
+        if (det > -EPSILON && det < EPSILON) continue;
+
+        float  invDet = 1.0 / det;
+        float3 tvec   = p0 - v0;
+        float  u      = dot(tvec, pvec) * invDet;
+        if (u < 0.0 || u > 1.0) continue;
+
+        float3 qvec = cross(tvec, e1);
+        float  v    = dot(dir, qvec) * invDet;
+        if (v < 0.0 || u + v > 1.0) continue;
+
+        float t = dot(e2, qvec) * invDet;
+        if (t <= length(p1 - p0))
+        {
+            uint slot;
+            InterlockedAdd(_ColSize[0], 1, slot);
+            if (slot >= MAX_CONSTRAINTS) break;
+
+            _ColConstraints[slot].orig          = v0;
+            _ColConstraints[slot].particleIndex = p;
+            _ColConstraints[slot].normal        = normalize(cross(e1, e2));
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: SolveCollisions
+// Equivalent of collision_constraint.comp
+// One thread per detected collision constraint.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void SolveCollisions(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ColSize[0]) return;
+
+    uint   pIdx    = _ColConstraints[i].particleIndex;
+    float3 pos     = _Positions[pIdx].predict;
+    float3 orig    = _ColConstraints[i].orig;
+    float3 normal  = _ColConstraints[i].normal;
+
+    float gradient = min(dot(pos - orig, normal), 0.0);
+    float3 corrVec = -gradient * normal;
+
+    AtomicAddDelta(pIdx, corrVec);
+}
