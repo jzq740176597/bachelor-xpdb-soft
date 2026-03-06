@@ -1,0 +1,136 @@
+#include "Commons.hlsl"
+// Collision.compute — FIX: _DeltaInt → _DeltaBytes (RWByteAddressBuffer)
+// Static mesh collision detection + constraint solve
+// Ported from static_collision_detection.comp + collision_constraint.comp
+// Target: Unity 2022.3 | Built-in RP | SM 6.5
+
+// DetectCollisions: one thread per particle vs all floor tris
+// SolveCollisions:  one thread per constraint slot
+
+#pragma kernel DetectCollisions
+#pragma kernel SolveCollisions
+
+//#pragma target 6.0
+//#pragma exclude_renderers d3d11
+//#pragma only_renderers d3d12 vulkan
+
+#define GRAVITY         -9.82
+#define EPSILON         0.000001
+#define MAX_CONSTRAINTS 10000
+#define GROUP_SIZE      32
+
+// ─── Structs ──────────────────────────────────────────────────────────────────
+struct Particle
+{
+    float3 position;
+    float  _pad0;
+    float3 velocity;
+    float  invMass;
+};
+
+struct PbdPositions
+{
+    float3 predict;
+    float  _pad0;
+    float3 delta;
+    float  _pad1;
+};
+
+// ColConstraint: matches C# struct with explicit padding to match std140
+struct ColConstraint
+{
+    float3 orig;          // 12 bytes
+    uint   particleIndex; // 4  bytes  → 16 bytes
+    float3 normal;        // 12 bytes
+    float  _pad;          // 4  bytes  → 32 bytes total
+};
+
+float _ColDeltaTime;
+uint  _TriCount;
+uint  _ParticleCount;
+
+// ─── Collision geometry (static mesh) ────────────────────────────────────────
+StructuredBuffer<float3>  _ColPositions : register(t0);  // read-only
+StructuredBuffer<uint>    _TriIndices   : register(t1);  // read-only
+
+// ─── Per-body particle data ───────────────────────────────────────────────────
+RWStructuredBuffer<Particle>    _Particles   : register(u0);
+RWStructuredBuffer<PbdPositions> _Positions  : register(u1);
+
+// ─── Collision output ─────────────────────────────────────────────────────────
+RWStructuredBuffer<uint>          _ColSize        : register(u2); // single uint counter
+RWStructuredBuffer<ColConstraint> _ColConstraints : register(u3);
+
+// FIX: true float atomics
+RWByteAddressBuffer _DeltaBytes;
+
+void AddDelta(uint idx, float3 v)
+{
+    uint b = idx * 12u;
+    //_DeltaBytes.InterlockedAddFloat(b,      v.x);
+    //_DeltaBytes.InterlockedAddFloat(b + 4u, v.y);
+    //_DeltaBytes.InterlockedAddFloat(b + 8u, v.z);
+    CustomInterlockedAddFloat(_DeltaBytes, b, v.x);
+    CustomInterlockedAddFloat(_DeltaBytes, b + 4u, v.y);
+    CustomInterlockedAddFloat(_DeltaBytes, b + 8u, v.z);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: DetectCollisions
+// Equivalent of static_collision_detection.comp
+// One thread per triangle of the collision mesh.
+// Inner loop walks all particles to find penetrations (same as original).
+// NOTE: For many-body or large meshes this O(tris × particles) loop becomes
+// the bottleneck — upgrade to a GPU spatial hash if needed.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void DetectCollisions(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount) return;
+
+    float3 pos = _Positions[i].predict;
+
+    for (uint t = 0; t < _TriCount; t++)
+    {
+        float3 v0 = _ColPositions[_TriIndices[t*3+0]];
+        float3 v1 = _ColPositions[_TriIndices[t*3+1]];
+        float3 v2 = _ColPositions[_TriIndices[t*3+2]];
+
+        float3 n = normalize(cross(v1-v0, v2-v0));
+        float  d = dot(pos - v0, n);
+
+        if (d < 0.0)
+        {
+            uint slot;
+            InterlockedAdd(_ColSize[0], 1u, slot);
+            if (slot < MAX_CONSTRAINTS)
+            {
+                _ColConstraints[slot].orig          = pos - n * d;
+                _ColConstraints[slot].particleIndex = i;
+                _ColConstraints[slot].normal        = n;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: SolveCollisions
+// Equivalent of collision_constraint.comp
+// One thread per detected collision constraint.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void SolveCollisions(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ColSize[0] || i >= MAX_CONSTRAINTS) return;
+
+    uint   pi = _ColConstraints[i].particleIndex;
+    float  w  = _Particles[pi].invMass;
+    if (w <= 0.0) return;
+
+    float3 n = _ColConstraints[i].normal;
+    float  d = dot(_Positions[pi].predict - _ColConstraints[i].orig, n);
+    if (d < 0.0)
+        AddDelta(pi, -n * d);
+}
