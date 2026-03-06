@@ -22,7 +22,7 @@ namespace XPBD
 
 		// 12 procedural vertices per tet = 4 faces × 3 verts
 		// matches vkCmdDraw(12, tetCount, 0, 0)
-		private const int VERTS_PER_TET = 12;
+		const int VERTS_PER_TET = 12;
 
 		void Update()
 		{
@@ -61,7 +61,7 @@ namespace XPBD
 		// Reflection-free access to the manager's body list
 		// In a production project expose a public IReadOnlyList<SoftBodyGPUState>
 		// on SoftBodySimulationManager instead.
-		private System.Collections.Generic.List<SoftBodyGPUState> GetActiveBodies()
+		System.Collections.Generic.List<SoftBodyGPUState> GetActiveBodies()
 		{
 			// Access via the internal list — add a public accessor to
 			// SoftBodySimulationManager if preferred.

@@ -17,38 +17,46 @@ using UnityEngine;
 namespace XPBD
 {
 	[RequireComponent(typeof(MeshFilter))]
-	public class SoftBodyComponent : MonoBehaviour
+	public sealed class SoftBodyComponent : MonoBehaviour
 	{
-		[Header("Assets")]
-		public TetrahedralMeshAsset TetMeshAsset;
+		#region Inspector
+		[SerializeField]
+		TetrahedralMeshAsset tetMeshAsset;
+		#endregion
 
-		[Header("Simulation")]
-		[Tooltip("True = barycentric skinning from low-res tet mesh to high-res render mesh (tetrahedral_deform path). " +
-				 "False = 1-to-1 index map (deform path), tet mesh and render mesh must share the same resolution.")]
-		public bool UseTetDeformation = true;
+		#region Imp
+		//[Header("Manager Reference")]
+		SoftBodySimulationManager manager;
+		SoftBodyGPUState _state;
+		MeshFilter _meshFilter;
+		//bool inited => _state != null;
+		bool valid => tetMeshAsset;
+		#endregion
 
-		[Header("Material Override")]
-		public Color Tint = new Color(1f, 0.15f, 0.05f, 1f);
-		[Range(0f, 1f)] public float Roughness = 0.5f;
-		[Range(0f, 1f)] public float Metallic = 0.0f;
-
-		[Header("Manager Reference")]
-		public SoftBodySimulationManager Manager;
-
-		private SoftBodyGPUState _state;
-		private MeshFilter _meshFilter;
-
-		void Start()
+		#region Pub
+		public void Init(TetrahedralMeshAsset tetMeshAsset)
 		{
-			if (TetMeshAsset == null)
+			if (tetMeshAsset == null)
 			{
 				Debug.LogError("[XPBD] No TetrahedralMeshAsset assigned.", this);
 				return;
 			}
-			if (Manager == null)
+			this.tetMeshAsset = tetMeshAsset;
+		}
+		#endregion
+
+		#region Unity
+		void Start()
+		{
+			if (!valid)
 			{
-				Manager = FindObjectOfType<SoftBodySimulationManager>();
-				if (Manager == null)
+				Debug.LogError("SoftBodyComponent invalid!", this);
+				return;
+			}
+			if (manager == null)
+			{
+				manager = FindObjectOfType<SoftBodySimulationManager>();
+				if (manager == null)
 				{
 					Debug.LogError("[XPBD] SoftBodySimulationManager not found in scene.", this);
 					return;
@@ -63,14 +71,14 @@ namespace XPBD
 			}
 			_meshFilter = GetComponent<MeshFilter>();
 
-			// Instantiate the render mesh so each body has its own copy
-			Mesh renderMesh = Instantiate(_meshFilter.sharedMesh);
-			renderMesh.MarkDynamic(); // hint to Unity: vertices change every frame
-			_meshFilter.mesh = renderMesh;
-
 			// Convert ScriptableObject data to GPU structs
-			var data = TetMeshAsset;
+			var data = tetMeshAsset;
 
+			// Instantiate the render mesh so each body has its own copy
+			Mesh renderMesh = Instantiate(data.RenderMesh);
+			renderMesh.MarkDynamic(); // hint to Unity: vertices change every frame
+			_meshFilter.sharedMesh = renderMesh;
+			//------------------->> Data associated with @tetMeshAsset----------
 			var particles = new GPUParticle[data.Particles.Length];
 			for (int i = 0; i < particles.Length; i++)
 			{
@@ -100,7 +108,7 @@ namespace XPBD
 			GPUSkinningInfo[] skinning = null;
 			uint[] origIndices = null;
 
-			if (UseTetDeformation)
+			if (tetMeshAsset.UseTetDeformation)
 			{
 				skinning = new GPUSkinningInfo[data.Skinning.Length];
 				for (int i = 0; i < skinning.Length; i++)
@@ -113,13 +121,8 @@ namespace XPBD
 			{
 				origIndices = data.OrigIndices;
 			}
-
-			_state = new SoftBodyGPUState();
-			_state.Tint = Tint;
-			_state.Roughness = Roughness;
-			_state.Metallic = Metallic;
-
-			_state.Init(
+			//-------------------<<----------
+			_state = new SoftBodyGPUState(
 				particles,
 				edges,
 				tets,
@@ -128,31 +131,19 @@ namespace XPBD
 				renderMesh.triangles,
 				origIndices,
 				skinning,
-				UseTetDeformation,
-				renderMesh,
-				Tint
+				tetMeshAsset.UseTetDeformation,
+				renderMesh
 			);
 
-			Manager.AddBody(_state);
+			manager.AddBody(_state);
 		}
 
 		void OnDestroy()
 		{
-			if (_state != null && Manager != null)
-				Manager.RemoveBody(_state);
+			Destroy(_meshFilter.sharedMesh); // clean up the instantiated render mesh - jzq [3/6/2026]
+			if (_state != null && manager != null)
+				manager.RemoveBody(_state);
 		}
-
-#if UNITY_EDITOR
-		// Sync Inspector changes to active simulation at runtime
-		void OnValidate()
-		{
-			if (_state != null)
-			{
-				_state.Tint = Tint;
-				_state.Roughness = Roughness;
-				_state.Metallic = Metallic;
-			}
-		}
-#endif
+		#endregion
 	}
 }

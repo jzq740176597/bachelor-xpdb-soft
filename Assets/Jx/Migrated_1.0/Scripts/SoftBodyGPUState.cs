@@ -32,78 +32,83 @@ using UnityEngine;
 
 namespace XPBD
 {
-	public class SoftBodyGPUState : IDisposable
+	public sealed class SoftBodyGPUState : IDisposable
 	{
 		// ── Physics buffers ─────────────────────────────────────────────────
-		public ComputeBuffer ParticleBuffer;    // GPUParticle[]
-		public ComputeBuffer PositionsBuffer;   // GPUPbdPositions[]
-		public ComputeBuffer EdgeBuffer;        // GPUEdge[]
-		public ComputeBuffer TetBuffer;         // GPUTetrahedral[]
+		public readonly ComputeBuffer ParticleBuffer;    // GPUParticle[]
+		public readonly ComputeBuffer PositionsBuffer;   // GPUPbdPositions[]
+		public readonly ComputeBuffer EdgeBuffer;        // GPUEdge[]
+		public readonly ComputeBuffer TetBuffer;         // GPUTetrahedral[]
 
 		// FIX 1: Raw byte buffer → RWByteAddressBuffer in HLSL → InterlockedAddFloat
 		// Size bytes = ParticleCount * 3 floats * 4 bytes
-		public ComputeBuffer DeltaBytesBuffer;
+		public readonly ComputeBuffer DeltaBytesBuffer;
 
 		// ── Deform buffers ───────────────────────────────────────────────────
 		// Either direct index map (same-res) or barycentric skinning (tet deform)
-		public ComputeBuffer OrigIndicesBuffer; // uint[]          — DirectDeform path
-		public ComputeBuffer SkinningBuffer;    // GPUSkinningInfo[] — TetDeform path
-		public bool UseTetDeformation;
+		public readonly ComputeBuffer OrigIndicesBuffer; // uint[]          — DirectDeform path
+		public readonly ComputeBuffer SkinningBuffer;    // GPUSkinningInfo[] — TetDeform path
+		public readonly bool UseTetDeformation;
 
 		// Render mesh vertex/normal streams — written by Deform kernels
-		public ComputeBuffer VertexPositionsBuffer; // float3[]
-		public ComputeBuffer VertexNormalsBuffer;   // float3[]
-		public ComputeBuffer MeshIndicesBuffer;     // uint[] (face index buffer for RecalcNormals)
-													// FIX 1: Same fix for normal accumulation
-													// Size bytes = VertexCount * 3 floats * 4 bytes
-		public ComputeBuffer NormalBytesBuffer;
+		public readonly ComputeBuffer VertexPositionsBuffer; // float3[]
+		public readonly ComputeBuffer VertexNormalsBuffer;   // float3[]
+		public readonly ComputeBuffer MeshIndicesBuffer;     // uint[] (face index buffer for RecalcNormals)
+															 // FIX 1: Same fix for normal accumulation
+															 // Size bytes = VertexCount * 3 floats * 4 bytes
+		public readonly ComputeBuffer NormalBytesBuffer;
 
 		// ── Collision buffers ────────────────────────────────────────────────
-		public ComputeBuffer ColSizeBuffer;       // uint[1]  — atomic counter
-		public ComputeBuffer ColConstraintBuffer; // GPUColConstraint[MAX_CONSTRAINTS]
+		public readonly ComputeBuffer ColSizeBuffer;       // uint[1]  — atomic counter
+		public readonly ComputeBuffer ColConstraintBuffer; // GPUColConstraint[MAX_CONSTRAINTS]
 
 		// ── Counts ───────────────────────────────────────────────────────────
-		public int ParticleCount;
-		public int EdgeCount;
-		public int TetCount;
-		public int VertexCount;
-		public int IndexCount;   // triangle index count (= faceCount * 3)
+		public readonly int ParticleCount;
+		public readonly int EdgeCount;
+		public readonly int TetCount;
+		public readonly int VertexCount;
+		public readonly int IndexCount;   // triangle index count (= faceCount * 3)
 
 		// ── Render material (per-body tint / roughness / metallic) ───────────
-		public Color Tint = new Color(1f, 0.15f, 0.05f, 1f);
-		public float Roughness = 0.5f;
-		public float Metallic = 0.0f;
+		//public Color Tint = new Color(1f, 0.15f, 0.05f, 1f);
+		//public float Roughness = 0.5f;
+		//public float Metallic = 0.0f;
 
 		// Used by SoftBodySimulationManager to hold the Unity Mesh
-		public Mesh RenderMesh;
-		public bool Active;
+		public readonly Mesh RenderMesh;
+		public bool Active
+		{
+			get; private set;
+		}
 
 		// FIX 2: Pre-allocated readback arrays — allocated ONCE in Init, reused every frame.
 		// Manager calls: body.VertexPositionsBuffer.GetData(body.ReadbackPos);
-		public Vector3[] ReadbackPos;
-		public Vector3[] ReadbackNrm;
+		public readonly Vector3[] ReadbackPos;
+		public readonly Vector3[] ReadbackNrm;
 
 		// Pre-allocated zero bytes for clearing NormalBytesBuffer — no per-frame alloc.
-		private byte[] _zeroNormalBytes;
+		readonly byte[] _zeroNormalBytes;
 		// ── Initialize ───────────────────────────────────────────────────────
 		/// <summary>
 		/// Allocate all GPU buffers and upload initial data.
 		/// Called once by SoftBodySimulationManager when spawning a body.
 		/// </summary>
-		public void Init(
+		public SoftBodyGPUState(
 			GPUParticle[] particles,
 			GPUEdge[] edges,
 			GPUTetrahedral[] tets,
+			//>
 			Vector3[] initialVertexPositions,
 			Vector2[] uvs,
 			int[] triangleIndices,
+			//<
 			// Deform path A — same-res direct index map
 			uint[] origIndices,
 			// Deform path B — tetrahedral barycentric skinning
 			GPUSkinningInfo[] skinning,
 			bool useTetDeformation,
-			Mesh renderMesh,
-			Color tint)
+			Mesh renderMesh
+			)
 		{
 			ParticleCount = particles.Length;
 			EdgeCount = edges.Length;
@@ -112,7 +117,6 @@ namespace XPBD
 			IndexCount = triangleIndices.Length;
 			UseTetDeformation = useTetDeformation;
 			RenderMesh = renderMesh;
-			Tint = tint;
 			Active = true;
 
 			// Physics
@@ -172,7 +176,7 @@ namespace XPBD
 			=> NormalBytesBuffer.SetData(_zeroNormalBytes);
 
 		// ── Helpers ───────────────────────────────────────────────────────────
-		private static ComputeBuffer Upload<T>(T[] data, int stride) where T : struct
+		static ComputeBuffer Upload<T>(T[] data, int stride) where T : struct
 		{
 			var b = new ComputeBuffer(data.Length, stride);
 			b.SetData(data);
@@ -199,7 +203,7 @@ namespace XPBD
 			SafeRelease(ColConstraintBuffer);
 		}
 
-		private static void SafeRelease(ComputeBuffer buf)
+		static void SafeRelease(ComputeBuffer buf)
 		{
 			if (buf != null && buf.IsValid())
 				buf.Release();

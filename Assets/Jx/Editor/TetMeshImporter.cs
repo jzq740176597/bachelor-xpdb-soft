@@ -164,6 +164,8 @@ namespace XPBD.Editor
 						I3 = tetData.tets[i].i3,
 						RestVolume = tetData.tets[i].restVolume
 					};
+				// [3/6/2026 jzq]
+				asset.RenderMesh = unityMesh;
 				// --- Deform path ---
 				if (_useTetDeform)
 				{

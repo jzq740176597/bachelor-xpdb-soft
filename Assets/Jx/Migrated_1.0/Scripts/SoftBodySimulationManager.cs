@@ -28,7 +28,7 @@ namespace XPBD
 	{
 		// ── Constants (matching original Renderer.h) ──────────────────────────
 		public const int MAX_COLLISION_CONSTRAINTS = 10000;
-		private const int GROUP_SIZE = 32;
+		const int GROUP_SIZE = 32;
 
 		// ── Inspector: Compute shaders ────────────────────────────────────────
 		[Header("Compute Shaders")]
@@ -49,29 +49,29 @@ namespace XPBD
 
 		// ── Inspector: Rendering ──────────────────────────────────────────────
 		[Header("Rendering")]
-		public Material SoftBodyMaterial;       // SoftBodyPBR.shader instance
+		//public Material SoftBodyMaterial;       // SoftBodyPBR.shader instance
 		public Light DirectionalLight;       // used to compute light matrix
 		public float ShadowOrthoSize = 15f;
 		public float ShadowLightDist = 15f;
 
 		// ── Private state ─────────────────────────────────────────────────────
-		private readonly List<SoftBodyGPUState> _bodies = new();
+		readonly List<SoftBodyGPUState> _bodies = new();
 
 		// Collision geometry buffers (static — uploaded once)
-		private ComputeBuffer _colPositionsBuffer;
-		private ComputeBuffer _colIndicesBuffer;
-		private int _colTriCount;
+		ComputeBuffer _colPositionsBuffer;
+		ComputeBuffer _colIndicesBuffer;
+		int _colTriCount;
 
 		// Kernel IDs — cached at startup
-		private int _kPresolve, _kPostsolve, _kStretch, _kVolume;
-		private int _kDetect, _kSolve;
-		private int _kDirectDeform, _kTetDeform, _kRecalcNormals, _kNormalizeNormals;
+		int _kPresolve, _kPostsolve, _kStretch, _kVolume;
+		int _kDetect, _kSolve;
+		int _kDirectDeform, _kTetDeform, _kRecalcNormals, _kNormalizeNormals;
 
 		// Fixed-timestep accumulator (matches Timer::passedFixedDT)
-		private float _timeAccum, _fixedDT, _subDT;
+		float _timeAccum, _fixedDT, _subDT;
 
 		// ── MaterialPropertyBlock per body ────────────────────────────────────
-		private MaterialPropertyBlock _mpb;
+		MaterialPropertyBlock _mpb;
 
 		// ─────────────────────────────────────────────────────────────────────
 		void Awake()
@@ -99,7 +99,7 @@ namespace XPBD
 			_timeAccum += Time.deltaTime;
 
 			// Update light matrix on shader each frame (matches renderImGui lightDir update)
-			UpdateLightMatrix();
+			//UpdateLightMatrix();
 
 			if (_timeAccum >= _fixedDT)
 			{
@@ -128,7 +128,7 @@ namespace XPBD
 			}
 
 			// ── Draw bodies every render frame ────────────────────────────────
-			DrawAllBodies();
+			//DrawAllBodies();
 		}
 
 		// ─────────────────────────────────────────────────────────────────────
@@ -152,10 +152,10 @@ namespace XPBD
 		// Dispatch: Collision Detection
 		// Mirrors Renderer::detectCollisions()
 		// ─────────────────────────────────────────────────────────────────────
-		private void ResetColSize(SoftBodyGPUState body)
+		void ResetColSize(SoftBodyGPUState body)
 			=> body.ColSizeBuffer.SetData(new uint[] { 0 });
 
-		private void DispatchDetectCollisions(SoftBodyGPUState body)
+		void DispatchDetectCollisions(SoftBodyGPUState body)
 		{
 			var cs = CollisionCS;
 			cs.SetFloat("_ColDeltaTime", _fixedDT);
@@ -184,7 +184,7 @@ namespace XPBD
 		// Barriers: Unity inserts UAV hazard barriers automatically between
 		//           Dispatch calls on ComputeBuffers (DX11/DX12 behavior).
 		// ─────────────────────────────────────────────────────────────────────
-		private void DispatchPhysicsSubstep(SoftBodyGPUState body)
+		void DispatchPhysicsSubstep(SoftBodyGPUState body)
 		{
 			var cs = SoftBodySimCS;
 
@@ -229,7 +229,7 @@ namespace XPBD
 			cs.Dispatch(_kPostsolve, Ceil(body.ParticleCount), 1, 1);
 		}
 
-		private void BindPhysicsBuffers(ComputeShader cs, int kernel, SoftBodyGPUState body)
+		void BindPhysicsBuffers(ComputeShader cs, int kernel, SoftBodyGPUState body)
 		{
 			cs.SetBuffer(kernel, "_Particles", body.ParticleBuffer);
 			cs.SetBuffer(kernel, "_Positions", body.PositionsBuffer);
@@ -242,7 +242,7 @@ namespace XPBD
 		// Dispatch: Mesh Deformation
 		// Mirrors Renderer::deformMesh()
 		// ─────────────────────────────────────────────────────────────────────
-		private void DispatchDeform(SoftBodyGPUState body)
+		void DispatchDeform(SoftBodyGPUState body)
 		{
 			var cs = DeformCS;
 			cs.SetInt("_VertexCount", body.VertexCount);
@@ -298,61 +298,59 @@ namespace XPBD
 		// Graphics.DrawMesh replaces vkCmdDrawIndexed; MaterialPropertyBlock
 		// replaces push constants (tint, roughness, metallic).
 		// ─────────────────────────────────────────────────────────────────────
-		private void DrawAllBodies()
-		{
-#if false
-			if (SoftBodyMaterial == null)
-				return;
+		//void DrawAllBodies()
+		//{
+		//	if (SoftBodyMaterial == null)
+		//		return;
 
-			foreach (var body in _bodies)
-			{
-				if (!body.Active || body.RenderMesh == null)
-					continue;
+		//	foreach (var body in _bodies)
+		//	{
+		//		if (!body.Active || body.RenderMesh == null)
+		//			continue;
 
-				_mpb.SetColor("_Tint", body.Tint);
-				_mpb.SetFloat("_Roughness", body.Roughness);
-				_mpb.SetFloat("_Metallic", body.Metallic);
+		//		_mpb.SetColor("_Tint", body.Tint);
+		//		_mpb.SetFloat("_Roughness", body.Roughness);
+		//		_mpb.SetFloat("_Metallic", body.Metallic);
 
-				Graphics.DrawMesh(
-					body.RenderMesh,
-					Matrix4x4.identity,
-					SoftBodyMaterial,
-					0,          // layer
-					null,       // camera (null = all cameras)
-					0,          // submesh
-					_mpb
-				);
-			}
-#endif
-		}
+		//		Graphics.DrawMesh(
+		//			body.RenderMesh,
+		//			Matrix4x4.identity,
+		//			SoftBodyMaterial,
+		//			0,          // layer
+		//			null,       // camera (null = all cameras)
+		//			0,          // submesh
+		//			_mpb
+		//		);
+		//	}
+		//}
 
 		// ─────────────────────────────────────────────────────────────────────
 		// Light matrix update (matches renderImGui light matrix calculation)
 		// ─────────────────────────────────────────────────────────────────────
-		private void UpdateLightMatrix()
-		{
-			if (DirectionalLight == null || SoftBodyMaterial == null)
-				return;
+		//void UpdateLightMatrix()
+		//{
+		//	if (DirectionalLight == null /*|| SoftBodyMaterial == null*/)
+		//		return;
 
-			Vector3 lightDir = DirectionalLight.transform.forward;
-			Matrix4x4 lightProj = Matrix4x4.Ortho(
-				-ShadowOrthoSize, ShadowOrthoSize,
-				-ShadowOrthoSize, ShadowOrthoSize,
-				0.1f, 100f);
+		//	Vector3 lightDir = DirectionalLight.transform.forward;
+		//	Matrix4x4 lightProj = Matrix4x4.Ortho(
+		//		-ShadowOrthoSize, ShadowOrthoSize,
+		//		-ShadowOrthoSize, ShadowOrthoSize,
+		//		0.1f, 100f);
 
-			Matrix4x4 lightView = Matrix4x4.LookAt(
-				-lightDir * ShadowLightDist,
-				Vector3.zero,
-				Vector3.up);
+		//	Matrix4x4 lightView = Matrix4x4.LookAt(
+		//		-lightDir * ShadowLightDist,
+		//		Vector3.zero,
+		//		Vector3.up);
 
-			SoftBodyMaterial.SetMatrix("_LightMatrix", lightProj * lightView);
-			SoftBodyMaterial.SetVector("_LightDir", new Vector4(lightDir.x, lightDir.y, lightDir.z, 0));
-		}
+		//	//SoftBodyMaterial.SetMatrix("_LightMatrix", lightProj * lightView);
+		//	//SoftBodyMaterial.SetVector("_LightDir", new Vector4(lightDir.x, lightDir.y, lightDir.z, 0));
+		//}
 
 		// ─────────────────────────────────────────────────────────────────────
 		// Collision mesh upload (replaces createResources() floor setup)
 		// ─────────────────────────────────────────────────────────────────────
-		private void UploadCollisionMesh()
+		void UploadCollisionMesh()
 		{
 			if (CollisionMesh == null)
 			{
@@ -375,7 +373,7 @@ namespace XPBD
 		// ─────────────────────────────────────────────────────────────────────
 		// Kernel ID caching
 		// ─────────────────────────────────────────────────────────────────────
-		private void CacheKernelIDs()
+		void CacheKernelIDs()
 		{
 			_kPresolve = SoftBodySimCS.FindKernel("Presolve");
 			_kPostsolve = SoftBodySimCS.FindKernel("Postsolve");
@@ -394,6 +392,6 @@ namespace XPBD
 		// ─────────────────────────────────────────────────────────────────────
 		// Utility
 		// ─────────────────────────────────────────────────────────────────────
-		private static int Ceil(int count) => (count + GROUP_SIZE - 1) / GROUP_SIZE;
+		static int Ceil(int count) => (count + GROUP_SIZE - 1) / GROUP_SIZE;
 	}
 }

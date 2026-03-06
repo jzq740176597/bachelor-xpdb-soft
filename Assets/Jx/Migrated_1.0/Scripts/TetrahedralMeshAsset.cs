@@ -1,3 +1,6 @@
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
 // TetrahedralMeshAsset.cs
 // ScriptableObject that holds all per-body tetrahedral mesh data.
 // Replaces the ResourceManager + TetrahedralMeshData loading pipeline.
@@ -63,6 +66,11 @@ namespace XPBD
 				 "One entry per high-res render vertex.")]
 		public SkinningData[] Skinning;
 
+		// [3/6/2026 jzq]
+		public Mesh RenderMesh; ///reference to the high-res render mesh
+		//[Tooltip("True = barycentric skinning from low-res tet mesh to high-res render mesh (tetrahedral_deform path). " +
+		//"False = 1-to-1 index map (deform path), tet mesh and render mesh must share the same resolution.")]
+		public bool UseTetDeformation => Skinning != null && Skinning.Length > 0;
 #if UNITY_EDITOR
 		// Convenience: compute rest volumes and edge rest lengths from particle positions.
 		// Call this from an Editor tool after populating Particles / Edges / Tetrahedrals.
@@ -97,4 +105,16 @@ namespace XPBD
 		}
 #endif
 	}
+#if UNITY_EDITOR
+	[CustomEditor(typeof(TetrahedralMeshAsset))]
+	class TetrahedralMeshAssetEditor : Editor
+	{
+		public override void OnInspectorGUI()
+		{
+			EditorGUI.BeginDisabledGroup(true);
+			base.OnInspectorGUI();
+			EditorGUI.EndDisabledGroup();
+		}
+	}
+#endif
 }

@@ -1,0 +1,7 @@
+route map / milestone
+1. CAN dyn create multiple spheres (other model)
+2. create & prepare asset(*) automatic & By Go components info <eg: render, meshFilter>
+3. create panel-gui : sim <dyn-change & Apply in runtime> for the orig-vulkan project!
+4. support collision <multi - static & unity rigidbody, Collider>
+5. support connections <ray, hit => create joint /connections > / pick interactive by mouse
+5. support cut
