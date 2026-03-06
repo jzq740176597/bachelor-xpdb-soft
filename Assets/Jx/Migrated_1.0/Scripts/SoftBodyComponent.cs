@@ -31,9 +31,21 @@ namespace XPBD
 		MeshFilter _meshFilter;
 		//bool inited => _state != null;
 		bool valid => tetMeshAsset;
+		bool visible
+		{
+			get => GetComponent<Renderer>().enabled;
+			set => GetComponent<Renderer>().enabled = value;
+		}
+		// [3/7/2026 jzq]
+		internal void InternalOnDeformed()
+		{
+			//gameObject.SetActive(true);
+			visible = true;
+		}
 		#endregion
 
 		#region Pub
+		public SoftBodyGPUState State => _state;
 		public void Init(TetrahedralMeshAsset tetMeshAsset)
 		{
 			if (tetMeshAsset == null)
@@ -72,6 +84,7 @@ namespace XPBD
 					Debug.LogError($"'{name}' : transform.lossyScale SHOULD be (1,1,1)");
 					transform.SetLossyScale(Vector3.one);
 				}
+				visible = false;
 			}
 			_meshFilter = GetComponent<MeshFilter>();
 
@@ -81,14 +94,20 @@ namespace XPBD
 			_meshFilter.sharedMesh = renderMesh;
 			//
 			_state = new SoftBodyGPUState(tetMeshAsset, mat, renderMesh);
-			manager.AddBody(_state);
+			manager.AddBody(/*_state*/this);
 		}
 
 		void OnDestroy()
 		{
 			Destroy(_meshFilter.sharedMesh); // clean up the instantiated render mesh - jzq [3/6/2026]
 			if (_state != null && manager != null)
-				manager.RemoveBody(_state);
+			{
+				{// [3/7/2026 jzq]
+					_state.Dispose();
+					_state = null;
+				}
+				manager.RemoveBody(/*_state*/this);
+			}
 		}
 		#endregion
 	}

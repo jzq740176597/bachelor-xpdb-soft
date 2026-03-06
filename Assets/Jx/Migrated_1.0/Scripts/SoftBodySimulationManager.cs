@@ -48,14 +48,14 @@ namespace XPBD
 		[Range(0f, 1f)] public float VolumeCompliance = 0.0f;
 
 		// ── Inspector: Rendering ──────────────────────────────────────────────
-		[Header("Rendering")]
+		//[Header("Rendering")]
 		//public Material SoftBodyMaterial;       // SoftBodyPBR.shader instance
-		public Light DirectionalLight;       // used to compute light matrix
-		public float ShadowOrthoSize = 15f;
-		public float ShadowLightDist = 15f;
+		//public Light DirectionalLight;       // used to compute light matrix
+		//public float ShadowOrthoSize = 15f;
+		//public float ShadowLightDist = 15f;
 
 		// ── Private state ─────────────────────────────────────────────────────
-		readonly List<SoftBodyGPUState> _bodies = new();
+		readonly List</*SoftBodyGPUState*/SoftBodyComponent> _bodies = new();
 
 		// Collision geometry buffers (static — uploaded once)
 		ComputeBuffer _colPositionsBuffer;
@@ -84,7 +84,11 @@ namespace XPBD
 		void OnDestroy()
 		{
 			foreach (var b in _bodies)
-				b.Dispose();
+			{
+				Destroy(b);
+				//b.Dispose();
+			}
+			//_bodies.Clear();
 			_colPositionsBuffer?.Release();
 			_colIndicesBuffer?.Release();
 		}
@@ -108,19 +112,19 @@ namespace XPBD
 				// ── Collision detection (once per fixed step, before substeps) ──
 				foreach (var body in _bodies)
 				{
-					if (!body.Active)
+					if (!body/*.Active*/)
 						continue;
-					ResetColSize(body);
-					DispatchDetectCollisions(body);
+					ResetColSize(body.State);
+					DispatchDetectCollisions(body.State);
 				}
 
 				// ── Physics substeps ───────────────────────────────────────────
 				foreach (var body in _bodies)
 				{
-					if (!body.Active)
+					if (!body/*.Active*/)
 						continue;
 					for (int s = 0; s < SubSteps; s++)
-						DispatchPhysicsSubstep(body);
+						DispatchPhysicsSubstep(body.State);
 
 					// ── Mesh deformation (once per fixed step) ─────────────────
 					DispatchDeform(body);
@@ -136,15 +140,15 @@ namespace XPBD
 		// ─────────────────────────────────────────────────────────────────────
 
 		/// <summary>Register a new soft body for simulation.</summary>
-		public void AddBody(SoftBodyGPUState body)
+		public void AddBody(/*SoftBodyGPUState*/SoftBodyComponent body)
 		{
 			_bodies.Add(body);
 		}
 
 		/// <summary>Remove and dispose a soft body.</summary>
-		public void RemoveBody(SoftBodyGPUState body)
+		public void RemoveBody(/*SoftBodyGPUState*/SoftBodyComponent body)
 		{
-			body.Dispose();
+			//body.Dispose();
 			_bodies.Remove(body);
 		}
 
@@ -242,8 +246,10 @@ namespace XPBD
 		// Dispatch: Mesh Deformation
 		// Mirrors Renderer::deformMesh()
 		// ─────────────────────────────────────────────────────────────────────
-		void DispatchDeform(SoftBodyGPUState body)
+		void DispatchDeform(/*SoftBodyGPUState*/SoftBodyComponent bodyCmp)
 		{
+			var body = bodyCmp.State;
+			//
 			var cs = DeformCS;
 			cs.SetInt("_VertexCount", body.VertexCount);
 			cs.SetInt("_IndexCount", body.IndexCount);
@@ -291,6 +297,8 @@ namespace XPBD
 			body.RenderMesh.vertices = body.ReadbackPos;
 			body.RenderMesh.normals = body.ReadbackNrm;
 			body.RenderMesh.RecalculateBounds();
+			// [3/7/2026 jzq]
+			bodyCmp.InternalOnDeformed();
 		}
 
 		// ─────────────────────────────────────────────────────────────────────

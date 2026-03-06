@@ -77,10 +77,10 @@ namespace XPBD
 
 		// Used by SoftBodySimulationManager to hold the Unity Mesh
 		public readonly Mesh RenderMesh;
-		public bool Active
-		{
-			get; private set;
-		}
+		//public bool Active
+		//{
+		//	get; private set;
+		//}
 
 		// FIX 2: Pre-allocated readback arrays — allocated ONCE in Init, reused every frame.
 		// Manager calls: body.VertexPositionsBuffer.GetData(body.ReadbackPos);
@@ -177,7 +177,7 @@ namespace XPBD
 			IndexCount = triangleIndices.Length;
 			UseTetDeformation = tetMeshAsset.UseTetDeformation;
 			RenderMesh = renderMesh;
-			Active = true;
+			//Active = true;
 			//
 			GPUParticle[] particles = null;
 			if (!mat.isIdentity) //deep-clone & transform
@@ -264,7 +264,7 @@ namespace XPBD
 		// ── IDisposable ───────────────────────────────────────────────────────
 		public void Dispose()
 		{
-			Active = false;
+			//Active = false;
 			SafeRelease(ParticleBuffer);
 			SafeRelease(PositionsBuffer);
 			SafeRelease(EdgeBuffer);
