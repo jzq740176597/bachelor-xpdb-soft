@@ -40,9 +40,9 @@ namespace XPBD
 		public ComputeBuffer EdgeBuffer;        // GPUEdge[]
 		public ComputeBuffer TetBuffer;         // GPUTetrahedral[]
 
-        // FIX 1: Raw byte buffer → RWByteAddressBuffer in HLSL → InterlockedAddFloat
-        // Size bytes = ParticleCount * 3 floats * 4 bytes
-        public ComputeBuffer DeltaBytesBuffer;
+		// FIX 1: Raw byte buffer → RWByteAddressBuffer in HLSL → InterlockedAddFloat
+		// Size bytes = ParticleCount * 3 floats * 4 bytes
+		public ComputeBuffer DeltaBytesBuffer;
 
 		// ── Deform buffers ───────────────────────────────────────────────────
 		// Either direct index map (same-res) or barycentric skinning (tet deform)
@@ -54,9 +54,9 @@ namespace XPBD
 		public ComputeBuffer VertexPositionsBuffer; // float3[]
 		public ComputeBuffer VertexNormalsBuffer;   // float3[]
 		public ComputeBuffer MeshIndicesBuffer;     // uint[] (face index buffer for RecalcNormals)
-        // FIX 1: Same fix for normal accumulation
-        // Size bytes = VertexCount * 3 floats * 4 bytes
-        public ComputeBuffer NormalBytesBuffer;
+													// FIX 1: Same fix for normal accumulation
+													// Size bytes = VertexCount * 3 floats * 4 bytes
+		public ComputeBuffer NormalBytesBuffer;
 
 		// ── Collision buffers ────────────────────────────────────────────────
 		public ComputeBuffer ColSizeBuffer;       // uint[1]  — atomic counter
@@ -78,13 +78,13 @@ namespace XPBD
 		public Mesh RenderMesh;
 		public bool Active;
 
-        // FIX 2: Pre-allocated readback arrays — allocated ONCE in Init, reused every frame.
-        // Manager calls: body.VertexPositionsBuffer.GetData(body.ReadbackPos);
-        public Vector3[] ReadbackPos;
-        public Vector3[] ReadbackNrm;
+		// FIX 2: Pre-allocated readback arrays — allocated ONCE in Init, reused every frame.
+		// Manager calls: body.VertexPositionsBuffer.GetData(body.ReadbackPos);
+		public Vector3[] ReadbackPos;
+		public Vector3[] ReadbackNrm;
 
-        // Pre-allocated zero bytes for clearing NormalBytesBuffer — no per-frame alloc.
-        private byte[] _zeroNormalBytes;
+		// Pre-allocated zero bytes for clearing NormalBytesBuffer — no per-frame alloc.
+		private byte[] _zeroNormalBytes;
 		// ── Initialize ───────────────────────────────────────────────────────
 		/// <summary>
 		/// Allocate all GPU buffers and upload initial data.
@@ -115,28 +115,28 @@ namespace XPBD
 			Tint = tint;
 			Active = true;
 
-            // Physics
-            ParticleBuffer  = Upload(particles, GPUStrides.Particle);
-            EdgeBuffer      = Upload(edges,     GPUStrides.Edge);
-            TetBuffer       = Upload(tets,      GPUStrides.Tetrahedral);
+			// Physics
+			ParticleBuffer = Upload(particles, GPUStrides.Particle);
+			EdgeBuffer = Upload(edges, GPUStrides.Edge);
+			TetBuffer = Upload(tets, GPUStrides.Tetrahedral);
 
 			// PbdPositions: predict = initial position, delta = 0
 			var pbdPos = new GPUPbdPositions[ParticleCount];
 			for (int i = 0; i < ParticleCount; i++)
 				pbdPos[i].predict = particles[i].position;
-            PositionsBuffer = Upload(pbdPos, GPUStrides.PbdPositions);
+			PositionsBuffer = Upload(pbdPos, GPUStrides.PbdPositions);
 
-            // FIX 1: ComputeBufferType.Raw → RWByteAddressBuffer in shader
-            // Count = number of 4-byte dwords.  ParticleCount*3 floats = ParticleCount*3 dwords.
-            DeltaBytesBuffer = new ComputeBuffer(
-                ParticleCount * 3, 4, ComputeBufferType.Raw);
-            DeltaBytesBuffer.SetData(new int[ParticleCount * 3]); // zero on creation
+			// FIX 1: ComputeBufferType.Raw → RWByteAddressBuffer in shader
+			// Count = number of 4-byte dwords.  ParticleCount*3 floats = ParticleCount*3 dwords.
+			DeltaBytesBuffer = new ComputeBuffer(
+				ParticleCount * 3, 4, ComputeBufferType.Raw);
+			DeltaBytesBuffer.SetData(new int[ParticleCount * 3]); // zero on creation
 
-            // Deform
-            if (!useTetDeformation)
-                OrigIndicesBuffer = Upload(origIndices, sizeof(uint));
-            else
-                SkinningBuffer = Upload(skinning, GPUStrides.SkinningInfo);
+			// Deform
+			if (!useTetDeformation)
+				OrigIndicesBuffer = Upload(origIndices, sizeof(uint));
+			else
+				SkinningBuffer = Upload(skinning, GPUStrides.SkinningInfo);
 
 			// Vertex / normal streams (RWStructuredBuffer<float3>)
 			// stride = 12 bytes (float3), use stride override
@@ -144,15 +144,15 @@ namespace XPBD
 			VertexNormalsBuffer = new ComputeBuffer(VertexCount, 3 * sizeof(float));
 			VertexPositionsBuffer.SetData(initialVertexPositions);
 
-            MeshIndicesBuffer = Upload(
-                Array.ConvertAll(triangleIndices, x => (uint)x), sizeof(uint));
+			MeshIndicesBuffer = Upload(
+				Array.ConvertAll(triangleIndices, x => (uint) x), sizeof(uint));
 
-            // FIX 1: Raw byte buffer for normals (same reason)
-            NormalBytesBuffer = new ComputeBuffer(
-                VertexCount * 3, 4, ComputeBufferType.Raw);
-            // Pre-allocated zero array — reused by ClearNormalBytes() every fixed step
-            _zeroNormalBytes = new byte[VertexCount * 3 * 4];
-            NormalBytesBuffer.SetData(_zeroNormalBytes);
+			// FIX 1: Raw byte buffer for normals (same reason)
+			NormalBytesBuffer = new ComputeBuffer(
+				VertexCount * 3, 4, ComputeBufferType.Raw);
+			// Pre-allocated zero array — reused by ClearNormalBytes() every fixed step
+			_zeroNormalBytes = new byte[VertexCount * 3 * 4];
+			NormalBytesBuffer.SetData(_zeroNormalBytes);
 
 			// ── Collision buffers ─────────────────────────────────────────────
 			ColSizeBuffer = new ComputeBuffer(1, sizeof(uint));
@@ -161,23 +161,23 @@ namespace XPBD
 			ColConstraintBuffer = new ComputeBuffer(
 				SoftBodySimulationManager.MAX_COLLISION_CONSTRAINTS,
 				GPUStrides.ColConstraint);
-            // FIX 2: allocate readback arrays once
-            ReadbackPos = new Vector3[VertexCount];
-            ReadbackNrm = new Vector3[VertexCount];
+			// FIX 2: allocate readback arrays once
+			ReadbackPos = new Vector3[VertexCount];
+			ReadbackNrm = new Vector3[VertexCount];
 		}
 
-        // Called once per fixed step before RecalcNormals dispatch.
-        // Uses the pre-allocated _zeroNormalBytes — no heap allocation.
-        public void ClearNormalBytes()
-            => NormalBytesBuffer.SetData(_zeroNormalBytes);
+		// Called once per fixed step before RecalcNormals dispatch.
+		// Uses the pre-allocated _zeroNormalBytes — no heap allocation.
+		public void ClearNormalBytes()
+			=> NormalBytesBuffer.SetData(_zeroNormalBytes);
 
-        // ── Helpers ───────────────────────────────────────────────────────────
-        private static ComputeBuffer Upload<T>(T[] data, int stride) where T : struct
-        {
-            var b = new ComputeBuffer(data.Length, stride);
-            b.SetData(data);
-            return b;
-        }
+		// ── Helpers ───────────────────────────────────────────────────────────
+		private static ComputeBuffer Upload<T>(T[] data, int stride) where T : struct
+		{
+			var b = new ComputeBuffer(data.Length, stride);
+			b.SetData(data);
+			return b;
+		}
 
 
 		// ── IDisposable ───────────────────────────────────────────────────────
@@ -188,13 +188,13 @@ namespace XPBD
 			SafeRelease(PositionsBuffer);
 			SafeRelease(EdgeBuffer);
 			SafeRelease(TetBuffer);
-            SafeRelease(DeltaBytesBuffer);
+			SafeRelease(DeltaBytesBuffer);
 			SafeRelease(OrigIndicesBuffer);
 			SafeRelease(SkinningBuffer);
 			SafeRelease(VertexPositionsBuffer);
 			SafeRelease(VertexNormalsBuffer);
 			SafeRelease(MeshIndicesBuffer);
-            SafeRelease(NormalBytesBuffer);
+			SafeRelease(NormalBytesBuffer);
 			SafeRelease(ColSizeBuffer);
 			SafeRelease(ColConstraintBuffer);
 		}
