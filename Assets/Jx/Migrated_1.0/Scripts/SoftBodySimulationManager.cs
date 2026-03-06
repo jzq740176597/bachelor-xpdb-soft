@@ -128,7 +128,7 @@ namespace XPBD
 			}
 
 			// ── Draw bodies every render frame ────────────────────────────────
-			//DrawAllBodies();
+			DrawAllBodies();
 		}
 
 		// ─────────────────────────────────────────────────────────────────────
@@ -172,7 +172,7 @@ namespace XPBD
 			cs.SetBuffer(_kDetect, "_ColConstraints", body.ColConstraintBuffer);
 			//cs.SetBuffer(_kDetect, "_DeltaInt",        body.DeltaIntBuffer);
 
-			cs.Dispatch(_kDetect, Ceil(body.ParticleCount), 1, 1);
+			cs.Dispatch(_kDetect, Ceil(_colTriCount), 1, 1);
 			// NOTE: Original dispatches over triCount; inner loop walks particles.
 			// Kept identical to preserve collision correctness.
 		}
@@ -298,9 +298,9 @@ namespace XPBD
 		// Graphics.DrawMesh replaces vkCmdDrawIndexed; MaterialPropertyBlock
 		// replaces push constants (tint, roughness, metallic).
 		// ─────────────────────────────────────────────────────────────────────
-#if false
 		private void DrawAllBodies()
 		{
+#if false
 			if (SoftBodyMaterial == null)
 				return;
 
@@ -323,8 +323,8 @@ namespace XPBD
 					_mpb
 				);
 			}
-		}
 #endif
+		}
 
 		// ─────────────────────────────────────────────────────────────────────
 		// Light matrix update (matches renderImGui light matrix calculation)
