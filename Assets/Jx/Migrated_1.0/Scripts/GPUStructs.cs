@@ -26,6 +26,15 @@ namespace XPBD
 		public float _pad0;     //  4 bytes → 16 aligned
 		public Vector3 velocity;  // 12 bytes
 		public float invMass;   //  4 bytes → 32 bytes total
+
+		#region Pub
+		public void CpyTo(ref GPUParticle p)
+		{
+			p.position = position;
+			p.velocity = velocity;
+			p.invMass = invMass;
+		}
+		#endregion
 	}
 
 	// ─── PbdPositions ─────────────────────────────────────────────────────────

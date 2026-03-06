@@ -67,74 +67,20 @@ namespace XPBD
 			{
 				transform.position = Vector3.zero;
 				transform.rotation = Quaternion.identity;
-				transform.SetLossyScale(Vector3.one);
+				if (transform.lossyScale != Vector3.one)
+				{
+					Debug.LogError($"'{name}' : transform.lossyScale SHOULD be (1,1,1)");
+					transform.SetLossyScale(Vector3.one);
+				}
 			}
 			_meshFilter = GetComponent<MeshFilter>();
 
-			// Convert ScriptableObject data to GPU structs
-			var data = tetMeshAsset;
-
 			// Instantiate the render mesh so each body has its own copy
-			Mesh renderMesh = Instantiate(data.RenderMesh);
+			var renderMesh = Instantiate(tetMeshAsset.RenderMesh);
 			renderMesh.MarkDynamic(); // hint to Unity: vertices change every frame
 			_meshFilter.sharedMesh = renderMesh;
-			//------------------->> Data associated with @tetMeshAsset----------
-			var particles = new GPUParticle[data.Particles.Length];
-			for (int i = 0; i < particles.Length; i++)
-			{
-				particles[i].position = mat.MultiplyPoint3x4(data.Particles[i].Position);
-				particles[i].velocity = Vector3.zero;
-				particles[i].invMass = data.Particles[i].InvMass;
-			}
-
-			var edges = new GPUEdge[data.Edges.Length];
-			for (int i = 0; i < edges.Length; i++)
-			{
-				edges[i].indexA = data.Edges[i].IndexA;
-				edges[i].indexB = data.Edges[i].IndexB;
-				edges[i].restLen = data.Edges[i].RestLen;
-			}
-
-			var tets = new GPUTetrahedral[data.Tetrahedrals.Length];
-			for (int i = 0; i < tets.Length; i++)
-			{
-				tets[i].i0 = data.Tetrahedrals[i].I0;
-				tets[i].i1 = data.Tetrahedrals[i].I1;
-				tets[i].i2 = data.Tetrahedrals[i].I2;
-				tets[i].i3 = data.Tetrahedrals[i].I3;
-				tets[i].restVolume = data.Tetrahedrals[i].RestVolume;
-			}
-
-			GPUSkinningInfo[] skinning = null;
-			uint[] origIndices = null;
-
-			if (tetMeshAsset.UseTetDeformation)
-			{
-				skinning = new GPUSkinningInfo[data.Skinning.Length];
-				for (int i = 0; i < skinning.Length; i++)
-				{
-					skinning[i].weights = data.Skinning[i].Weights;
-					skinning[i].tetIndex = data.Skinning[i].TetIndex;
-				}
-			}
-			else
-			{
-				origIndices = data.OrigIndices;
-			}
-			//-------------------<<----------
-			_state = new SoftBodyGPUState(
-				particles,
-				edges,
-				tets,
-				renderMesh.vertices,
-				renderMesh.uv,
-				renderMesh.triangles,
-				origIndices,
-				skinning,
-				tetMeshAsset.UseTetDeformation,
-				renderMesh
-			);
-
+			//
+			_state = new SoftBodyGPUState(tetMeshAsset, mat, renderMesh);
 			manager.AddBody(_state);
 		}
 

@@ -28,6 +28,7 @@
 //     Fix: _readbackPos / _readbackNrm allocated ONCE in Init, reused every frame.
 //          Exposed as ReadbackPos / ReadbackNrm so Manager can call GetData into them.
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace XPBD
@@ -93,43 +94,119 @@ namespace XPBD
 		/// Allocate all GPU buffers and upload initial data.
 		/// Called once by SoftBodySimulationManager when spawning a body.
 		/// </summary>
-		public SoftBodyGPUState(
-			GPUParticle[] particles,
-			GPUEdge[] edges,
-			GPUTetrahedral[] tets,
-			//>
-			Vector3[] initialVertexPositions,
-			Vector2[] uvs,
-			int[] triangleIndices,
-			//<
-			// Deform path A — same-res direct index map
-			uint[] origIndices,
-			// Deform path B — tetrahedral barycentric skinning
-			GPUSkinningInfo[] skinning,
-			bool useTetDeformation,
-			Mesh renderMesh
-			)
+		//public SoftBodyGPUState(
+		//	GPUParticle[] particles,
+		//	GPUEdge[] edges,
+		//	GPUTetrahedral[] tets,
+		//	//>
+		//	//Vector3[] initialVertexPositions,
+		//	//Vector2[] uvs,
+		//	//int[] triangleIndices,
+		//	//<
+		//	// Deform path A — same-res direct index map
+		//	uint[] origIndices,
+		//	// Deform path B — tetrahedral barycentric skinning
+		//	GPUSkinningInfo[] skinning,
+		//	bool useTetDeformation,
+		//	Mesh renderMesh
+		//	)
+		#region Static
+		sealed class TetMeshGpuInfo
 		{
-			ParticleCount = particles.Length;
-			EdgeCount = edges.Length;
-			TetCount = tets.Length;
+			public TetMeshGpuInfo(TetrahedralMeshAsset tetAsset)
+			{
+				particles = new GPUParticle[tetAsset.Particles.Length];
+				for (int i = 0; i < tetAsset.Particles.Length; i++)
+				{
+					particles[i].position = tetAsset.Particles[i].Position;
+					particles[i].velocity = Vector3.zero;
+					particles[i].invMass = tetAsset.Particles[i].InvMass;
+				}
+				edges = new GPUEdge[tetAsset.Edges.Length];
+				for (int i = 0; i < edges.Length; i++)
+				{
+					var edge = tetAsset.Edges[i];
+					edges[i].indexA = edge.IndexA;
+					edges[i].indexB = edge.IndexB;
+					edges[i].restLen = edge.RestLen;
+				}
+				tets = new GPUTetrahedral[tetAsset.Tetrahedrals.Length];
+
+				for (int i = 0; i < tets.Length; i++)
+				{
+					var t = tetAsset.Tetrahedrals[i];
+					tets[i].i0 = t.I0;
+					tets[i].i1 = t.I1;
+					tets[i].i2 = t.I2;
+					tets[i].i3 = t.I3;
+					tets[i].restVolume = t.RestVolume;
+				}
+				if (tetAsset.UseTetDeformation)
+				{
+					skinnings = new GPUSkinningInfo[tetAsset.Skinning.Length];
+					for (int i = 0; i < skinnings.Length; i++)
+					{
+						var skinning = tetAsset.Skinning[i];
+						skinnings[i].weights = skinning.Weights;
+						skinnings[i].tetIndex = skinning.TetIndex;
+					}
+				}
+				else
+					skinnings = null;
+			}
+			public readonly GPUParticle[] particles;
+			public readonly GPUEdge[] edges;
+			public readonly GPUTetrahedral[] tets;
+			public readonly GPUSkinningInfo[] skinnings;
+		}
+		readonly static Dictionary<TetrahedralMeshAsset, TetMeshGpuInfo> tetMeshGpuInfoMap_s = new Dictionary<TetrahedralMeshAsset, TetMeshGpuInfo>();
+		#endregion
+		public SoftBodyGPUState(TetrahedralMeshAsset tetMeshAsset, Matrix4x4 mat, Mesh renderMesh)
+		{
+			//var renderMesh = tetMeshAsset.RenderMesh; //CAN'T use asset-version
+			var triangleIndices = renderMesh.triangles;
+			var initialVertexPositions = renderMesh.vertices;
+			//
+			if (!tetMeshGpuInfoMap_s.TryGetValue(tetMeshAsset, out var tetMeshGpuInfo))
+				tetMeshGpuInfoMap_s[tetMeshAsset] = tetMeshGpuInfo = new TetMeshGpuInfo(tetMeshAsset);
+			//
+			ParticleCount = tetMeshGpuInfo.particles.Length;
+			EdgeCount = tetMeshGpuInfo.edges.Length;
+			TetCount = tetMeshGpuInfo.tets.Length;
 			VertexCount = initialVertexPositions.Length;
 			IndexCount = triangleIndices.Length;
-			UseTetDeformation = useTetDeformation;
+			UseTetDeformation = tetMeshAsset.UseTetDeformation;
 			RenderMesh = renderMesh;
 			Active = true;
-
+			//
+			GPUParticle[] particles = null;
+			if (!mat.isIdentity) //deep-clone & transform
+			{
+				particles = new GPUParticle[ParticleCount];
+				for (int i = 0; i < particles.Length; i++)
+				{
+					var p = particles[i];
+					tetMeshGpuInfo.particles[i].CpyTo(ref p);
+					//post
+					p.position = mat.MultiplyPoint3x4(p.position);
+					particles[i] = p; //^
+				}
+			}
+			else
+				particles = tetMeshGpuInfo.particles;
 			// Physics
 			ParticleBuffer = Upload(particles, GPUStrides.Particle);
-			EdgeBuffer = Upload(edges, GPUStrides.Edge);
-			TetBuffer = Upload(tets, GPUStrides.Tetrahedral);
-
+			EdgeBuffer = Upload(tetMeshGpuInfo.edges, GPUStrides.Edge);
+			TetBuffer = Upload(tetMeshGpuInfo.tets, GPUStrides.Tetrahedral);
 			// PbdPositions: predict = initial position, delta = 0
 			var pbdPos = new GPUPbdPositions[ParticleCount];
 			for (int i = 0; i < ParticleCount; i++)
 				pbdPos[i].predict = particles[i].position;
 			PositionsBuffer = Upload(pbdPos, GPUStrides.PbdPositions);
-
+			{
+				//Null particles [3/6/2026 jzq]
+				particles = null;
+			}
 			// FIX 1: ComputeBufferType.Raw → RWByteAddressBuffer in shader
 			// Count = number of 4-byte dwords.  ParticleCount*3 floats = ParticleCount*3 dwords.
 			DeltaBytesBuffer = new ComputeBuffer(
@@ -137,10 +214,10 @@ namespace XPBD
 			DeltaBytesBuffer.SetData(new int[ParticleCount * 3]); // zero on creation
 
 			// Deform
-			if (!useTetDeformation)
-				OrigIndicesBuffer = Upload(origIndices, sizeof(uint));
+			if (!UseTetDeformation)
+				OrigIndicesBuffer = Upload(tetMeshAsset.OrigIndices, sizeof(uint));
 			else
-				SkinningBuffer = Upload(skinning, GPUStrides.SkinningInfo);
+				SkinningBuffer = Upload(tetMeshGpuInfo.skinnings, GPUStrides.SkinningInfo);
 
 			// Vertex / normal streams (RWStructuredBuffer<float3>)
 			// stride = 12 bytes (float3), use stride override
