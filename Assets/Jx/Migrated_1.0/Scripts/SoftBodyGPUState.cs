@@ -160,6 +160,7 @@ namespace XPBD
 			public readonly GPUSkinningInfo[] skinnings;
 		}
 		readonly static Dictionary<TetrahedralMeshAsset, TetMeshGpuInfo> tetMeshGpuInfoMap_s = new Dictionary<TetrahedralMeshAsset, TetMeshGpuInfo>();
+		public static void ClearAssetCache_S() => tetMeshGpuInfoMap_s.Clear();
 		#endregion
 		public SoftBodyGPUState(TetrahedralMeshAsset tetMeshAsset, Matrix4x4 mat, Mesh renderMesh)
 		{

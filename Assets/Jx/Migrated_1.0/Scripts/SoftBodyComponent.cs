@@ -17,7 +17,7 @@ using UnityEngine;
 namespace XPBD
 {
 	[RequireComponent(typeof(MeshFilter))]
-	public sealed class SoftBodyComponent : MonoBehaviour
+	public sealed class SoftBodyComponent : MonoBase
 	{
 		#region Inspector
 		[SerializeField]
@@ -29,12 +29,17 @@ namespace XPBD
 		SoftBodySimulationManager manager;
 		SoftBodyGPUState _state;
 		MeshFilter _meshFilter;
+		Renderer _rd;
 		//bool inited => _state != null;
 		bool valid => tetMeshAsset;
 		bool visible
 		{
-			get => GetComponent<Renderer>().enabled;
-			set => GetComponent<Renderer>().enabled = value;
+			get => _rd && _rd.enabled;
+			set
+			{
+				if (_rd)
+					_rd.enabled = value;
+			}
 		}
 		// [3/7/2026 jzq]
 		internal void InternalOnDeformed()
@@ -58,13 +63,17 @@ namespace XPBD
 		#endregion
 
 		#region Unity
-		void Start()
+		protected override void OnInit()
 		{
+			base.OnInit();
 			if (!valid)
 			{
 				Debug.LogError("SoftBodyComponent invalid!", this);
 				return;
 			}
+			_rd = GetComponent<Renderer>();
+			if (!_rd)
+				Debug.LogError("SoftBodyComponent rd == null!", this);
 			if (manager == null)
 			{
 				manager = FindObjectOfType<SoftBodySimulationManager>();
@@ -97,16 +106,17 @@ namespace XPBD
 			manager.AddBody(/*_state*/this);
 		}
 
-		void OnDestroy()
+		protected override void DoDeInit()
 		{
+			base.DoDeInit();
 			Destroy(_meshFilter.sharedMesh); // clean up the instantiated render mesh - jzq [3/6/2026]
 			if (_state != null && manager != null)
 			{
+				manager.RemoveBody(/*_state*/this); // manager might still be mid-dispatch on this frame
 				{// [3/7/2026 jzq]
-					_state.Dispose();
+					_state.Dispose(); //Safe: post GPU buffers released
 					_state = null;
 				}
-				manager.RemoveBody(/*_state*/this);
 			}
 		}
 		#endregion

@@ -91,6 +91,8 @@ namespace XPBD
 			//_bodies.Clear();
 			_colPositionsBuffer?.Release();
 			_colIndicesBuffer?.Release();
+			// [3/7/2026 jzq]
+			SoftBodyGPUState.ClearAssetCache_S();
 		}
 
 		// ─────────────────────────────────────────────────────────────────────
