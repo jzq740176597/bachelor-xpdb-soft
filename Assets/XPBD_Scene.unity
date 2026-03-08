@@ -557,7 +557,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 05fe08fa6483d43429eb32bdc0befb22, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  softPrefab: {fileID: 7423521658402546732, guid: 3100d8daa6285e04fb5de650627715d7, type: 3}
+  softPrefab: {fileID: 7423521658402546732, guid: 3b7e7c2b32731ff49a502270b805f023, type: 3}
   minHeight: 5
   maxHeight: 10
 --- !u!1 &1772512984
