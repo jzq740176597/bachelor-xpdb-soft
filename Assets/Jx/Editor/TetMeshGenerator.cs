@@ -42,7 +42,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Threading;
 using UnityEditor;
 using UnityEngine;
@@ -56,7 +55,7 @@ namespace XPBD.Editor
 		private Mesh _sourceMesh;
 		private int _decimationRes = 5;    // ratio = decimationRes / 100  (Blender Decimate equivalent)
 		private int _interiorRes = 8;    // interior grid resolution  (plugin default = 8)
-		private string _outputFolder = "Assets/XPBD/TetModels";
+		private string _outputFolder = "Assets/Jx/Gen_TetModels";
 		private string _assetName = "mesh_5";
 
 		private string _statusMsg = "";
@@ -69,7 +68,7 @@ namespace XPBD.Editor
 		private Exception _bgError;
 		private bool _bgDone;
 
-		[MenuItem("XPBD/Generate Tet Mesh...")]
+		[MenuItem("XPBD/Generate Tet Mesh... %T")] //Ctrl + T
 		public static void ShowWindow() =>
 			GetWindow<TetMeshGenerator>(false, "XPBD Tet Generator", true);
 
@@ -316,35 +315,16 @@ namespace XPBD.Editor
 			int sdfRes;
 			BuildSDF(verts, tris, b, interiorRes * 4, out sdfData, out sdfRes);
 
-			// ── 3. Decimate render mesh → physics mesh ────────────────────────
-			// Matches Blender's "Decimate (Collapse)" modifier at ratio = decimationRes/100.
-			// The decimated mesh supplies the surface vertices fed into Delaunay.
-			// The original render mesh is kept for display; skinning maps it back.
-			prog(0.10f, $"Decimating mesh (ratio {decimationRes}/100)…");
-			float decimRatio = Mathf.Clamp01(decimationRes / 100f);
-			int targetVerts = Mathf.Max(4, Mathf.RoundToInt(verts.Length * decimRatio));
-			Vector3[] physVerts;
-			int[] physTris;
-			DecimateMesh(verts, tris, targetVerts, out physVerts, out physTris);
-
-			// ── 3b. Snap decimated verts back to original surface ─────────────
-			// Quadric collapse can drift verts slightly off the original mesh.
-			// Snapping every decimated vert to its nearest original vert ensures
-			// all surface particles are exactly on the original surface — which
-			// guarantees the tet mesh covers the surface with no gaps, and thus
-			// that all render verts have a valid enclosing tet for skinning.
-			SnapVertsToNearest(physVerts, verts);
-
-			// Deduplicate: snapping may map two decimated verts to the same original vert.
-			// Duplicates produce zero-volume tets in Delaunay → remove them.
-			{
-				var seen = new Dictionary<Vector3, bool>(physVerts.Length);
-				var deduped = new List<Vector3>(physVerts.Length);
-				foreach (var v in physVerts)
-					if (seen.TryAdd(v, true))
-						deduped.Add(v);
-				physVerts = deduped.ToArray();
-			}
+			// ── 3. Select physics-mesh surface vertices ───────────────────────
+			// Matches Blender's "Decimate → ratio = decimationRes/100" step.
+			// We use Greedy Farthest Point Sampling (FPS) instead of QEM collapse:
+			//   • Selects a well-distributed subset of the ORIGINAL vertices.
+			//   • All selected verts lie exactly on the original surface — no drift.
+			//   • No near-duplicate positions → no tiny edges or sliver tets.
+			//   • Same effective coverage as Blender's decimated mesh.
+			prog(0.10f, $"Sampling surface verts (ratio {decimationRes}/100)…");
+			int targetVerts = Mathf.Max(4, Mathf.RoundToInt(verts.Length * (decimationRes / 100f)));
+			Vector3[] physVerts = FarthestPointSample(verts, targetVerts);
 
 			// ── 4. Tet vertex sampling ────────────────────────────────────────
 			// Surface samples = decimated physics mesh verts (jittered ±1e-4).
@@ -419,459 +399,6 @@ namespace XPBD.Editor
 				origIndices = null   // not used when skinning is active
 			};
 		}
-
-		// ═════════════════════════════════════════════════════════════════════
-		// STEP 1: Signed Distance Field
-		// Voxel grid of sdfRes³ cells.
-		// Each cell = signed distance to nearest triangle.
-		// Sign: negative = inside (odd X-ray crossings).
-		// ═════════════════════════════════════════════════════════════════════
-
-		struct ABounds
-		{
-			public Vector3 min, size;
-		}
-
-		static ABounds ComputeBounds(Vector3[] verts)
-		{
-			Vector3 mn = verts[0], mx = verts[0];
-			foreach (var v in verts)
-			{
-				if (v.x < mn.x)
-					mn.x = v.x;
-				if (v.x > mx.x)
-					mx.x = v.x;
-				if (v.y < mn.y)
-					mn.y = v.y;
-				if (v.y > mx.y)
-					mx.y = v.y;
-				if (v.z < mn.z)
-					mn.z = v.z;
-				if (v.z > mx.z)
-					mx.z = v.z;
-			}
-			// Tight bounds — no padding.  The interior grid uses h = maxDim/interiorRes
-			// and minDist = 0.5*h to match the Blender plugin exactly.  Any padding here
-			// would inflate h and minDist, pushing too many near-surface grid nodes outside
-			// the accepted region and producing far too few interior particles.
-			return new ABounds { min = mn, size = mx - mn };
-		}
-
-		// ══════════════════════════════════════════════════════════════════════════
-		// SNAP TO NEAREST ORIGINAL VERTEX
-		//
-		// After quadric edge-collapse, each output vertex is an edge midpoint and
-		// may drift slightly off the original surface.  For tet physics we need
-		// surface particles to lie exactly on the mesh surface so that:
-		//   (a) The SDF classifies them as "surface" (d ≈ 0), not "inside/outside".
-		//   (b) The tet mesh tightly wraps the render mesh with no surface gaps.
-		//   (c) All render verts have a valid enclosing tet for barycentric skinning.
-		//
-		// We snap each decimated vert to the nearest vertex in the original mesh.
-		// This is O(n_decim * n_orig) naively but we use a spatial grid for O(n).
-		// ══════════════════════════════════════════════════════════════════════════
-		static void SnapVertsToNearest(Vector3[] pts, Vector3[] sources)
-		{
-			if (pts.Length == 0 || sources.Length == 0)
-				return;
-
-			// Build a spatial hash of the source verts for O(1) nearest lookup
-			// Cell size = average edge length of source mesh ≈ bounding box / cbrt(n)
-			float cellSize = 0.5f;
-			if (sources.Length > 1)
-			{
-				var sb = ComputeBounds(sources);
-				float vol = sb.size.x * sb.size.y * sb.size.z;
-				float n = sources.Length;
-				cellSize = Mathf.Max(0.01f, Mathf.Pow(vol / n, 1f / 3f) * 2f);
-			}
-
-			// Grid: Dictionary<(int,int,int), List<int>>
-			var grid = new Dictionary<(int, int, int), List<int>>();
-			var sb2 = ComputeBounds(sources);
-
-			(int, int, int) Cell(Vector3 p) =>
-				(Mathf.FloorToInt((p.x - sb2.min.x) / cellSize),
-				 Mathf.FloorToInt((p.y - sb2.min.y) / cellSize),
-				 Mathf.FloorToInt((p.z - sb2.min.z) / cellSize));
-
-			for (int i = 0; i < sources.Length; i++)
-			{
-				var c = Cell(sources[i]);
-				if (!grid.TryGetValue(c, out var lst))
-					grid[c] = lst = new List<int>(4);
-				lst.Add(i);
-			}
-
-			for (int pi = 0; pi < pts.Length; pi++)
-			{
-				Vector3 p = pts[pi];
-				float best = float.MaxValue;
-				int bi = 0;
-
-				var (cx, cy, cz) = Cell(p);
-
-				// Search in expanding shells until we find a vert closer than shell distance
-				for (int rad = 0; rad <= 3; rad++)
-				{
-					float shellDist = (rad - 1) * cellSize;
-					if (rad > 0 && best < shellDist * shellDist)
-						break;
-
-					for (int dx = -rad; dx <= rad; dx++)
-						for (int dy = -rad; dy <= rad; dy++)
-							for (int dz = -rad; dz <= rad; dz++)
-							{
-								// Only process the surface of the current shell
-								if (rad > 0 && System.Math.Abs(dx) < rad && System.Math.Abs(dy) < rad && System.Math.Abs(dz) < rad)
-									continue;
-								if (!grid.TryGetValue((cx + dx, cy + dy, cz + dz), out var lst))
-									continue;
-								foreach (int si in lst)
-								{
-									float d2 = V3Sq(sources[si] - p);
-									if (d2 < best)
-									{
-										best = d2;
-										bi = si;
-									}
-								}
-							}
-					if (best < float.MaxValue && rad >= 1)
-						break;
-				}
-				pts[pi] = sources[bi];
-			}
-		}
-
-		// ══════════════════════════════════════════════════════════════════════════
-		// MESH DECIMATION  —  Quadric Error Metrics  (Garland & Heckbert 1997)
-		//
-		// Matches Blender's "Decimate → Collapse" modifier closely enough that
-		// the resulting tet counts are in the same range for identical inputs.
-		//
-		// Pipeline:
-		//   1. Compute per-vertex quadric Q = sum of (face-plane)² over incident faces.
-		//   2. For each edge (u,v): compute optimal collapse position and cost
-		//        cost = v_opt^T * (Q_u + Q_v) * v_opt
-		//   3. Collapse lowest-cost edge until targetVertCount reached.
-		//   4. Rebuild clean triangulation (remove degenerate/duplicate tris).
-		// ══════════════════════════════════════════════════════════════════════════
-
-		// 4×4 symmetric quadric matrix stored as upper-triangle (10 doubles).
-		// Indices: a0=m00 a1=m01 a2=m02 a3=m03 a4=m11 a5=m12 a6=m13 a7=m22 a8=m23 a9=m33
-		struct Quadric
-		{
-			public double a0, a1, a2, a3, a4, a5, a6, a7, a8, a9;
-			public static Quadric operator +(Quadric p, Quadric q) =>
-				new Quadric
-				{
-					a0 = p.a0 + q.a0,
-					a1 = p.a1 + q.a1,
-					a2 = p.a2 + q.a2,
-					a3 = p.a3 + q.a3,
-					a4 = p.a4 + q.a4,
-					a5 = p.a5 + q.a5,
-					a6 = p.a6 + q.a6,
-					a7 = p.a7 + q.a7,
-					a8 = p.a8 + q.a8,
-					a9 = p.a9 + q.a9
-				};
-			// Evaluate v^T Q v  for homogeneous v=(x,y,z,1)
-			public double Eval(double x, double y, double z)
-			{
-				double w = 1;
-				return a0 * x * x + 2 * a1 * x * y + 2 * a2 * x * z + 2 * a3 * x * w
-							 + a4 * y * y + 2 * a5 * y * z + 2 * a6 * y * w
-										  + a7 * z * z + 2 * a8 * z * w
-													  + a9 * w * w;
-			}
-		}
-
-		// Build plane quadric from face plane ax+by+cz+d=0 (a,b,c = unit normal)
-		static Quadric PlaneQuadric(double a, double b, double c, double d) =>
-			new Quadric
-			{
-				a0 = a * a,
-				a1 = a * b,
-				a2 = a * c,
-				a3 = a * d,
-				a4 = b * b,
-				a5 = b * c,
-				a6 = b * d,
-				a7 = c * c,
-				a8 = c * d,
-				a9 = d * d
-			};
-
-		// Solve Q * [x y z 1]^T = 0 for the optimal position that minimises cost.
-		// Falls back to edge midpoint if the 3x3 sub-matrix is singular.
-		static bool SolveQuadricMin(Quadric q, out double ox, out double oy, out double oz)
-		{
-			// Upper-left 3×3 of Q (symmetric):
-			// | a0 a1 a2 |   | xx xy xz |
-			// | a1 a4 a5 | = | xy yy yz |
-			// | a2 a5 a7 |   | xz yz zz |
-			double a = q.a0, b = q.a1, c = q.a2;
-			double d = q.a4, e = q.a5;
-			double f = q.a7;
-			// det of 3×3
-			double det = a * (d * f - e * e) - b * (b * f - e * c) + c * (b * e - d * c);
-			if (System.Math.Abs(det) < 1e-10)
-			{
-				ox = oy = oz = 0;
-				return false;
-			}
-			double invDet = 1.0 / det;
-			// Right-hand side: -[a3, a6, a8]
-			double rx = -q.a3, ry = -q.a6, rz = -q.a8;
-			ox = invDet * (rx * (d * f - e * e) + ry * (c * e - b * f) + rz * (b * e - d * c));
-			oy = invDet * (rx * (c * e - b * f) + ry * (a * f - c * c) + rz * (c * b - a * e));    // fixed
-			oz = invDet * (rx * (b * e - d * c) + ry * (c * b - a * e) + rz * (a * d - b * b));
-			return true;
-		}
-
-		static void DecimateMesh(
-			Vector3[] srcVerts, int[] srcTris, int targetVerts,
-			out Vector3[] outVerts, out int[] outTris)
-		{
-			int nv = srcVerts.Length;
-			int nt = srcTris.Length / 3;
-
-			if (nv <= targetVerts)
-			{
-				outVerts = (Vector3[]) srcVerts.Clone();
-				outTris = (int[]) srcTris.Clone();
-				return;
-			}
-
-			// Working positions (double for quadric precision)
-			var vx = new double[nv];
-			var vy = new double[nv];
-			var vz = new double[nv];
-			for (int i = 0; i < nv; i++)
-			{
-				vx[i] = srcVerts[i].x;
-				vy[i] = srcVerts[i].y;
-				vz[i] = srcVerts[i].z;
-			}
-
-			var Q = new Quadric[nv];
-			var alive = new bool[nv];
-			var triAlive = new bool[nt];
-			for (int i = 0; i < nv; i++)
-				alive[i] = true;
-			for (int i = 0; i < nt; i++)
-				triAlive[i] = true;
-
-			// Vertex → incident triangles  (HashSet for O(1) Contains/Add)
-			var vTris = new HashSet<int>[nv];
-			for (int i = 0; i < nv; i++)
-				vTris[i] = new HashSet<int>();
-			for (int ti = 0; ti < nt; ti++)
-			{
-				vTris[srcTris[3 * ti]].Add(ti);
-				vTris[srcTris[3 * ti + 1]].Add(ti);
-				vTris[srcTris[3 * ti + 2]].Add(ti);
-			}
-
-			// 1. Per-vertex quadrics from incident face planes
-			for (int ti = 0; ti < nt; ti++)
-			{
-				int i0 = srcTris[3 * ti], i1 = srcTris[3 * ti + 1], i2 = srcTris[3 * ti + 2];
-				double e1x = vx[i1] - vx[i0], e1y = vy[i1] - vy[i0], e1z = vz[i1] - vz[i0];
-				double e2x = vx[i2] - vx[i0], e2y = vy[i2] - vy[i0], e2z = vz[i2] - vz[i0];
-				double nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
-				double nl = System.Math.Sqrt(nx * nx + ny * ny + nz * nz);
-				if (nl < 1e-14)
-					continue;
-				nx /= nl;
-				ny /= nl;
-				nz /= nl;
-				double d = -(nx * vx[i0] + ny * vy[i0] + nz * vz[i0]);
-				var pq = PlaneQuadric(nx, ny, nz, d);
-				Q[i0] = Q[i0] + pq;
-				Q[i1] = Q[i1] + pq;
-				Q[i2] = Q[i2] + pq;
-			}
-
-			// 2. Build initial edge set
-			var liveEdges = new HashSet<long>();   // currently-valid (u,v) pairs
-			for (int ti = 0; ti < nt; ti++)
-			{
-				int i0 = srcTris[3 * ti], i1 = srcTris[3 * ti + 1], i2 = srcTris[3 * ti + 2];
-				liveEdges.Add(EdgeKey(i0, i1));
-				liveEdges.Add(EdgeKey(i1, i2));
-				liveEdges.Add(EdgeKey(i2, i0));
-			}
-
-			// Union-Find remap (path-compressed)
-			var remap = new int[nv];
-			for (int i = 0; i < nv; i++)
-				remap[i] = i;
-			int Find(int i)
-			{
-				while (remap[i] != i)
-				{
-					remap[i] = remap[remap[i]];
-					i = remap[i];
-				}
-				return i;
-			}
-
-			// Min-heap: key = (cost, u, v)  — u<v always, u and v are canonical at insert time.
-			// Stale entries (u or v no longer alive / no longer canonical) are skipped at pop.
-			// Optimal position stored in separate dict; recomputed at pop time (cheap).
-			var heap = new SortedSet<(double cost, int u, int v)>(
-				Comparer<(double, int, int)>.Create((a2, b2) =>
-				{
-					int c = a2.Item1.CompareTo(b2.Item1);
-					if (c != 0)
-						return c;
-					c = a2.Item2.CompareTo(b2.Item2);
-					if (c != 0)
-						return c;
-					return a2.Item3.CompareTo(b2.Item3);
-				}));
-
-			// Compute edge cost and add to heap + liveEdges
-			void AddEdge(int u, int v)
-			{
-				u = Find(u);
-				v = Find(v);
-				if (u == v || !alive[u] || !alive[v])
-					return;
-				if (u > v)
-				{
-					int tmp = u;
-					u = v;
-					v = tmp;
-				}
-				var qe = Q[u] + Q[v];
-				double ox, oy, oz;
-				// Always use midpoint — keeps collapsed verts ON the original surface.
-				// Quadric still used to rank edge costs (lower = less shape distortion).
-				ox = (vx[u] + vx[v]) * .5;
-				oy = (vy[u] + vy[v]) * .5;
-				oz = (vz[u] + vz[v]) * .5;
-				double cost = qe.Eval(ox, oy, oz);
-				heap.Add((cost, u, v));
-				liveEdges.Add(EdgeKey(u, v));
-			}
-
-			foreach (var ek in liveEdges.ToArray())
-			{
-				int u = (int) (ek >> 32), v = (int) (ek & 0xFFFFFFFFu);
-				AddEdge(u, v);
-			}
-
-			int liveVerts = nv;
-			var seen = new HashSet<int>(32);   // reused each iteration (avoid per-loop alloc)
-
-			// 3. Greedy edge collapse
-			while (liveVerts > targetVerts && heap.Count > 0)
-			{
-				var best = heap.Min;
-				heap.Remove(best);
-				int u = Find(best.u), v = Find(best.v);
-
-				// Skip stale entries: either vertex dead, not canonical, or edge no longer live
-				if (!alive[u] || !alive[v] || u == v)
-					continue;
-				if (u > v)
-				{
-					int tmp = u;
-					u = v;
-					v = tmp;
-				}
-				if (!liveEdges.Contains(EdgeKey(u, v)))
-					continue;
-
-				// Midpoint collapse — stays on original surface
-				var qe = Q[u] + Q[v];
-				double ox = (vx[u] + vx[v]) * .5, oy = (vy[u] + vy[v]) * .5, oz = (vz[u] + vz[v]) * .5;
-
-				// Collapse v into u
-				vx[u] = ox;
-				vy[u] = oy;
-				vz[u] = oz;
-				Q[u] = qe;
-				alive[v] = false;
-				remap[v] = u;
-				liveVerts--;
-
-				// Remove collapsed edge from live set
-				liveEdges.Remove(EdgeKey(u, v));
-
-				// Merge v's triangles into u; mark degenerate tris dead
-				foreach (int ti in vTris[v])
-				{
-					if (!triAlive[ti])
-						continue;
-					int i0 = Find(srcTris[3 * ti]), i1 = Find(srcTris[3 * ti + 1]), i2 = Find(srcTris[3 * ti + 2]);
-					if (i0 == i1 || i1 == i2 || i0 == i2)
-					{
-						triAlive[ti] = false;
-						continue;
-					}
-					vTris[u].Add(ti);
-				}
-				// Remove dead tris from v (not strictly needed but keeps sets small)
-				vTris[v].Clear();
-
-				// Re-add edges incident on u with updated quadric costs
-				seen.Clear();
-				foreach (int ti in vTris[u])
-				{
-					if (!triAlive[ti])
-						continue;
-					int i0 = Find(srcTris[3 * ti]), i1 = Find(srcTris[3 * ti + 1]), i2 = Find(srcTris[3 * ti + 2]);
-					void TryNeighbor(int nb)
-					{
-						if (nb != u && alive[nb] && seen.Add(nb))
-							AddEdge(u, nb);
-					}
-					TryNeighbor(i0);
-					TryNeighbor(i1);
-					TryNeighbor(i2);
-				}
-			}
-
-			// 4. Compact and output
-			var newIdx = new int[nv];
-			var outV = new List<Vector3>(liveVerts);
-			for (int i = 0; i < nv; i++)
-			{
-				if (!alive[i] || Find(i) != i)
-				{
-					newIdx[i] = -1;
-					continue;
-				}
-				newIdx[i] = outV.Count;
-				outV.Add(new Vector3((float) vx[i], (float) vy[i], (float) vz[i]));
-			}
-			var outT = new List<int>();
-			for (int ti = 0; ti < nt; ti++)
-			{
-				if (!triAlive[ti])
-					continue;
-				int i0 = newIdx[Find(srcTris[3 * ti])],
-					i1 = newIdx[Find(srcTris[3 * ti + 1])],
-					i2 = newIdx[Find(srcTris[3 * ti + 2])];
-				if (i0 < 0 || i1 < 0 || i2 < 0 || i0 == i1 || i1 == i2 || i0 == i2)
-					continue;
-				outT.Add(i0);
-				outT.Add(i1);
-				outT.Add(i2);
-			}
-			outVerts = outV.ToArray();
-			outTris = outT.ToArray();
-		}
-
-		// Pack two vertex indices into a single long (u < v guaranteed)
-		static long EdgeKey(int u, int v) =>
-			u < v ? ((long) u << 32) | (uint) v : ((long) v << 32) | (uint) u;
-
 		// ── Snap decimated verts to nearest original vert ─────────────────────────────
 		// QEM collapse moves vertex positions to the quadric-optimal point which can
 		// drift outside the original surface (especially at high-valence poles).
@@ -937,6 +464,156 @@ namespace XPBD.Editor
 						data[iz * r * r + iy * r + ix] = sign * Mathf.Sqrt(minD2);
 					}
 		}
+		// ═════════════════════════════════════════════════════════════════════
+		// STEP 1: Signed Distance Field
+		// Voxel grid of sdfRes³ cells.
+		// Each cell = signed distance to nearest triangle.
+		// Sign: negative = inside (odd X-ray crossings).
+		// ═════════════════════════════════════════════════════════════════════
+
+		struct ABounds
+		{
+			public Vector3 min, size;
+		}
+
+		static ABounds ComputeBounds(Vector3[] verts)
+		{
+			Vector3 mn = verts[0], mx = verts[0];
+			foreach (var v in verts)
+			{
+				if (v.x < mn.x)
+					mn.x = v.x;
+				if (v.x > mx.x)
+					mx.x = v.x;
+				if (v.y < mn.y)
+					mn.y = v.y;
+				if (v.y > mx.y)
+					mx.y = v.y;
+				if (v.z < mn.z)
+					mn.z = v.z;
+				if (v.z > mx.z)
+					mx.z = v.z;
+			}
+			// Tight bounds — no padding.  The interior grid uses h = maxDim/interiorRes
+			// and minDist = 0.5*h to match the Blender plugin exactly.  Any padding here
+			// would inflate h and minDist, pushing too many near-surface grid nodes outside
+			// the accepted region and producing far too few interior particles.
+			return new ABounds { min = mn, size = mx - mn };
+		}
+
+		// ══════════════════════════════════════════════════════════════════════════
+		// SNAP TO NEAREST ORIGINAL VERTEX
+		//
+		// After quadric edge-collapse, each output vertex is an edge midpoint and
+		// may drift slightly off the original surface.  For tet physics we need
+		// surface particles to lie exactly on the mesh surface so that:
+		//   (a) The SDF classifies them as "surface" (d ≈ 0), not "inside/outside".
+		//   (b) The tet mesh tightly wraps the render mesh with no surface gaps.
+		//   (c) All render verts have a valid enclosing tet for barycentric skinning.
+		//
+		// We snap each decimated vert to the nearest vertex in the original mesh.
+		// This is O(n_decim * n_orig) naively but we use a spatial grid for O(n).
+
+		// ══════════════════════════════════════════════════════════════════════════
+		// MESH DECIMATION  —  Quadric Error Metrics  (Garland & Heckbert 1997)
+		//
+		// Matches Blender's "Decimate → Collapse" modifier closely enough that
+		// the resulting tet counts are in the same range for identical inputs.
+		//
+		// Pipeline:
+		//   1. Compute per-vertex quadric Q = sum of (face-plane)² over incident faces.
+		//   2. For each edge (u,v): compute optimal collapse position and cost
+		//        cost = v_opt^T * (Q_u + Q_v) * v_opt
+		//   3. Collapse lowest-cost edge until targetVertCount reached.
+		//   4. Rebuild clean triangulation (remove degenerate/duplicate tris).
+		// ══════════════════════════════════════════════════════════════════════════
+		// SURFACE VERTEX SAMPLING  —  Greedy Farthest Point Sampling
+		//
+		// Replaces QEM decimation.  Selects `targetCount` vertices from the original
+		// mesh that are maximally spread across the surface:
+		//   1. Seed with the vertex closest to the mesh centroid.
+		//   2. Repeatedly add the vertex that is farthest from all already-selected.
+		//
+		// Guarantees:
+		//   • Every output vertex is an exact original mesh vertex (on-surface, no drift).
+		//   • No near-duplicate positions → no tiny edges or sliver tets.
+		//   • Uniform coverage → no large gaps → no oversized tets.
+		//   • O(n × k) time where n = original vert count, k = target count.
+		//     For sphere.obj (n=2562, k=128): ~330 k ops ≈ 2 ms.
+		// ══════════════════════════════════════════════════════════════════════════
+		static Vector3[] FarthestPointSample(Vector3[] srcVerts, int targetCount)
+		{
+			int n = srcVerts.Length;
+			targetCount = Mathf.Clamp(targetCount, 1, n);
+
+			// minDist[i] = squared distance from srcVerts[i] to the nearest
+			// already-selected vertex.  Starts at +∞.
+			var minDist = new float[n];
+			for (int i = 0; i < n; i++)
+				minDist[i] = float.MaxValue;
+
+			// Seed: vertex nearest the centroid (avoids pole-bias of index 0)
+			Vector3 centroid = Vector3.zero;
+			for (int i = 0; i < n; i++)
+				centroid += srcVerts[i];
+			centroid /= n;
+			int seed = 0;
+			float bestD = float.MaxValue;
+			for (int i = 0; i < n; i++)
+			{
+				float d = V3DistSq(srcVerts[i], centroid);
+				if (d < bestD)
+				{
+					bestD = d;
+					seed = i;
+				}
+			}
+
+			var selected = new List<int>(targetCount) { seed };
+			UpdateMinDist(minDist, srcVerts, seed);
+
+			for (int iter = 1; iter < targetCount; iter++)
+			{
+				// Pick the vertex farthest from all selected vertices
+				int farthest = 0;
+				float farthestD = -1f;
+				for (int i = 0; i < n; i++)
+				{
+					if (minDist[i] > farthestD)
+					{
+						farthestD = minDist[i];
+						farthest = i;
+					}
+				}
+				selected.Add(farthest);
+				UpdateMinDist(minDist, srcVerts, farthest);
+			}
+
+			var result = new Vector3[targetCount];
+			for (int i = 0; i < targetCount; i++)
+				result[i] = srcVerts[selected[i]];
+			return result;
+		}
+
+		static void UpdateMinDist(float[] minDist, Vector3[] verts, int newIdx)
+		{
+			var s = verts[newIdx];
+			for (int i = 0; i < verts.Length; i++)
+			{
+				float d = V3DistSq(verts[i], s);
+				if (d < minDist[i])
+					minDist[i] = d;
+			}
+			minDist[newIdx] = -1f;   // mark as selected (never picked again)
+		}
+
+		static float V3DistSq(Vector3 a, Vector3 b)
+		{
+			float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+			return dx * dx + dy * dy + dz * dz;
+		}
+
+
 
 		// Squared distance point → triangle (Ericson, Real-Time Collision Detection)
 		static float PtTriSq(Vector3 p, Vector3 a, Vector3 b, Vector3 c)

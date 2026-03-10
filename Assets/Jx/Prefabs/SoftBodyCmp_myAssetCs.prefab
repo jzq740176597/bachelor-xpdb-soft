@@ -96,4 +96,4 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: f7e34f71a08e5c54eb9a9ec5f44dd9a7, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  tetMeshAsset: {fileID: 11400000, guid: d3703cf08a61f144a8b3d0d472e0fdbe, type: 2}
+  tetMeshAsset: {fileID: 11400000, guid: af50bd9e7c2541148adca2b75344cf88, type: 2}
