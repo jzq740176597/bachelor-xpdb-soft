@@ -52,21 +52,21 @@ namespace XPBD.Editor
 	public class TetMeshGenerator : EditorWindow
 	{
 		// ── Window state ──────────────────────────────────────────────────────
-		private Mesh _sourceMesh;
-		private int _decimationRes = 5;    // ratio = decimationRes / 100  (Blender Decimate equivalent)
-		private int _interiorRes = 8;    // interior grid resolution  (plugin default = 8)
-		private string _outputFolder = "Assets/Jx/Gen_TetModels";
-		private string _assetName = "mesh_5";
+		Mesh _sourceMesh;
+		int _decimationRes = 5;    // ratio = decimationRes / 100  (Blender Decimate equivalent)
+		int _interiorRes = 8;    // interior grid resolution  (plugin default = 8)
+		string _outputFolder = "Assets/Jx/Gen_TetModels";
+		string _assetName = "mesh_5";
 
-		private string _statusMsg = "";
-		private bool _statusOk = true;
-		private bool _running = false;
-		private float _progress = 0f;
-		private string _progressLabel = "";
+		string _statusMsg = "";
+		bool _statusOk = true;
+		bool _running = false;
+		float _progress = 0f;
+		string _progressLabel = "";
 
-		private GenResult _result;
-		private Exception _bgError;
-		private bool _bgDone;
+		GenResult _result;
+		Exception _bgError;
+		bool _bgDone;
 
 		[MenuItem("XPBD/Generate Tet Mesh... %T")] //Ctrl + T
 		public static void ShowWindow() =>
@@ -112,6 +112,24 @@ namespace XPBD.Editor
 			GUI.enabled = canRun;
 			if (GUILayout.Button("Generate", GUILayout.Height(36)))
 				RunGeneration();
+			GUI.enabled = true;
+
+			// Clear SDF cache for current mesh + interiorRes
+			GUI.enabled = _sourceMesh != null && !_running;
+			if (GUILayout.Button("Clear SDF Cache", GUILayout.Height(22)))
+			{
+				string guid = UnityEditor.AssetDatabase.AssetPathToGUID(
+								  UnityEditor.AssetDatabase.GetAssetPath(_sourceMesh));
+				string cp = $"{sdfDir}/_sdf_{guid}_{_interiorRes}.asset";
+				if (UnityEditor.AssetDatabase.DeleteAsset(cp))
+				{
+					UnityEditor.AssetDatabase.Refresh();
+					_statusOk = true;
+					_statusMsg = "SDF cache cleared.";
+				}
+				else
+					_statusMsg = "No cache found for this mesh / Interior Res.";
+			}
 			GUI.enabled = true;
 
 			if (_running)
@@ -167,11 +185,29 @@ namespace XPBD.Editor
 			int decRes = _decimationRes;
 			int intRes = _interiorRes;
 
+			// ── SDF Cache: load or schedule build ────────────────────────────
+			// AssetDatabase calls must happen on the main thread.
+			float[] cachedSdf = null;
+			int cachedSdfRes = 0;
+			string meshGuid = UnityEditor.AssetDatabase.AssetPathToGUID(
+									   UnityEditor.AssetDatabase.GetAssetPath(_sourceMesh));
+			string cacheFolder = _outputFolder;
+			string cacheName = $"_sdf_{meshGuid}_{intRes}";
+			string cachePath = $"{cacheFolder}/{cacheName}.asset";
+			var existing = UnityEditor.AssetDatabase.LoadAssetAtPath<CachedSdfAsset>(cachePath);
+			if (existing != null && existing.SourceMeshGUID == meshGuid && existing.InteriorRes == intRes)
+			{
+				cachedSdf = existing.Data;
+				cachedSdfRes = existing.SdfRes;
+				_progressLabel = "SDF loaded from cache.";
+			}
+
 			new Thread(() =>
 			{
 				try
 				{
 					_result = Generate(verts, tris, normals, uvs, decRes, intRes,
+						cachedSdf, cachedSdfRes,
 						(p, lbl) => { _progress = p; _progressLabel = lbl; });
 				}
 				catch (Exception ex) { _bgError = ex; }
@@ -181,13 +217,13 @@ namespace XPBD.Editor
 				IsBackground = true
 			}.Start();
 		}
-
+		string sdfDir => $"{_outputFolder}/_SdfCaches";
 		void SaveAssets(GenResult r)
 		{
 			try
 			{
-				EnsureFolder(_outputFolder);
-
+				//EnsureFolder(_outputFolder);
+				EnsureFolder(sdfDir);
 				// TetrahedralMeshAsset — physics data only.
 				// RenderMesh is a plain Inspector reference to the source mesh asset;
 				// the user assigns it (or it stays null until assigned).
@@ -240,6 +276,24 @@ namespace XPBD.Editor
 				string assetPath = $"{_outputFolder}/{_assetName}.asset";
 				AssetDatabase.DeleteAsset(assetPath);
 				AssetDatabase.CreateAsset(asset, assetPath);
+
+				// ── Save SDF cache (only if it wasn't already loaded from cache) ──
+				if (_result.sdfData != null)
+				{
+					string meshGuid2 = AssetDatabase.AssetPathToGUID(
+										   AssetDatabase.GetAssetPath(_sourceMesh));
+					string cachePath2 = $"{sdfDir}/_sdf_{meshGuid2}_{_interiorRes}.asset";
+					AssetDatabase.DeleteAsset(cachePath2);
+					var sdfAsset = ScriptableObject.CreateInstance<CachedSdfAsset>();
+					sdfAsset.SourceMeshGUID = meshGuid2;
+					sdfAsset.InteriorRes = _interiorRes;
+					sdfAsset.BoundsMin = _result.boundsMin;
+					sdfAsset.BoundsSize = _result.boundsSize;
+					sdfAsset.SdfRes = _result.sdfRes;
+					sdfAsset.Data = _result.sdfData;
+					AssetDatabase.CreateAsset(sdfAsset, cachePath2);
+				}
+
 				AssetDatabase.SaveAssets();
 				AssetDatabase.Refresh();
 
@@ -277,6 +331,11 @@ namespace XPBD.Editor
 			public Tet[] tets;
 			public Skin[] skinning;
 			public uint[] origIndices;
+			// SDF cache fields — null if SDF was loaded from cache (no need to re-save)
+			public float[] sdfData;
+			public int sdfRes;
+			public Vector3 boundsMin;
+			public Vector3 boundsSize;
 		}
 
 		struct Particle
@@ -300,20 +359,27 @@ namespace XPBD.Editor
 			Vector3[] verts, int[] tris,
 			Vector3[] normals, Vector2[] uvs,
 			int decimationRes, int interiorRes,
+			float[] preBuildSdf, int preBuildSdfRes,
 			Action<float, string> prog)
 		{
 			// ── 1. Bounds ──────────────────────────────────────────────────────
 			prog(0.02f, "Computing bounds…");
 			var b = ComputeBounds(verts);
 
-			// ── 2. SDF — used for interior-sample classification + tet filter ─
-			// Build on original mesh so the signed field correctly represents
-			// the render mesh surface.  Resolution driven by interiorRes so
-			// voxel size matches the interior grid spacing.
-			prog(0.04f, "Building SDF…");
+			// ── 2. SDF — use cache if available, otherwise build ─────────────
 			float[] sdfData;
 			int sdfRes;
-			BuildSDF(verts, tris, b, interiorRes * 4, out sdfData, out sdfRes);
+			if (preBuildSdf != null && preBuildSdfRes > 0)
+			{
+				prog(0.04f, "SDF loaded from cache — skipping build.");
+				sdfData = preBuildSdf;
+				sdfRes = preBuildSdfRes;
+			}
+			else
+			{
+				prog(0.04f, "Building SDF (BVH-accelerated)…");
+				BuildSDF(verts, tris, b, interiorRes * 4, out sdfData, out sdfRes);
+			}
 
 			// ── 3. Select physics-mesh surface vertices ───────────────────────
 			// Matches Blender's "Decimate → ratio = decimationRes/100" step.
@@ -396,74 +462,15 @@ namespace XPBD.Editor
 				edges = edges,
 				tets = tetList,
 				skinning = skinning,
-				origIndices = null   // not used when skinning is active
+				origIndices = null,
+				// Pass SDF back for caching — null means it came from cache, skip re-save
+				sdfData = preBuildSdf == null ? sdfData : null,
+				sdfRes = sdfRes,
+				boundsMin = b.min,
+				boundsSize = b.size,
 			};
 		}
-		// ── Snap decimated verts to nearest original vert ─────────────────────────────
-		// QEM collapse moves vertex positions to the quadric-optimal point which can
-		// drift outside the original surface (especially at high-valence poles).
-		// Snapping back to the nearest original vertex guarantees every surface particle
-		// lies exactly on the source mesh, prevents extra-long edges and oversized tets,
-		static void BuildSDF(Vector3[] verts, int[] tris,
-			ABounds b, int res,
-			out float[] data, out int sdfRes)
-		{
-			sdfRes = res + 1;
-			int r = sdfRes;
-			data = new float[r * r * r];
 
-			int triCount = tris.Length / 3;
-			float dx = b.size.x / res;
-			float dy = b.size.y / res;
-			float dz = b.size.z / res;
-
-			// Precompute per-triangle: unnormalised outward normal + centroid.
-			// Used for sign determination: dot(normal, p-centroid) > 0 → outside.
-			// This is robust against the ray-through-vertex degeneracy that
-			// breaks axis-aligned ray casting on icospheres and grid-aligned meshes.
-			var triNormals = new Vector3[triCount];
-			var triCentroids = new Vector3[triCount];
-			for (int t = 0; t < triCount; t++)
-			{
-				Vector3 v0 = verts[tris[t * 3]];
-				Vector3 v1 = verts[tris[t * 3 + 1]];
-				Vector3 v2 = verts[tris[t * 3 + 2]];
-				triNormals[t] = V3Cross(v1 - v0, v2 - v0);   // unnormalised outward normal
-				triCentroids[t] = (v0 + v1 + v2) * (1f / 3f);
-			}
-
-			for (int iz = 0; iz < r; iz++)
-				for (int iy = 0; iy < r; iy++)
-					for (int ix = 0; ix < r; ix++)
-					{
-						var p = new Vector3(
-							b.min.x + (ix + 0.5f) * dx,
-							b.min.y + (iy + 0.5f) * dy,
-							b.min.z + (iz + 0.5f) * dz);
-
-						float minD2 = float.MaxValue;
-						int nearestT = 0;
-
-						for (int t = 0; t < triCount; t++)
-						{
-							Vector3 v0 = verts[tris[t * 3]];
-							Vector3 v1 = verts[tris[t * 3 + 1]];
-							Vector3 v2 = verts[tris[t * 3 + 2]];
-							float d2 = PtTriSq(p, v0, v1, v2);
-							if (d2 < minD2)
-							{
-								minD2 = d2;
-								nearestT = t;
-							}
-						}
-
-						// Sign: dot(outward_normal, p - centroid) < 0 → p is inside mesh.
-						// Robust for any closed manifold mesh — no ray/vertex degeneracy.
-						float dot = V3Dot(triNormals[nearestT], p - triCentroids[nearestT]);
-						float sign = dot < 0f ? -1f : 1f;
-						data[iz * r * r + iy * r + ix] = sign * Mathf.Sqrt(minD2);
-					}
-		}
 		// ═════════════════════════════════════════════════════════════════════
 		// STEP 1: Signed Distance Field
 		// Voxel grid of sdfRes³ cells.
@@ -614,6 +621,228 @@ namespace XPBD.Editor
 		}
 
 
+
+		// ══════════════════════════════════════════════════════════════════
+		// BuildSDF  —  BVH-accelerated signed distance field
+		//
+		// Naive O(voxels × triangles) is ~184M ops for sphere.obj at res=32.
+		// This BVH reduces it to O(voxels × log T) ≈ 1.3M ops → ~100× faster.
+		//
+		// Algorithm:
+		//   1. Build a simple axis-aligned BVH over the mesh triangles
+		//      (top-down median split, depth-limited to log2(T)+1 levels).
+		//   2. For each voxel centre p, traverse the BVH to find the nearest
+		//      triangle and its squared distance.
+		//   3. Sign: dot(face_normal, p − face_centroid) < 0 → inside.
+		// ══════════════════════════════════════════════════════════════════════
+
+		// BVH node: either a leaf (triStart/triCount) or an inner node (left/right child).
+		struct BvhNode
+		{
+			public float minX, minY, minZ, maxX, maxY, maxZ;   // AABB
+			public int left;      // child index, or triStart if leaf
+			public int right;     // child index, or triEnd  if leaf
+			public bool isLeaf;
+		}
+
+		static BvhNode[] BuildBvh(Vector3[] verts, int[] tris, int[] triIdx)
+		{
+			int n = triIdx.Length;
+
+			var nodes = new System.Collections.Generic.List<BvhNode>(n * 2);
+
+			// Recursive build using a stack to avoid C# recursion limit
+			// Stack entry: (nodeIdx, start, end) — [start,end) in triIdx
+			var stack = new System.Collections.Generic.Stack<(int nodeIdx, int s, int e)>();
+
+			// Allocate root node slot
+			nodes.Add(default);
+			stack.Push((0, 0, n));
+
+			while (stack.Count > 0)
+			{
+				var (nodeIdx, s, e) = stack.Pop();
+				BvhNode node = default;
+
+				// Compute AABB for [s,e)
+				node.minX = node.minY = node.minZ = float.MaxValue;
+				node.maxX = node.maxY = node.maxZ = float.MinValue;
+				for (int k = s; k < e; k++)
+				{
+					int t = triIdx[k];
+					for (int vi = 0; vi < 3; vi++)
+					{
+						var v = verts[tris[t * 3 + vi]];
+						if (v.x < node.minX)
+							node.minX = v.x;
+						if (v.x > node.maxX)
+							node.maxX = v.x;
+						if (v.y < node.minY)
+							node.minY = v.y;
+						if (v.y > node.maxY)
+							node.maxY = v.y;
+						if (v.z < node.minZ)
+							node.minZ = v.z;
+						if (v.z > node.maxZ)
+							node.maxZ = v.z;
+					}
+				}
+
+				if (e - s <= 4)  // leaf
+				{
+					node.isLeaf = true;
+					node.left = s;
+					node.right = e;
+					nodes[nodeIdx] = node;
+					continue;
+				}
+
+				// Split on the longest axis at the median centroid
+				float sx = node.maxX - node.minX, sy = node.maxY - node.minY, sz = node.maxZ - node.minZ;
+				int axis = sx >= sy && sx >= sz ? 0 : sy >= sz ? 1 : 2;
+				int mid = (s + e) / 2;
+				// Sort [s,e) by centroid on chosen axis.
+				// cxArr/cyArr/czArr are indexed by position in the ORIGINAL triIdx order
+				// before any sorting, so we must look up by triangle index, not by position.
+				// Rebuild a temp float[] for this sub-range to sort cleanly in O(k log k).
+				{
+					// Build (centroid, triIndex) pairs for sub-range, sort, write back
+					int count = e - s;
+					var pairs = new (float c, int tri)[count];
+					for (int k = 0; k < count; k++)
+					{
+						int t = triIdx[s + k];
+						Vector3 v0 = verts[tris[t * 3]], v1 = verts[tris[t * 3 + 1]], v2 = verts[tris[t * 3 + 2]];
+						float cv = axis == 0 ? (v0.x + v1.x + v2.x) / 3f
+								 : axis == 1 ? (v0.y + v1.y + v2.y) / 3f
+								 : (v0.z + v1.z + v2.z) / 3f;
+						pairs[k] = (cv, t);
+					}
+					System.Array.Sort(pairs, (a2, b2) => a2.c.CompareTo(b2.c));
+					for (int k = 0; k < count; k++)
+						triIdx[s + k] = pairs[k].tri;
+				}
+
+				// Allocate two child slots
+				int leftIdx = nodes.Count;
+				nodes.Add(default);
+				int rightIdx = nodes.Count;
+				nodes.Add(default);
+				node.isLeaf = false;
+				node.left = leftIdx;
+				node.right = rightIdx;
+				nodes[nodeIdx] = node;
+
+				stack.Push((leftIdx, s, mid));
+				stack.Push((rightIdx, mid, e));
+			}
+			return nodes.ToArray();
+		}
+
+		// AABB–point squared distance (0 if inside)
+		static float AabbDistSq(BvhNode n, Vector3 p)
+		{
+			float dx = p.x < n.minX ? n.minX - p.x : p.x > n.maxX ? p.x - n.maxX : 0f;
+			float dy = p.y < n.minY ? n.minY - p.y : p.y > n.maxY ? p.y - n.maxY : 0f;
+			float dz = p.z < n.minZ ? n.minZ - p.z : p.z > n.maxZ ? p.z - n.maxZ : 0f;
+			return dx * dx + dy * dy + dz * dz;
+		}
+
+		static void BuildSDF(Vector3[] verts, int[] tris,
+			ABounds b, int res,
+			out float[] data, out int sdfRes)
+		{
+			sdfRes = res + 1;
+			int r = sdfRes;
+			data = new float[r * r * r];
+			int nTris = tris.Length / 3;
+
+			float dx = b.size.x / res;
+			float dy = b.size.y / res;
+			float dz = b.size.z / res;
+
+			// Pre-compute per-triangle outward normal + centroid (for sign test)
+			var triNormals = new Vector3[nTris];
+			var triCentroids = new Vector3[nTris];
+			for (int t = 0; t < nTris; t++)
+			{
+				Vector3 v0 = verts[tris[t * 3]], v1 = verts[tris[t * 3 + 1]], v2 = verts[tris[t * 3 + 2]];
+				triNormals[t] = V3Cross(v1 - v0, v2 - v0);
+				triCentroids[t] = (v0 + v1 + v2) * (1f / 3f);
+			}
+
+			// Build BVH
+			var triIdx = new int[nTris];
+			for (int i = 0; i < nTris; i++)
+				triIdx[i] = i;
+			var bvh = BuildBvh(verts, tris, triIdx);
+
+			// Query stack (reused across voxels to avoid per-voxel allocation)
+			var queryStack = new int[64];
+
+			for (int iz = 0; iz < r; iz++)
+				for (int iy = 0; iy < r; iy++)
+					for (int ix = 0; ix < r; ix++)
+					{
+						var p = new Vector3(
+							b.min.x + (ix + 0.5f) * dx,
+							b.min.y + (iy + 0.5f) * dy,
+							b.min.z + (iz + 0.5f) * dz);
+
+						// BVH nearest-triangle query
+						float minD2 = float.MaxValue;
+						int nearestT = 0;
+						int top = 0;
+						queryStack[top++] = 0;   // root
+
+						while (top > 0)
+						{
+							var node = bvh[queryStack[--top]];
+
+							if (AabbDistSq(node, p) >= minD2)
+								continue;  // prune
+
+							if (node.isLeaf)
+							{
+								for (int k = node.left; k < node.right; k++)
+								{
+									int t = triIdx[k];
+									float d2 = PtTriSq(p,
+										verts[tris[t * 3]], verts[tris[t * 3 + 1]], verts[tris[t * 3 + 2]]);
+									if (d2 < minD2)
+									{
+										minD2 = d2;
+										nearestT = t;
+									}
+								}
+							}
+							else
+							{
+								// Push farther child first so nearer child is processed first
+								float dLeft = AabbDistSq(bvh[node.left], p);
+								float dRight = AabbDistSq(bvh[node.right], p);
+								if (dLeft < dRight)
+								{
+									if (top < 63)
+										queryStack[top++] = node.right;
+									if (top < 63)
+										queryStack[top++] = node.left;
+								}
+								else
+								{
+									if (top < 63)
+										queryStack[top++] = node.left;
+									if (top < 63)
+										queryStack[top++] = node.right;
+								}
+							}
+						}
+
+						float dot = V3Dot(triNormals[nearestT], p - triCentroids[nearestT]);
+						float sign = dot < 0f ? -1f : 1f;
+						data[iz * r * r + iy * r + ix] = sign * Mathf.Sqrt(minD2);
+					}
+		}
 
 		// Squared distance point → triangle (Ericson, Real-Time Collision Detection)
 		static float PtTriSq(Vector3 p, Vector3 a, Vector3 b, Vector3 c)

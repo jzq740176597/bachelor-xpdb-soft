@@ -112,7 +112,7 @@ namespace XPBD
 	}
 #if UNITY_EDITOR
 	[CustomEditor(typeof(TetrahedralMeshAsset))]
-	class TetrahedralMeshAssetEditor : Editor
+	class TetrahedralMeshAssetEditor : UnityEditor.Editor
 	{
 		public override void OnInspectorGUI()
 		{

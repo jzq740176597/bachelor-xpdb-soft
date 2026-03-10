@@ -10,7 +10,7 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 32ddbff61f94125419644adffd48d909, type: 3}
-  m_Name: cs_mesh_5_v2
+  m_Name: mesh_5_v2
   m_EditorClassIdentifier: 
   Particles:
   - Position: {x: -0.59634537, y: 0.7308082, z: 0.3318061}
