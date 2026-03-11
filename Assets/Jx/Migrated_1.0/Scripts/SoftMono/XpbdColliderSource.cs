@@ -129,10 +129,11 @@ namespace XPBD
 					d.centre = transform.TransformPoint(bc.center);
 					var hs = Vector3.Scale(bc.size * 0.5f, transform.lossyScale);
 					d.axis = transform.right;
-					d.param0 = Mathf.Abs(hs.x);
+					//Fix param0 == 0 NOT Working : CLD_MIN_SIZE_PARAM [3/11/2026 jzq]
+					d.param0 = Mathf.Max(SoftConst.CLD_MIN_SIZE_PARAM, Mathf.Abs(hs.x));
 					d.axis2 = transform.up;
-					d.param1 = Mathf.Abs(hs.y);
-					d.param2 = Mathf.Abs(hs.z);
+					d.param1 = Mathf.Max(SoftConst.CLD_MIN_SIZE_PARAM, Mathf.Abs(hs.y));
+					d.param2 = Mathf.Max(SoftConst.CLD_MIN_SIZE_PARAM, Mathf.Abs(hs.z));
 					break;
 
 				case CapsuleCollider cc:
