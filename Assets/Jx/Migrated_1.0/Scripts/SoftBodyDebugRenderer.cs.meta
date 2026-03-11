@@ -3,7 +3,9 @@ guid: a9c23daaed9843b4f9dff9ecdca68e70
 MonoImporter:
   externalObjects: {}
   serializedVersion: 2
-  defaultReferences: []
+  defaultReferences:
+  - Manager: {instanceID: 0}
+  - TetWireframeMaterial: {fileID: 2100000, guid: 7b906f3e0cb2e0647a57c3e1645822a2, type: 2}
   executionOrder: 0
   icon: {instanceID: 0}
   userData: 

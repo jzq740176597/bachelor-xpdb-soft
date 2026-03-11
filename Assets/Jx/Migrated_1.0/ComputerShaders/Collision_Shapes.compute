@@ -1,0 +1,251 @@
+// Collision_Shapes.compute
+// Analytic primitive collision — Sphere / OBB / Capsule.
+// Supports Static, Kinematic, and Dynamic Rigidbody types.
+// Separate file from Collision_Floor.compute so each file only declares
+// the buffers its own kernels use — Unity validates per-file, not per-kernel.
+
+#pragma kernel ClearImpulseAccum
+#pragma kernel DetectShapes
+#pragma kernel SolveCollisions
+
+#pragma target 5.0
+
+#define EPSILON           1e-6
+#define MAX_CONSTRAINTS   10000
+#define GROUP_SIZE        32
+#define IMPULSE_STRIDE    32u
+
+#define COL_STATIC        0u
+#define COL_KINEMATIC     1u
+#define COL_DYNAMIC       2u
+
+#define SHAPE_SPHERE      0u
+#define SHAPE_OBB         1u
+#define SHAPE_CAPSULE     2u
+
+// ImpulseBytes layout per dynamic slot (32 bytes):
+//   +0   impulse.xyz  (float×3, atomic CAS)
+//   +12  hitCount     (uint,    InterlockedAdd)
+//   +16  contactSum.xyz (float×3, atomic CAS)
+//   +28  _pad
+
+// ── Structs ───────────────────────────────────────────────────────────────────
+
+struct ShapeDescriptor
+{
+	uint   shapeType; uint colType; uint dynSlot; float rbInvMass; // word 0
+	float3 centre;    float param0;                                 // word 1
+	float3 axis;      float param1;                                 // word 2
+	float3 axis2;     float param2;                                 // word 3
+};
+
+struct Particle
+{
+	float3 position; float _p0;
+	float3 velocity; float invMass;
+};
+
+struct PbdPositions
+{
+	float3 predict; float _p0;
+	float3 delta;   float _p1;
+};
+
+struct ColConstraint
+{
+	float3 contactPt;
+	uint   pIdx;
+	float3 normal;
+	float  surfVelN;
+	uint   colType;
+	uint   dynSlot;
+	float  rbInvMass;
+	float  _pad;
+};
+
+// ── Uniforms ──────────────────────────────────────────────────────────────────
+
+float _ColDeltaTime;
+uint  _ShapeCount;
+uint  _ParticleCount;
+uint  _DynSlotCount;
+
+// ── Buffers ───────────────────────────────────────────────────────────────────
+
+StructuredBuffer<ShapeDescriptor>  _Shapes;
+StructuredBuffer<float3>           _ShapeVelocities;
+
+RWStructuredBuffer<Particle>       _Particles;
+RWStructuredBuffer<PbdPositions>   _Positions;
+RWStructuredBuffer<uint>           _ColSize;
+RWStructuredBuffer<ColConstraint>  _ColConstraints;
+
+RWByteAddressBuffer                _ImpulseBytes;
+
+// ── Atomic float add (CAS) ────────────────────────────────────────────────────
+
+void AtomicAddF(uint addr, float v)
+{
+	uint prev = _ImpulseBytes.Load(addr);
+	uint next;
+	[allow_uav_condition]
+	do {
+		next = asuint(asfloat(prev) + v);
+		uint orig;
+		_ImpulseBytes.InterlockedCompareExchange(addr, prev, next, orig);
+		if (orig == prev) break;
+		prev = orig;
+	} while (true);
+}
+
+// ── Kernel: ClearImpulseAccum ─────────────────────────────────────────────────
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ClearImpulseAccum(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= _DynSlotCount) return;
+	uint b = id.x * IMPULSE_STRIDE;
+	_ImpulseBytes.Store(b +  0, 0u);
+	_ImpulseBytes.Store(b +  4, 0u);
+	_ImpulseBytes.Store(b +  8, 0u);
+	_ImpulseBytes.Store(b + 12, 0u);
+	_ImpulseBytes.Store(b + 16, 0u);
+	_ImpulseBytes.Store(b + 20, 0u);
+	_ImpulseBytes.Store(b + 24, 0u);
+	_ImpulseBytes.Store(b + 28, 0u);
+}
+
+// ── Analytic contact helpers ──────────────────────────────────────────────────
+
+bool TestSphere(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
+{
+	cp = 0; n = float3(0,1,0);
+	float3 d = p - s.centre;
+	float  r = s.param0;
+	float  d2= dot(d,d);
+	if (d2 >= r*r) return false;
+	float dist = sqrt(d2);
+	n  = dist > EPSILON ? d/dist : float3(0,1,0);
+	cp = s.centre + n*r;
+	return true;
+}
+
+bool TestOBB(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
+{
+	cp = 0; n = float3(0,1,0);
+	float3 d  = p - s.centre;
+	float3 ax = s.axis, ay = s.axis2, az = cross(ax, ay);
+	float  lx = dot(d,ax), ly = dot(d,ay), lz = dot(d,az);
+	float  hx = s.param0,  hy = s.param1,  hz = s.param2;
+	if (abs(lx)>=hx || abs(ly)>=hy || abs(lz)>=hz) return false;
+	float px=hx-abs(lx), py=hy-abs(ly), pz=hz-abs(lz);
+	if      (px<=py && px<=pz) { n=ax*sign(lx); cp=s.centre+ax*(hx*sign(lx))+ay*ly+az*lz; }
+	else if (py<=pz)           { n=ay*sign(ly); cp=s.centre+ax*lx+ay*(hy*sign(ly))+az*lz; }
+	else                       { n=az*sign(lz); cp=s.centre+ax*lx+ay*ly+az*(hz*sign(lz)); }
+	return true;
+}
+
+bool TestCapsule(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
+{
+	cp = 0; n = float3(0,1,0);
+	float3 a = s.centre - s.axis*s.param1;
+	float3 b = s.centre + s.axis*s.param1;
+	float3 ab= b - a;
+	float  r = s.param0;
+	float  t = saturate(dot(p-a, ab) / max(dot(ab,ab), EPSILON));
+	float3 cl= a + ab*t;
+	float3 d = p - cl;
+	float  d2= dot(d,d);
+	if (d2 >= r*r) return false;
+	float dist = sqrt(d2);
+	n  = dist > EPSILON ? d/dist : float3(0,1,0);
+	cp = cl + n*r;
+	return true;
+}
+
+// ── Kernel: DetectShapes ──────────────────────────────────────────────────────
+// One thread per (shape × particle). Thread index = si*_ParticleCount + pi.
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void DetectShapes(uint3 id : SV_DispatchThreadID)
+{
+	uint total = _ShapeCount * _ParticleCount;
+	if (id.x >= total) return;
+
+	uint si = id.x / _ParticleCount;
+	uint pi = id.x % _ParticleCount;
+
+	ShapeDescriptor s = _Shapes[si];
+	float3 p = _Positions[pi].predict;
+
+	float3 cp, n;
+	bool   hit;
+	if      (s.shapeType == SHAPE_SPHERE)  hit = TestSphere (s, p, cp, n);
+	else if (s.shapeType == SHAPE_OBB)     hit = TestOBB    (s, p, cp, n);
+	else                                   hit = TestCapsule(s, p, cp, n);
+	if (!hit) return;
+
+	uint slot;
+	InterlockedAdd(_ColSize[0], 1u, slot);
+	if (slot >= MAX_CONSTRAINTS) return;
+
+	float3 sv = _ShapeVelocities[si];
+
+	ColConstraint c;
+	c.contactPt  = cp;
+	c.pIdx       = pi;
+	c.normal     = n;
+	c.surfVelN   = dot(sv, n);
+	c.colType    = s.colType;
+	c.dynSlot    = s.dynSlot;
+	c.rbInvMass  = s.rbInvMass;
+	c._pad       = 0;
+	_ColConstraints[slot] = c;
+}
+
+// ── Kernel: SolveCollisions ───────────────────────────────────────────────────
+// Mass-weighted position correction + velocity response.
+// Dynamic: accumulates Newton-3rd impulse into _ImpulseBytes.
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void SolveCollisions(uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.x;
+	if (i >= _ColSize[0] || i >= MAX_CONSTRAINTS) return;
+
+	ColConstraint c = _ColConstraints[i];
+	float3 pos = _Positions[c.pIdx].predict;
+	float3 nrm = c.normal;
+
+	float pen = dot(pos - c.contactPt, nrm);
+	if (pen >= 0.0) return;
+
+	float3 corr = -nrm * pen;
+
+	// Mass-weighted correction split
+	float pInv = _Particles[c.pIdx].invMass;
+	float cInv = c.rbInvMass;
+	float wTot = pInv + cInv;
+	_Positions[c.pIdx].predict = pos + ((wTot > EPSILON) ? corr*(pInv/wTot) : corr);
+
+	// Velocity: kill relative inward component, inherit surface velocity
+	float3 pVel  = _Particles[c.pIdx].velocity;
+	float  vRelN = dot(pVel, nrm) - c.surfVelN;
+	if (vRelN < 0.0)
+		_Particles[c.pIdx].velocity -= nrm * vRelN;
+
+	// Dynamic: Newton-3rd impulse
+	if (c.colType == COL_DYNAMIC && wTot > EPSILON)
+	{
+		float3 rbImp = -corr * (cInv/wTot) / _ColDeltaTime;
+		uint   b     = c.dynSlot * IMPULSE_STRIDE;
+		AtomicAddF(b +  0, rbImp.x);
+		AtomicAddF(b +  4, rbImp.y);
+		AtomicAddF(b +  8, rbImp.z);
+		AtomicAddF(b + 16, c.contactPt.x);
+		AtomicAddF(b + 20, c.contactPt.y);
+		AtomicAddF(b + 24, c.contactPt.z);
+		uint dummy;
+		_ImpulseBytes.InterlockedAdd(b + 12, 1u, dummy);
+	}
+}

@@ -5,11 +5,10 @@ MonoImporter:
   serializedVersion: 2
   defaultReferences:
   - SoftBodySimCS: {fileID: 7200000, guid: 083384a4c37b66743b9a76c82bd162bd, type: 3}
-  - CollisionCS: {fileID: 7200000, guid: c7f19b24679315346acd9abf4be26a68, type: 3}
+  - CollisionFloorCS: {fileID: 7200000, guid: e79309577b612be469bd3f4a4cfc2a15, type: 3}
+  - CollisionShapesCS: {fileID: 7200000, guid: 7f9439041d81b494282cf35dd273d234, type: 3}
   - DeformCS: {fileID: 7200000, guid: 21cc22ea2a32d254e885707879d019ec, type: 3}
   - CollisionMesh: {instanceID: 0}
-  - SoftBodyMaterial: {instanceID: 0}
-  - DirectionalLight: {instanceID: 0}
   executionOrder: 0
   icon: {instanceID: 0}
   userData: 
