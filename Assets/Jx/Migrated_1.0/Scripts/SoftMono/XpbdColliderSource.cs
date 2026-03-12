@@ -100,6 +100,10 @@ namespace XPBD
 		Quaternion _prevRot;
 		// Local-space planes for convex mesh (computed once in Awake).
 		Vector4[] _localPlanes;
+		// Dirty-tracking for Static convex — re-transform only when moved.
+		Vector3 _cachedConvexPos = new Vector3(float.MaxValue, 0, 0);
+		Quaternion _cachedConvexRot = Quaternion.identity;
+
 		// [3/12/2026 jzq]
 		static bool ValidateCld_S(Collider c)
 		{
@@ -159,8 +163,8 @@ namespace XPBD
 					//}
 					Shape = ShapeType.Convex;
 					_localPlanes = ExtractConvexPlanes(mc.sharedMesh);
-					if (Type == ColType.Static)
-						FacePlanes = TransformPlanes(_localPlanes, transform.localToWorldMatrix);
+					// FacePlanes transformed on first RefreshDescriptor (not cached in Awake)
+					// so that moving a Static MeshCollider at runtime is always reflected.
 					break;
 				case SphereCollider:
 					Shape = ShapeType.Sphere;
@@ -181,6 +185,9 @@ namespace XPBD
 		void OnDisable() => SoftBodySimulationManager.Instance?.UnregisterCollider(this);
 
 		// ─────────────────────────────────────────────────────────────────────
+		// Called by manager each fixed step. Updates surface velocity and
+		// rebuilds the ShapeDescriptorCPU from current Unity transform state.
+		// ─────────────────────────────────────────────────────────────────────
 		public void RefreshDescriptor(float dt, uint dynSlot)
 		{
 			SurfaceVelocity =
@@ -191,8 +198,22 @@ namespace XPBD
 			_prevPos = transform.position;
 			_prevRot = transform.rotation;
 
-			if (Shape == ShapeType.Convex && Type != ColType.Static)
-				FacePlanes = TransformPlanes(_localPlanes, transform.localToWorldMatrix);
+			// Convex face planes: always re-transform when the transform changed.
+			// Static bodies are expected to stay put — we only re-bake when they actually move
+			// (fixes mismatch with BoxCollider which always reads transform live).
+			if (Shape == ShapeType.Convex)
+			{
+				var pos = transform.position;
+				var rot = transform.rotation;
+				bool moved = (pos - _cachedConvexPos).sqrMagnitude > 1e-8f
+						  || Mathf.Abs(Quaternion.Dot(rot, _cachedConvexRot)) < 1f - 1e-6f;
+				if (moved || FacePlanes == null)
+				{
+					FacePlanes = TransformPlanes(_localPlanes, transform.localToWorldMatrix);
+					_cachedConvexPos = pos;
+					_cachedConvexRot = rot;
+				}
+			}
 
 			float rbInvMass = Type == ColType.Dynamic && Body && Body.mass > 0f
 							? 1f / Body.mass : 0f;
@@ -249,14 +270,24 @@ namespace XPBD
 						break;
 					}
 
-				case MeshCollider:
-					// Convex mesh: manager already set FacePlanesOffset
-					d.centre = transform.position;
-					d.param0 = System.BitConverter.ToSingle(
-						System.BitConverter.GetBytes(FacePlanesOffset), 0);
-					d.param1 = System.BitConverter.ToSingle(
-						System.BitConverter.GetBytes((uint) (FacePlanes?.Length ?? 0)), 0);
-					break;
+				case MeshCollider mc2:
+					{
+						// centre unused by GPU for Convex (planes are already world-space)
+						d.centre = transform.position;
+						// param0 = faceOffset (uint reinterpreted as float)
+						d.param0 = System.BitConverter.ToSingle(
+							System.BitConverter.GetBytes(FacePlanesOffset), 0);
+						// param1 = faceCount (uint reinterpreted as float)
+						d.param1 = System.BitConverter.ToSingle(
+							System.BitConverter.GetBytes((uint) (FacePlanes?.Length ?? 0)), 0);
+						// axis  = world-space AABB centre  (for bounds-reject in TestConvex)
+						// axis2 = world-space AABB half-extents (for exact per-axis reject)
+						// mc2.bounds is always world-space; Unity keeps it current automatically.
+						var b = mc2.bounds;
+						d.axis = b.center;
+						d.axis2 = b.extents;
+						break;
+					}
 			}
 
 			return d;
@@ -274,7 +305,6 @@ namespace XPBD
 			var verts = mesh.vertices;
 			var tris = mesh.triangles;
 			var planes = new List<Vector4>();
-
 			for (int i = 0; i < tris.Length; i += 3)
 			{
 				var v0 = verts[tris[i]];
@@ -285,7 +315,6 @@ namespace XPBD
 					continue;
 				n.Normalize();
 				float d = -Vector3.Dot(n, v0);
-
 				bool dup = false;
 				foreach (var pl in planes)
 				{

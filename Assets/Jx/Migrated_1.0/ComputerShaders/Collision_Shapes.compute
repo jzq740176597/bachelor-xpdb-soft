@@ -23,8 +23,12 @@
 //             param1=halfY         (interior mode, thick box)
 //             param1=-halfY        (CCD mode, thin/flat box: segment vs face)
 //   Capsule:  centre, axis=segAxis, param0=radius, param1=halfHeight
-//   Convex:   centre=meshOrigin,
-//             param0=asuint(faceOffset), param1=asuint(faceCount)
+//   Convex:   centre=meshOrigin (unused by GPU),
+//             param0=asuint(faceOffset), param1=asuint(faceCount),
+//             axis=worldAABB_centre, axis2=worldAABB_halfExtents,
+//             param2 unused
+//   AABB reject runs before face-plane test to prevent "infinite plane" on
+//   degenerate meshes (flat quads, single-sided surfaces).
 //
 // _MeshFacePlanes : float4[] — world-space face planes for ALL convex meshes
 //   packed flat; plane = float4(normal.xyz, d)
@@ -258,6 +262,16 @@ bool TestCapsule(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 bool TestConvex(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 {
 	cp = 0; n = float3(0,1,0);
+
+	// ── AABB bounds reject ───────────────────────────────────────────────────
+	// axis  = world-space AABB centre, axis2 = world-space AABB half-extents.
+	// Rejects particles outside the mesh's bounding box before any face test.
+	// This fixes "infinite plane" behaviour for flat/open convex meshes that
+	// have too few face planes to constrain all lateral directions.
+	float3 bDelta = abs(p - s.axis) - s.axis2;
+	if (bDelta.x > 0.0 || bDelta.y > 0.0 || bDelta.z > 0.0) return false;
+
+	// ── Face-plane inside test ───────────────────────────────────────────────
 	uint faceOffset = asuint(s.param0);
 	uint faceCount  = asuint(s.param1);
 	if (faceCount == 0u) return false;
