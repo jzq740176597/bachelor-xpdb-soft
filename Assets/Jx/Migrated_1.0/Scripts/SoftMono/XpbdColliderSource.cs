@@ -249,7 +249,15 @@ namespace XPBD
 						d.axis2 = transform.up;      // world local-Y
 						float hy = Mathf.Abs(hs.y);
 						// Negative param1 signals CCD mode to the GPU (TestOBB_CCD).
-						d.param1 = (EnableCCD && hy < OBB_CCD_THRESHOLD) ? -hy : hy;
+						// IMPORTANT: clamp hy to a small positive value before negating.
+						// A flat BoxCollider (Size.y=0) gives hy=0 — negating yields
+						// -0.0f, which is bit-equal to +0.0f and fails the GPU sign-bit
+						// CCD check (s.param1 < 0 is false for -0.0 on most GPUs).
+						// 1e-4f (0.1mm) is invisible but guarantees strictly-negative param1.
+						if (EnableCCD && hy < OBB_CCD_THRESHOLD)
+							d.param1 = -Mathf.Max(hy, 1e-4f);
+						else
+							d.param1 = hy;
 						d.param2 = Mathf.Abs(hs.z);
 						// GPU TestOBB: if param1 < OBB_CCD_THRESHOLD → CCD segment vs face
 						// The GPU threshold must match OBB_CCD_THRESHOLD = 0.1 (see compute shader)

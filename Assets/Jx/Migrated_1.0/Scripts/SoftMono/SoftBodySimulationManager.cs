@@ -78,6 +78,10 @@ namespace XPBD
 		// Canonical key: (lower instanceID, higher instanceID) so (A,B)==(B,A).
 		// Value is null until first EnsureSoftSoftPairBuffers allocates it.
 		readonly Dictionary<(int, int), SoftSoftPairBuffers> _softSoftPairs = new();
+		// Tracks which pairs have already run Clear+Detect in the current substep.
+		// Prevents the second body in a pair from re-clearing and re-detecting,
+		// which would erase the corrections accumulated for the first body's Apply.
+		readonly HashSet<(int, int)> _softSoftDetectedThisStep = new();
 
 		// ── Rigid-collision GPU buffers ───────────────────────────────────────
 		ComputeBuffer _shapesBuffer;
@@ -149,12 +153,21 @@ namespace XPBD
 			if (hasSoftSoft)
 				EnsureSoftSoftPairBuffers();
 
+			for (int s = 0; s < SubSteps; s++)
+			{
+				// Reset per-substep detect set so Clear+Detect runs exactly once per pair.
+				_softSoftDetectedThisStep.Clear();
+				foreach (var body in _bodies)
+				{
+					if (!body)
+						continue;
+					DispatchSubstep(body.State, hasRigid, hasSoftSoft);
+				}
+			}
 			foreach (var body in _bodies)
 			{
 				if (!body)
 					continue;
-				for (int s = 0; s < SubSteps; s++)
-					DispatchSubstep(body.State, hasRigid, hasSoftSoft);
 				DispatchDeform(body);
 			}
 
@@ -457,31 +470,38 @@ namespace XPBD
 				int nA = a.State.ParticleCount;
 				int nB = b.State.ParticleCount;
 
-				// ── Clear delta buffers ────────────────────────────────────────
-				// ClearSoftSoftDelta zeros _DeltaBufA for _CountA particles.
-				// Call twice, rebinding to clear both sides.
-				cs.SetInt("_CountA", nA);
-				cs.SetBuffer(_kClearSoftSoftDelta, "_DeltaBufA", bufs.DeltaA);
-				cs.Dispatch(_kClearSoftSoftDelta, Ceil(nA), 1, 1);
+				// ── Clear + Detect (once per pair per substep) ──────────────────
+				// _softSoftDetectedThisStep is cleared once per substep in Update.
+				// The first body to reach this pair runs Clear+Detect.
+				// The second body skips straight to Apply, reading the shared delta buffer.
+				var pairKey = kvp.Key;
+				if (!_softSoftDetectedThisStep.Contains(pairKey))
+				{
+					_softSoftDetectedThisStep.Add(pairKey);
 
-				cs.SetInt("_CountA", nB);
-				cs.SetBuffer(_kClearSoftSoftDelta, "_DeltaBufA", bufs.DeltaB);
-				cs.Dispatch(_kClearSoftSoftDelta, Ceil(nB), 1, 1);
+					// Clear A's delta buffer
+					cs.SetInt("_CountA", nA);
+					cs.SetBuffer(_kClearSoftSoftDelta, "_DeltaBufA", bufs.DeltaA);
+					cs.Dispatch(_kClearSoftSoftDelta, Ceil(nA), 1, 1);
+					// Clear B's delta buffer
+					cs.SetInt("_CountA", nB);
+					cs.SetBuffer(_kClearSoftSoftDelta, "_DeltaBufA", bufs.DeltaB);
+					cs.Dispatch(_kClearSoftSoftDelta, Ceil(nB), 1, 1);
 
-				// ── Detect ────────────────────────────────────────────────────
-				// 2D dispatch: X covers CountA (group=8), Y covers CountB (group=8).
-				cs.SetInt("_CountA", nA);
-				cs.SetInt("_CountB", nB);
-				cs.SetFloat("_ColRadius", radius);
-				cs.SetBuffer(_kDetectSoftSoft, "_ParticlesA", a.State.ParticleBuffer);
-				cs.SetBuffer(_kDetectSoftSoft, "_PositionsA", a.State.PositionsBuffer);
-				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufA", bufs.DeltaA);
-				cs.SetBuffer(_kDetectSoftSoft, "_ParticlesB", b.State.ParticleBuffer);
-				cs.SetBuffer(_kDetectSoftSoft, "_PositionsB", b.State.PositionsBuffer);
-				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufB", bufs.DeltaB);
-				cs.Dispatch(_kDetectSoftSoft, CeilN(nA, 8), CeilN(nB, 8), 1);
+					// Detect: 2D dispatch over CountA x CountB particles
+					cs.SetInt  ("_CountA",    nA);
+					cs.SetInt  ("_CountB",    nB);
+					cs.SetFloat("_ColRadius", radius);
+					cs.SetBuffer(_kDetectSoftSoft, "_ParticlesA", a.State.ParticleBuffer);
+					cs.SetBuffer(_kDetectSoftSoft, "_PositionsA", a.State.PositionsBuffer);
+					cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufA",  bufs.DeltaA);
+					cs.SetBuffer(_kDetectSoftSoft, "_ParticlesB", b.State.ParticleBuffer);
+					cs.SetBuffer(_kDetectSoftSoft, "_PositionsB", b.State.PositionsBuffer);
+					cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufB",  bufs.DeltaB);
+					cs.Dispatch(_kDetectSoftSoft, CeilN(nA, 8), CeilN(nB, 8), 1);
+				}
 
-				// ── Apply ─────────────────────────────────────────────────────
+				// ── Apply this body's side ────────────────────────────────────
 				// ApplySoftSoftDelta reuses _DeltaBufA + _PositionsA + _CountA.
 				if (isA)
 				{

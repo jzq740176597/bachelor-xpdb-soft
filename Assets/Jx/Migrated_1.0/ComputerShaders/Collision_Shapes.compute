@@ -65,7 +65,6 @@
 //   +12  hitCount     (uint,    InterlockedAdd)
 //   +16  contactSum.xyz (float×3, atomic CAS)
 //   +28  _pad
-
 // ── Structs ───────────────────────────────────────────────────────────────────
 
 struct ShapeDescriptor
@@ -231,8 +230,12 @@ bool TestOBB_CCD(ShapeDescriptor s, float3 prev, float3 p, out float3 cp, out fl
 
 bool TestOBB(ShapeDescriptor s, float3 prev, float3 p, out float3 cp, out float3 n)
 {
-	// param1 < 0 → CCD mode (flat/thin box); param1 >= 0 → interior mode
-	if (s.param1 < 0.0)
+	// Route to CCD or interior via sign-bit of param1 (NOT a magnitude comparison).
+	// A flat BoxCollider (Size.y=0) encodes -0.0f on the CPU. In IEEE 754, -0.0 == +0.0
+	// so "param1 < 0.0" is false for -0.0 on all conforming GPUs. The sign-bit test
+	// (asuint & 0x80000000) correctly identifies -0.0 as "negative" → CCD path.
+	bool isCCD = (asuint(s.param1) & 0x80000000u) != 0u;
+	if (isCCD)
 		return TestOBB_CCD(s, prev, p, cp, n);
 	else
 		return TestOBB_Interior(s, p, cp, n);
@@ -303,7 +306,6 @@ void DetectShapes(uint3 id : SV_DispatchThreadID)
 {
 	uint total = _ShapeCount * _ParticleCount;
 	if (id.x >= total) return;
-
 	uint si = id.x / _ParticleCount;
 	uint pi = id.x % _ParticleCount;
 
@@ -353,12 +355,11 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 	if (pen >= 0.0) return;
 
 	float3 corr = -nrm * pen;
-
 	// Mass-weighted correction split
-	float pInv = _Particles[c.pIdx].invMass;
-	float cInv = c.rbInvMass;
-	float wTot = pInv + cInv;
-	_Positions[c.pIdx].predict = pos + ((wTot > EPSILON) ? corr*(pInv/wTot) : corr);
+	float  pInv = _Particles[c.pIdx].invMass;
+	float  cInv = c.rbInvMass;
+	float  wTot = pInv + cInv;
+	_Positions[c.pIdx].predict = pos + ((wTot > EPSILON) ? corr * (pInv / wTot) : corr);
 
 	// Velocity: kill relative inward component, inherit surface velocity
 	float3 pVel  = _Particles[c.pIdx].velocity;
