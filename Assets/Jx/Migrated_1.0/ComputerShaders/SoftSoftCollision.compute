@@ -1,0 +1,144 @@
+// SoftSoftCollision.compute
+//
+// Particle-particle bilateral collision between two XPBD soft bodies.
+// One dispatch per registered (BodyA, BodyB) pair, per substep.
+//
+// Strategy: point-vs-point proximity test.
+//   If dist(pA, pB) < CollisionRadius → bilateral push-apart correction,
+//   mass-weighted, accumulated atomically into per-body SoftSoftDeltaBuffers.
+//   A separate ApplySoftSoftDelta kernel commits the accumulated deltas.
+//
+// GPU buffers (A-side and B-side bound separately per dispatch):
+//   _ParticlesA / _PositionsA / _DeltaBufA   — body A
+//   _ParticlesB / _PositionsB / _DeltaBufB   — body B
+//
+// Uniforms:
+//   _CountA          particle count for A
+//   _CountB          particle count for B
+//   _ColRadius       contact distance threshold (sum of both particle radii)
+//
+// DeltaBuf layout per particle (12 bytes, 3 atomic floats):
+//   [particleIdx * 12 + 0]  delta.x
+//   [particleIdx * 12 + 4]  delta.y
+//   [particleIdx * 12 + 8]  delta.z
+
+#pragma kernel ClearSoftSoftDelta
+#pragma kernel DetectSoftSoft
+#pragma kernel ApplySoftSoftDelta
+
+#pragma target 5.0
+
+#define EPSILON     1e-6
+#define GROUP_SIZE  64   // larger group for 2D dispatch
+
+struct Particle     { float3 position; float _p0; float3 velocity; float invMass; };
+struct PbdPositions { float3 predict;  float _p0; float3 delta;    float _p1;    };
+
+// ── Uniforms ──────────────────────────────────────────────────────────────────
+
+uint  _CountA;
+uint  _CountB;
+float _ColRadius;   // contact threshold (e.g. 0.05 for small soft bodies)
+
+// ── Buffers ───────────────────────────────────────────────────────────────────
+
+StructuredBuffer<Particle>     _ParticlesA;
+RWStructuredBuffer<PbdPositions> _PositionsA;
+RWByteAddressBuffer              _DeltaBufA;
+
+StructuredBuffer<Particle>     _ParticlesB;
+RWStructuredBuffer<PbdPositions> _PositionsB;
+RWByteAddressBuffer              _DeltaBufB;
+
+// ── Atomic float add (CAS) ────────────────────────────────────────────────────
+
+void AtomicAddFA(RWByteAddressBuffer buf, uint addr, float v)
+{
+	uint prev = buf.Load(addr);
+	uint next;
+	[allow_uav_condition]
+	do {
+		next = asuint(asfloat(prev) + v);
+		uint orig;
+		buf.InterlockedCompareExchange(addr, prev, next, orig);
+		if (orig == prev) break;
+		prev = orig;
+	} while (true);
+}
+
+// ── Kernel: ClearSoftSoftDelta ────────────────────────────────────────────────
+// Zeros one body's delta buffer. Dispatch with count = particle count of that body.
+// Call twice (once for A, once for B) by rebinding _DeltaBufA / _CountA.
+// (Manager dispatches ClearSoftSoftDelta twice per pair, swapping which buffer
+//  is bound to _DeltaBufA — simpler than a separate clear-B kernel.)
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ClearSoftSoftDelta(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= _CountA) return;
+	uint b = id.x * 12u;
+	_DeltaBufA.Store(b + 0u, 0u);
+	_DeltaBufA.Store(b + 4u, 0u);
+	_DeltaBufA.Store(b + 8u, 0u);
+}
+
+// ── Kernel: DetectSoftSoft ────────────────────────────────────────────────────
+// 2D dispatch: thread (i, j) tests particle i of A against particle j of B.
+// Dispatch groups: Ceil(CountA / GROUP_SIZE_X), Ceil(CountB / GROUP_SIZE_Y), 1
+// where GROUP_SIZE_X = GROUP_SIZE_Y = 8 → 64 threads per group in 8×8 tile.
+
+[numthreads(8, 8, 1)]
+void DetectSoftSoft(uint3 id : SV_DispatchThreadID)
+{
+	uint ai = id.x;
+	uint bi = id.y;
+	if (ai >= _CountA || bi >= _CountB) return;
+
+	float3 pa = _PositionsA[ai].predict;
+	float3 pb = _PositionsB[bi].predict;
+	float3 d  = pa - pb;
+	float  r2 = dot(d, d);
+	float  cr = _ColRadius;
+
+	if (r2 >= cr * cr || r2 < EPSILON) return;
+
+	float  dist = sqrt(r2);
+	float  pen  = cr - dist;
+	float3 n    = d / dist;   // normal pointing from B toward A
+
+	float wA  = _ParticlesA[ai].invMass;
+	float wB  = _ParticlesB[bi].invMass;
+	float wTot = wA + wB;
+	if (wTot < EPSILON) return;
+
+	float3 corrA =  n * pen * (wA / wTot);
+	float3 corrB = -n * pen * (wB / wTot);
+
+	// Accumulate into per-body delta buffers (atomic)
+	uint ba = ai * 12u;
+	AtomicAddFA(_DeltaBufA, ba + 0u, corrA.x);
+	AtomicAddFA(_DeltaBufA, ba + 4u, corrA.y);
+	AtomicAddFA(_DeltaBufA, ba + 8u, corrA.z);
+
+	uint bb = bi * 12u;
+	AtomicAddFA(_DeltaBufB, bb + 0u, corrB.x);
+	AtomicAddFA(_DeltaBufB, bb + 4u, corrB.y);
+	AtomicAddFA(_DeltaBufB, bb + 8u, corrB.z);
+}
+
+// ── Kernel: ApplySoftSoftDelta ────────────────────────────────────────────────
+// Reads accumulated delta for each particle and adds it to predict.
+// Bind _DeltaBufA + _PositionsA, dispatch Ceil(CountA). Then repeat for B.
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ApplySoftSoftDelta(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= _CountA) return;
+
+	uint   b  = id.x * 12u;
+	float  dx = asfloat(_DeltaBufA.Load(b + 0u));
+	float  dy = asfloat(_DeltaBufA.Load(b + 4u));
+	float  dz = asfloat(_DeltaBufA.Load(b + 8u));
+
+	_PositionsA[id.x].predict += float3(dx, dy, dz);
+}

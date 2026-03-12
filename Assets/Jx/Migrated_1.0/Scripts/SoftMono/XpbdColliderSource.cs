@@ -1,31 +1,27 @@
 // XpbdColliderSource.cs
 //
 // Supported colliders:
-//   SphereCollider  → SHAPE_SPHERE  (analytic)
-//   BoxCollider     → SHAPE_OBB     (analytic OBB)
-//   CapsuleCollider → SHAPE_CAPSULE (analytic, spherical end-caps)
-//   MeshCollider    → SHAPE_CONVEX  (face-plane inside test; convex=true required)
-//
-// Collider kind auto-detected:
-//   Static    — no Rigidbody
-//   Kinematic — Rigidbody.isKinematic
-//   Dynamic   — Rigidbody present and not kinematic
+//   SphereCollider  → SHAPE_SPHERE  (interior test, analytic)
+//   BoxCollider     → SHAPE_OBB     (CCD segment vs face for thin/flat boxes;
+//                                    interior test for thick boxes)
+//   CapsuleCollider → SHAPE_CAPSULE (interior test, analytic)
+//   MeshCollider    → SHAPE_CONVEX  (face-plane interior test; convex=true required)
 //
 // ── OBB floor note ────────────────────────────────────────────────────────────
-// The GPU OBB test is a pure interior test: a particle must be INSIDE the box
-// to register a contact. A BoxCollider used as a floor typically has Size.y = 0
-// or a very small value, making the detection band too narrow to catch fast-
-// moving particles (at 60 fps with gravity, a particle moves ~0.17 m per fixed
-// step — far more than a 0.001 m half-height).
+// A flat BoxCollider floor (Size.y = 0 or very small) needs CCD to avoid:
+//   a) Missing fast particles that tunnel through between fixed steps
+//   b) Catching slow particles that are already deep inside an extended slab,
+//      causing large differential corrections that explode the soft body
 //
-// Fix: when hy < OBB_FLOOR_EXTEND the GPU descriptor extends the box downward
-// by OBB_FLOOR_EXTEND, keeping the top face at exactly the same world position.
-// The top-face normal selection (py wins when particle is near the surface) is
-// unaffected because the particle will always be much closer to the top face
-// than to the new deep bottom.
+// When hy < OBB_CCD_THRESHOLD the GPU test changes from interior to CCD:
+//   DetectShapes passes _Particles[pi].position (start of fixed step) plus
+//   predict (end) to TestOBB. The shader casts a segment against the top face
+//   of the OBB and uses the intersection point as contactPt.
+//   This is encoded by setting param2 = OBB_USE_CCD_MARKER in the descriptor.
 //
-// OBB_FLOOR_EXTEND = 2.0f means the box reaches 2 m below its top surface,
-// safely catching any particle moving up to ~120 m/s at 60 fps.
+// GPU TestOBB reads param2:
+//   param2 > 0 → CCD mode:  segment vs top/bottom face crossing test
+//   param2 = 0 → interior mode: normal thick-box test (3D slab)
 
 using System.Collections.Generic;
 using UnityEngine;
@@ -45,10 +41,26 @@ namespace XPBD
 			Sphere = 0, OBB = 1, Capsule = 2, Convex = 4
 		}
 
-		// Minimum OBB half-extent in the thin axis before the floor-extend kicks in.
-		// Any hy below this triggers the extension.
-		const float OBB_FLOOR_EXTEND = 2.0f;
-		const float OBB_THIN_THRESHOLD = OBB_FLOOR_EXTEND; // extend whenever hy < this
+		// When the OBB half-height in the normal axis is below this threshold,
+		// the descriptor encodes CCD mode (param1 = -halfY).
+		// 0.1m covers any reasonable floor thickness.
+		const float OBB_CCD_THRESHOLD = 0.1f;
+
+		// ── Inspector ─────────────────────────────────────────────────────────
+		[Header("CCD (Continuous Collision Detection)")]
+		[Tooltip("Encode CCD mode for thin/flat OBB colliders (floors, walls). " +
+				 "Prevents tunneling at the cost of a segment-vs-face test per substep. " +
+				 "Disable if the collider is thick enough that tunneling can't occur.")]
+		public bool EnableCCD = true;
+		// Sentinel written into param2 to signal CCD mode to the GPU.
+		// Must be > 0 so the GPU can distinguish it from a real halfZ.
+		// We still encode the real halfZ into a separate field — see below.
+		// For OBB CCD: we repurpose ShapeDescriptor as:
+		//   param0 = halfX  param1 = halfY (thin)  param2 = halfZ
+		//   axis2  = worldUp (already there)
+		// The CCD flag is signalled by param1 < OBB_CCD_THRESHOLD
+		// → GPU simply checks: if (hy < CCD_THRESHOLD) → CCD path
+		// No extra field needed.
 
 		// ── Runtime properties ────────────────────────────────────────────────
 		public ColType Type
@@ -169,9 +181,6 @@ namespace XPBD
 		void OnDisable() => SoftBodySimulationManager.Instance?.UnregisterCollider(this);
 
 		// ─────────────────────────────────────────────────────────────────────
-		// Called by manager each fixed step. Updates surface velocity and
-		// rebuilds the ShapeDescriptorCPU from current Unity transform state.
-		// ─────────────────────────────────────────────────────────────────────
 		public void RefreshDescriptor(float dt, uint dynSlot)
 		{
 			SurfaceVelocity =
@@ -213,46 +222,16 @@ namespace XPBD
 				case BoxCollider bc:
 					{
 						var hs = Vector3.Scale(bc.size * 0.5f, transform.lossyScale);
-						float hx = Mathf.Abs(hs.x);
+						d.centre = transform.TransformPoint(bc.center);
+						d.axis = transform.right;   // world local-X
+						d.param0 = Mathf.Abs(hs.x);
+						d.axis2 = transform.up;      // world local-Y
 						float hy = Mathf.Abs(hs.y);
-						float hz = Mathf.Abs(hs.z);
-
-						// ── Floor-extend fix ─────────────────────────────────────
-						// When hy is thinner than OBB_THIN_THRESHOLD the GPU interior
-						// test would miss particles that tunnel through between fixed
-						// steps. We extend the box DOWNWARD by OBB_FLOOR_EXTEND so it
-						// becomes thick enough to catch any realistically fast particle.
-						// The top face world position is preserved by shifting the
-						// centre down by the same amount we added to hy.
-						//
-						// Before: centre.y = C,  top = C+hy,  bot = C-hy
-						// After:  centre.y = C - (OBB_FLOOR_EXTEND - hy)
-						//         top = newCentre + OBB_FLOOR_EXTEND = C+hy  ← unchanged
-						//         bot = newCentre - OBB_FLOOR_EXTEND = C+hy - 2*OBB_FLOOR_EXTEND
-						//
-						// The top-face normal wins because the particle (just below the
-						// original surface) is always much closer to the top than to the
-						// deep new bottom:
-						//   py_top  = OBB_FLOOR_EXTEND - |ly_top|  ≈ small (particle near top face)
-						//   py_bot  = OBB_FLOOR_EXTEND + small     ≈ large
-						//   → py_top < py_bot → top face normal always selected ✓
-						// ─────────────────────────────────────────────────────────
-						Vector3 worldCentre = transform.TransformPoint(bc.center);
-						Vector3 worldUp = transform.up; // local Y in world space
-
-						if (hy < OBB_THIN_THRESHOLD)
-						{
-							float shift = OBB_FLOOR_EXTEND - hy;
-							worldCentre -= worldUp * shift;
-							hy = OBB_FLOOR_EXTEND;
-						}
-
-						d.centre = worldCentre;
-						d.axis = transform.right;  // world local-X
-						d.param0 = hx;
-						d.axis2 = worldUp;          // world local-Y
-						d.param1 = hy;
-						d.param2 = hz;
+						// Negative param1 signals CCD mode to the GPU (TestOBB_CCD).
+						d.param1 = (EnableCCD && hy < OBB_CCD_THRESHOLD) ? -hy : hy;
+						d.param2 = Mathf.Abs(hs.z);
+						// GPU TestOBB: if param1 < OBB_CCD_THRESHOLD → CCD segment vs face
+						// The GPU threshold must match OBB_CCD_THRESHOLD = 0.1 (see compute shader)
 						break;
 					}
 
@@ -260,12 +239,12 @@ namespace XPBD
 					{
 						d.centre = transform.TransformPoint(cc.center);
 						var localAx = cc.direction == 0 ? Vector3.right
-									 : cc.direction == 1 ? Vector3.up : Vector3.forward;
+									: cc.direction == 1 ? Vector3.up : Vector3.forward;
 						d.axis = transform.TransformDirection(localAx).normalized;
 						d.param0 = cc.radius * MaxScale();
 						float axScl = cc.direction == 0 ? Mathf.Abs(transform.lossyScale.x)
-									 : cc.direction == 1 ? Mathf.Abs(transform.lossyScale.y)
-									 : Mathf.Abs(transform.lossyScale.z);
+									: cc.direction == 1 ? Mathf.Abs(transform.lossyScale.y)
+									: Mathf.Abs(transform.lossyScale.z);
 						d.param1 = Mathf.Max(0f, cc.height * 0.5f * axScl - d.param0);
 						break;
 					}

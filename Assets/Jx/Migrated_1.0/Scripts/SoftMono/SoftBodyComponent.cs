@@ -22,6 +22,11 @@ namespace XPBD
 		#region Inspector
 		[SerializeField]
 		TetrahedralMeshAsset tetMeshAsset;
+		//for soft-collision [3/12/2026 jzq]
+		[Header("Soft-Soft-Collision")]
+		public int CollisionLayer = 0;
+		public int CollisionMask = 0;   // 0 = no layer-based pairing
+		public float SoftSoftParticleRadius = 0f; // 0 = use manager's SoftSoftDefaultRadius
 		#endregion
 
 		#region Imp
