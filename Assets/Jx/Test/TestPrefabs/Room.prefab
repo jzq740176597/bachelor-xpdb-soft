@@ -140,7 +140,7 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 10, y: 0.1, z: 10}
+  m_Size: {x: 10, y: 0, z: 10}
   m_Center: {x: 0, y: 0, z: 0}
 --- !u!114 &4973100898201739993
 MonoBehaviour:
@@ -154,7 +154,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 28c3ed83a957a474f98c289df42a781f, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  EnableCCD: 0
+  EnableCCD: 1
 --- !u!1001 &513330502947193438
 PrefabInstance:
   m_ObjectHideFlags: 0

@@ -2,26 +2,27 @@
 //
 // Supported colliders:
 //   SphereCollider  → SHAPE_SPHERE  (interior test, analytic)
-//   BoxCollider     → SHAPE_OBB     (CCD segment vs face for thin/flat boxes;
-//                                    interior test for thick boxes)
+//   BoxCollider     → SHAPE_OBB     (see below)
 //   CapsuleCollider → SHAPE_CAPSULE (interior test, analytic)
 //   MeshCollider    → SHAPE_CONVEX  (face-plane interior test; convex=true required)
 //
-// ── OBB floor note ────────────────────────────────────────────────────────────
-// A flat BoxCollider floor (Size.y = 0 or very small) needs CCD to avoid:
-//   a) Missing fast particles that tunnel through between fixed steps
-//   b) Catching slow particles that are already deep inside an extended slab,
-//      causing large differential corrections that explode the soft body
+// ── OBB collision modes ───────────────────────────────────────────────────────
+// Thick box (hy >= OBB_CCD_THRESHOLD, e.g. a wall):
+//   Interior 3D slab test. param1 = +hy. GPU: point-in-box, push to nearest face.
 //
-// When hy < OBB_CCD_THRESHOLD the GPU test changes from interior to CCD:
-//   DetectShapes passes _Particles[pi].position (start of fixed step) plus
-//   predict (end) to TestOBB. The shader casts a segment against the top face
-//   of the OBB and uses the intersection point as contactPt.
-//   This is encoded by setting param2 = OBB_USE_CCD_MARKER in the descriptor.
+// Thin/flat box (hy < OBB_CCD_THRESHOLD, e.g. a floor with Size.y = 0):
+//   Speculative half-space test. param1 = -hy (negative signals this mode to GPU).
+//   The GPU treats the floor as a ONE-SIDED HALF-SPACE — any predicted position
+//   within OBB_CONTACT_OFFSET (2 cm) of the top face generates a contact pushing
+//   upward. Works at any particle speed; no sweep or segment test needed.
+//   This mirrors Unity Speculative CCD / PhysX contact generation.
 //
-// GPU TestOBB reads param2:
-//   param2 > 0 → CCD mode:  segment vs top/bottom face crossing test
-//   param2 = 0 → interior mode: normal thick-box test (3D slab)
+// Why not sweep-based CCD?
+//   Sweep (segment prev→predict vs face plane) requires a finite slab thickness.
+//   For a zero-thickness box the "top" and "bottom" faces are nearly co-planar.
+//   At typical XPBD substep sizes (5 m/s / 1200 Hz = 4 mm/substep) a 0.2 mm slab
+//   is crossed in a single substep, making the sweep numerically unreliable.
+//   The speculative approach has no such limitation.
 
 using System.Collections.Generic;
 using UnityEngine;
@@ -248,19 +249,23 @@ namespace XPBD
 						d.param0 = Mathf.Abs(hs.x);
 						d.axis2 = transform.up;      // world local-Y
 						float hy = Mathf.Abs(hs.y);
-						// Negative param1 signals CCD mode to the GPU (TestOBB_CCD).
-						// IMPORTANT: clamp hy to a small positive value before negating.
-						// A flat BoxCollider (Size.y=0) gives hy=0 — negating yields
-						// -0.0f, which is bit-equal to +0.0f and fails the GPU sign-bit
-						// CCD check (s.param1 < 0 is false for -0.0 on most GPUs).
-						// 1e-4f (0.1mm) is invisible but guarantees strictly-negative param1.
-						if (EnableCCD && hy < OBB_CCD_THRESHOLD)
-							d.param1 = -Mathf.Max(hy, 1e-4f);
-						else
-							d.param1 = hy;
+						// param1 encoding:
+						//   negative → speculative half-space mode (thin/flat box, floor).
+						//              GPU adds OBB_CONTACT_OFFSET (2 cm) to hy for detection,
+						//              but the contact point projects to centre + ay*hy,
+						//              so a zero-thickness floor (hy=0) makes particles rest
+						//              exactly at the floor's transform y. ← IMPORTANT
+						//   positive → interior 3D slab mode (thick box, wall).
+						//
+						// We store the RAW geometric hy without any clamp so the contact
+						// surface stays at the collider's actual surface. The GPU is responsible
+						// for adding the skin offset to expand the detection window.
+						//
+						// -0.0f corner case: asuint(-0.0f) has the sign bit SET, so the GPU
+						// sign-bit check (asuint & 0x80000000) correctly routes hy=0 floors
+						// to speculative mode. No CPU clamp needed.
+						d.param1 = (EnableCCD && hy < OBB_CCD_THRESHOLD) ? -hy : hy;
 						d.param2 = Mathf.Abs(hs.z);
-						// GPU TestOBB: if param1 < OBB_CCD_THRESHOLD → CCD segment vs face
-						// The GPU threshold must match OBB_CCD_THRESHOLD = 0.1 (see compute shader)
 						break;
 					}
 

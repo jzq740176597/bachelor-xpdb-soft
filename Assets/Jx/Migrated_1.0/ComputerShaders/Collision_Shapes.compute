@@ -60,11 +60,6 @@
 #define SHAPE_CAPSULE    2u
 #define SHAPE_CONVEX     4u
 
-// ImpulseBytes layout per dynamic slot (32 bytes):
-//   +0   impulse.xyz  (float×3, atomic CAS)
-//   +12  hitCount     (uint,    InterlockedAdd)
-//   +16  contactSum.xyz (float×3, atomic CAS)
-//   +28  _pad
 // ── Structs ───────────────────────────────────────────────────────────────────
 
 struct ShapeDescriptor
@@ -153,119 +148,94 @@ bool TestSphere(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 	return true;
 }
 
-// OBB interior test (thick box: all three axes checked).
-bool TestOBB_Interior(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
+// ── OBB collision — speculative signed-distance (Unity/PhysX model) ────────────
+//
+// WHY NOT SWEEP (CCD segment-vs-face):
+//   A sweep test computes where (prev→predict) crosses a face. But collision
+//   runs AFTER Stretch+Volume+Postsolve, so `prev` (= position at substep start)
+//   and `p` (= predict after all elastic corrections) are no longer a clean
+//   segment. Elastic constraints may have moved `p` in arbitrary directions.
+//   Using a stale `prev` for the segment origin causes missed or incorrect contacts.
+//
+// SPECULATIVE SIGNED-DISTANCE (correct approach):
+//   For each axis project the predicted position onto the face plane.
+//   If the signed distance is inside the box (negative penetration): contact.
+//   Choose the shallowest penetrating face as the contact normal.
+//   This is what Unity's speculative CCD and PhysX's contact generation do:
+//   they look at WHERE the point IS, not how it got there.
+//
+// CONTACT OFFSET (skin width):
+//   param1 stores hy:
+//     param1 >= 0 → interior mode, hy = param1 (thick box, normal 3D test)
+//     param1 <  0 → speculative mode, hy = -param1 (thin/flat box)
+//   In speculative mode a CONTACT_OFFSET is added to hy so that a zero-thickness
+//   floor (hy=1e-4) gets an effective half-extent of (1e-4 + CONTACT_OFFSET).
+//   Any particle within CONTACT_OFFSET of the surface generates a contact.
+//   This is exactly Unity's "contact offset" / PhysX's skin width.
+//   Value 0.02 (2cm) matches Unity's default Physics.defaultContactOffset = 0.01
+//   but doubled for soft-body particles which are larger than rigid colliders.
+#define OBB_CONTACT_OFFSET 0.02
+
+// TestOBB: routes between two modes encoded in param1 sign bit.
+//
+// ── Speculative / Half-space mode  (param1 < 0, thin/flat box) ────────────────
+//   Mirrors Unity Speculative CCD and PhysX contact generation:
+//     "Test where the predicted point IS, not how it got there."
+//   The floor is modelled as a ONE-SIDED HALF-SPACE:
+//     contact iff  dot(ay, p - centre)  <  OBB_CONTACT_OFFSET
+//     AND the particle is within the lateral (X, Z) footprint of the box.
+//   Contact normal is always +ay (outward from top face).
+//
+//   TWO-SIDED reject (abs(ly) >= hy) was the previous bug:
+//     A particle at ly = -0.05 (5 cm below floor) has abs(-0.05)=0.05 > offset=0.02
+//     → old code returned no-contact → particle passed through.
+//   Correct: only reject particles ABOVE the skin (ly >= OBB_CONTACT_OFFSET).
+//   Particles below the floor are ALWAYS in contact — push them up regardless of depth.
+//
+// ── Interior mode  (param1 >= 0, thick box) ───────────────────────────────────
+//   Standard XPBD point-in-box test; unchanged.
+bool TestOBB(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 {
 	cp = 0; n = float3(0,1,0);
 	float3 d  = p - s.centre;
 	float3 ax = s.axis, ay = s.axis2, az = cross(ax, ay);
 	float  lx = dot(d, ax), ly = dot(d, ay), lz = dot(d, az);
-	float  hx = s.param0,   hy = abs(s.param1), hz = s.param2;
+
+	bool speculative = (asuint(s.param1) & 0x80000000u) != 0u;
+
+	if (speculative)
+	{
+		// ── Lateral bounds: raw footprint only (no skin expansion laterally) ──
+		float hx = s.param0;
+		float hz = s.param2;
+		if (abs(lx) >= hx) return false;
+		if (abs(lz) >= hz) return false;
+
+		// ── One-sided half-space test along floor normal (ay) ─────────────────
+		// Only reject if particle is ABOVE the contact skin.
+		// Particles at or below the skin surface (including far below) always
+		// generate a contact — the floor is an infinite half-space downward.
+		if (ly >= OBB_CONTACT_OFFSET) return false;   // above skin → no contact
+
+		// Contact: push to the geometric top-face surface.
+		// raw_hy = abs(param1): geometric half-thickness.
+		//   For Size.y=0 floor: param1 = -0.0f, abs(-0.0f) = 0.0f → cp.y = centre.y + 0 = 0.
+		//   Particle rests exactly at the floor's visual surface. ✓
+		// We use abs() not negation so that -0.0f gives 0.0f (not -0.0f).
+		float raw_hy = abs(s.param1);   // geometric half-thickness (0 for flat floor)
+		cp = s.centre + ay * raw_hy + ax * lx + az * lz;
+		n  = ay;
+		return true;
+	}
+
+	// ── Interior (thick box) ───────────────────────────────────────────────────
+	float hx = s.param0, hy = s.param1, hz = s.param2;
 	if (abs(lx) >= hx || abs(ly) >= hy || abs(lz) >= hz) return false;
 	float px = hx - abs(lx), py = hy - abs(ly), pz = hz - abs(lz);
-	if      (px <= py && px <= pz) { n = ax*sign(lx); cp = s.centre + ax*(hx*sign(lx)) + ay*ly + az*lz; }
-	else if (py <= pz)             { n = ay*sign(ly); cp = s.centre + ax*lx + ay*(hy*sign(ly)) + az*lz; }
-	else                           { n = az*sign(lz); cp = s.centre + ax*lx + ay*ly + az*(hz*sign(lz)); }
+	if      (px <= py && px <= pz) { n = ax*sign(lx); cp = s.centre + ax*(hx*sign(lx)) + ay*ly          + az*lz; }
+	else if (py <= pz)             { n = ay*sign(ly); cp = s.centre + ax*lx             + ay*(hy*sign(ly)) + az*lz; }
+	else                           { n = az*sign(lz); cp = s.centre + ax*lx             + ay*ly            + az*(hz*sign(lz)); }
 	return true;
-}
-
-// OBB CCD: segment (prevPos → predict) vs the faces of the OBB.
-//
-// KEY RULE: only test faces that prev is OUTSIDE of (or sitting on).
-// Without this guard, a particle resting on the top face has float-drift that
-// places prev just below it. The 6-face loop then picks the BOTTOM face (which
-// has t > 0 in the downward direction) and returns n = -up, pushing the particle
-// further down → pass-through. The outside-only filter eliminates this completely.
-//
-// For a zero-thickness floor (hy = 1e-4), the top face is the only face prev
-// can be outside of while the particle is approaching from above, so this
-// naturally reduces to a single half-space crossing test in the common case.
-bool TestOBB_CCD(ShapeDescriptor s, float3 prev, float3 p, out float3 cp, out float3 n)
-{
-	cp = 0; n = float3(0,1,0);
-	float3 ax = s.axis, ay = s.axis2, az = cross(ax, ay);
-	float  hx = s.param0, hy = -s.param1, hz = s.param2; // param1 stored negative
-
-	// Segment direction
-	float3 dir  = p - prev;
-	float3 drel = prev - s.centre;   // prev relative to box centre
-
-	// Test all 6 faces; keep the crossing with smallest valid t.
-	float  bestT = 2.0;   // > 1 means no hit yet
-	float3 bestN = 0;
-	float3 bestP = 0;
-
-	// Helper macro-style: test one face given axis 'fax', half-extent 'fh', sign 'fs'
-	// face plane: dot(fax, q - centre) = fh*fs
-	// Inline for each of the 6 faces:
-
-	// ── face along ax ──────────────────────────────────────────────────────
-	[unroll] for (int fi = 0; fi < 6; fi++)
-	{
-		float3 fax; float fh; float fs;
-		if      (fi == 0) { fax = ax;  fh = hx; fs =  1; }
-		else if (fi == 1) { fax = ax;  fh = hx; fs = -1; }
-		else if (fi == 2) { fax = ay;  fh = hy; fs =  1; }
-		else if (fi == 3) { fax = ay;  fh = hy; fs = -1; }
-		else if (fi == 4) { fax = az;  fh = hz; fs =  1; }
-		else              { fax = az;  fh = hz; fs = -1; }
-
-		// ── ENTRY FILTER (two conditions, both required) ────────────────
-		// 1. prev must be OUTSIDE this face (or on it):
-		//      dot(fax*fs, prev-centre) >= -EPSILON
-		//    Without this: a particle drifted just inside the slab skips the top
-		//    face correctly, but then hits the bottom face (t>0, n=-up) and gets
-		//    pushed downward → tunnels through.
-		// 2. Segment must be ENTERING (moving inward through this face):
-		//      denom * fs < 0
-		//    Without this: fi=3 (bottom face, n=-up) passes condition 1 when prev
-		//    is barely inside the slab, and its t is valid → wrong downward push.
-		//    denom*fs < 0 means the particle moves against the face outward normal,
-		//    which is the definition of entering that face.
-		float denom = dot(fax, dir);
-		if (dot(fax, drel) * fs < -EPSILON) continue;  // prev not outside this face
-		if (denom * fs >= 0.0) continue;               // not entering (parallel or exiting)
-
-		// t at which segment hits the face plane
-		// plane eq: dot(fax, q - centre) = fh * fs
-		// → t = (fh*fs - dot(fax, drel)) / denom
-		float t = (fh * fs - dot(fax, drel)) / denom;
-		if (t < 0.0 || t > 1.0) continue;     // crossing outside this substep
-		if (t >= bestT) continue;
-
-		// Candidate crossing point — check lateral bounds
-		float3 q  = prev + dir * t;
-		float3 qd = q - s.centre;
-		if      (fi < 2) { if (abs(dot(ay,qd)) > hy + EPSILON || abs(dot(az,qd)) > hz + EPSILON) continue; }
-		else if (fi < 4) { if (abs(dot(ax,qd)) > hx + EPSILON || abs(dot(az,qd)) > hz + EPSILON) continue; }
-		else             { if (abs(dot(ax,qd)) > hx + EPSILON || abs(dot(ay,qd)) > hy + EPSILON) continue; }
-
-		bestT = t;
-		bestN = fax * fs;
-		bestP = q;
-	}
-
-	if (bestT > 1.0) return false;
-	cp = bestP;
-	n  = bestN;
-	return true;
-}
-
-bool TestOBB(ShapeDescriptor s, float3 prev, float3 p, out float3 cp, out float3 n)
-{
-	// param1 sign bit: negative → CCD mode (thin/flat box), positive → Interior only.
-	bool isCCD = (asuint(s.param1) & 0x80000000u) != 0u;
-	if (isCCD)
-	{
-		// CCD first: catches particles crossing a face this substep (outside → inside).
-		// The outside-only face filter means CCD MISSES particles that are already
-		// inside the slab (e.g. float drift placed prev just below the top face).
-		// Interior fallback catches those: penetration is at most one subDT of motion
-		// (a tiny depth), so the correction is small and stable.
-		if (TestOBB_CCD(s, prev, p, cp, n)) return true;
-		return TestOBB_Interior(s, p, cp, n);
-	}
-	return TestOBB_Interior(s, p, cp, n);
 }
 
 bool TestCapsule(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
@@ -337,12 +307,14 @@ void DetectShapes(uint3 id : SV_DispatchThreadID)
 
 	ShapeDescriptor s    = _Shapes[si];
 	float3 p    = _Positions[pi].predict;
-	float3 prev = _Particles[pi].position;  // start of this substep (before Presolve)
+	// NOTE: `prev` (particle.position, set by Presolve) is NOT used here.
+	// TestOBB is now a speculative signed-distance test on `p` only,
+	// matching Unity/PhysX contact generation. No segment sweep needed.
 
 	float3 cp, n;
 	bool   hit;
 	if      (s.shapeType == SHAPE_SPHERE)   hit = TestSphere  (s, p,       cp, n);
-	else if (s.shapeType == SHAPE_OBB)      hit = TestOBB     (s, prev, p, cp, n);
+	else if (s.shapeType == SHAPE_OBB)      hit = TestOBB     (s, p, cp, n);
 	else if (s.shapeType == SHAPE_CAPSULE)  hit = TestCapsule (s, p,       cp, n);
 	else                                    hit = TestConvex  (s, p,       cp, n);
 	if (!hit) return;
@@ -377,7 +349,27 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 	ColConstraint c   = _ColConstraints[i];
 	float3 pos        = _Positions[c.pIdx].predict;
 	float3 nrm        = c.normal;
-	float  pen        = dot(pos - c.contactPt, nrm);
+
+	// Speculative-contact depth: re-evaluate against the SURFACE PLANE, not the
+	// stale contactPt. DetectShapes runs before Stretch/Volume; by the time
+	// SolveCollisions runs, Stretch/Volume have already moved predict.
+	//
+	// Old:  pen = dot(pos - contactPt, nrm)
+	//   For CCD the contactPt lands exactly ON the surface (pen≈0 at detect time).
+	//   If Stretch nudges predict even 0.1 mm away from the surface, pen > 0 → early-out
+	//   → collision discarded every frame → zero-thickness floor pass-through.
+	//
+	// New (Speculative / plane-based):
+	//   planeDist = dot(contactPt, nrm)  — the surface's signed offset from origin.
+	//   pen       = dot(pos, nrm) - planeDist
+	//   This is the signed distance of the CURRENT predict from the surface plane.
+	//   It is independent of how Stretch/Volume moved predict:
+	//     predict above surface → pen > 0 → discard   ✓
+	//     predict below surface → pen < 0 → correct   ✓
+	//   Works identically for thick interior contacts (planeDist = top-face offset)
+	//   and for zero-thickness CCD contacts (planeDist = floor y).
+	float  planeDist  = dot(c.contactPt, nrm);
+	float  pen        = dot(pos, nrm) - planeDist;
 	if (pen >= 0.0) return;
 
 	float3 corr = -nrm * pen;

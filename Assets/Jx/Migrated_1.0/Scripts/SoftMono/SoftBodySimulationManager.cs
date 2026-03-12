@@ -78,10 +78,6 @@ namespace XPBD
 		// Canonical key: (lower instanceID, higher instanceID) so (A,B)==(B,A).
 		// Value is null until first EnsureSoftSoftPairBuffers allocates it.
 		readonly Dictionary<(int, int), SoftSoftPairBuffers> _softSoftPairs = new();
-		// Tracks which pairs have already run Clear+Detect in the current substep.
-		// Prevents the second body in a pair from re-clearing and re-detecting,
-		// which would erase the corrections accumulated for the first body's Apply.
-		readonly HashSet<(int, int)> _softSoftDetectedThisStep = new();
 
 		// ── Rigid-collision GPU buffers ───────────────────────────────────────
 		ComputeBuffer _shapesBuffer;
@@ -153,21 +149,12 @@ namespace XPBD
 			if (hasSoftSoft)
 				EnsureSoftSoftPairBuffers();
 
-			for (int s = 0; s < SubSteps; s++)
-			{
-				// Reset per-substep detect set so Clear+Detect runs exactly once per pair.
-				_softSoftDetectedThisStep.Clear();
-				foreach (var body in _bodies)
-				{
-					if (!body)
-						continue;
-					DispatchSubstep(body.State, hasRigid, hasSoftSoft);
-				}
-			}
 			foreach (var body in _bodies)
 			{
 				if (!body)
 					continue;
+				for (int s = 0; s < SubSteps; s++)
+					DispatchSubstep(body.State, hasRigid, hasSoftSoft);
 				DispatchDeform(body);
 			}
 
@@ -470,38 +457,31 @@ namespace XPBD
 				int nA = a.State.ParticleCount;
 				int nB = b.State.ParticleCount;
 
-				// ── Clear + Detect (once per pair per substep) ──────────────────
-				// _softSoftDetectedThisStep is cleared once per substep in Update.
-				// The first body to reach this pair runs Clear+Detect.
-				// The second body skips straight to Apply, reading the shared delta buffer.
-				var pairKey = kvp.Key;
-				if (!_softSoftDetectedThisStep.Contains(pairKey))
-				{
-					_softSoftDetectedThisStep.Add(pairKey);
+				// ── Clear delta buffers ────────────────────────────────────────
+				// ClearSoftSoftDelta zeros _DeltaBufA for _CountA particles.
+				// Call twice, rebinding to clear both sides.
+				cs.SetInt("_CountA", nA);
+				cs.SetBuffer(_kClearSoftSoftDelta, "_DeltaBufA", bufs.DeltaA);
+				cs.Dispatch(_kClearSoftSoftDelta, Ceil(nA), 1, 1);
 
-					// Clear A's delta buffer
-					cs.SetInt("_CountA", nA);
-					cs.SetBuffer(_kClearSoftSoftDelta, "_DeltaBufA", bufs.DeltaA);
-					cs.Dispatch(_kClearSoftSoftDelta, Ceil(nA), 1, 1);
-					// Clear B's delta buffer
-					cs.SetInt("_CountA", nB);
-					cs.SetBuffer(_kClearSoftSoftDelta, "_DeltaBufA", bufs.DeltaB);
-					cs.Dispatch(_kClearSoftSoftDelta, Ceil(nB), 1, 1);
+				cs.SetInt("_CountA", nB);
+				cs.SetBuffer(_kClearSoftSoftDelta, "_DeltaBufA", bufs.DeltaB);
+				cs.Dispatch(_kClearSoftSoftDelta, Ceil(nB), 1, 1);
 
-					// Detect: 2D dispatch over CountA x CountB particles
-					cs.SetInt("_CountA", nA);
-					cs.SetInt("_CountB", nB);
-					cs.SetFloat("_ColRadius", radius);
-					cs.SetBuffer(_kDetectSoftSoft, "_ParticlesA", a.State.ParticleBuffer);
-					cs.SetBuffer(_kDetectSoftSoft, "_PositionsA", a.State.PositionsBuffer);
-					cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufA", bufs.DeltaA);
-					cs.SetBuffer(_kDetectSoftSoft, "_ParticlesB", b.State.ParticleBuffer);
-					cs.SetBuffer(_kDetectSoftSoft, "_PositionsB", b.State.PositionsBuffer);
-					cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufB", bufs.DeltaB);
-					cs.Dispatch(_kDetectSoftSoft, CeilN(nA, 8), CeilN(nB, 8), 1);
-				}
+				// ── Detect ────────────────────────────────────────────────────
+				// 2D dispatch: X covers CountA (group=8), Y covers CountB (group=8).
+				cs.SetInt("_CountA", nA);
+				cs.SetInt("_CountB", nB);
+				cs.SetFloat("_ColRadius", radius);
+				cs.SetBuffer(_kDetectSoftSoft, "_ParticlesA", a.State.ParticleBuffer);
+				cs.SetBuffer(_kDetectSoftSoft, "_PositionsA", a.State.PositionsBuffer);
+				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufA", bufs.DeltaA);
+				cs.SetBuffer(_kDetectSoftSoft, "_ParticlesB", b.State.ParticleBuffer);
+				cs.SetBuffer(_kDetectSoftSoft, "_PositionsB", b.State.PositionsBuffer);
+				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufB", bufs.DeltaB);
+				cs.Dispatch(_kDetectSoftSoft, CeilN(nA, 8), CeilN(nB, 8), 1);
 
-				// ── Apply this body's side ────────────────────────────────────
+				// ── Apply ─────────────────────────────────────────────────────
 				// ApplySoftSoftDelta reuses _DeltaBufA + _PositionsA + _CountA.
 				if (isA)
 				{
@@ -532,22 +512,13 @@ namespace XPBD
 			cs.SetInt("_EdgeCount", body.EdgeCount);
 			cs.SetInt("_TetCount", body.TetCount);
 
+			// ── 1. Integrate ──────────────────────────────────────────────────
 			BindSimBuffers(cs, _kPresolve, body);
 			cs.Dispatch(_kPresolve, Ceil(body.ParticleCount), 1, 1);
 
-			// Detect every substep with fresh predicted positions.
-			// (Stale constraints cause resonant velocity oscillation → explosion.)
-			if (hasRigid)
-			{
-				ResetColSize(body);
-				DispatchDetectShapes(body);
-				DispatchShapesSolve(body);
-			}
-
-			// Soft-soft: detect + apply for all pairs involving this body.
-			if (hasSoftSoft)
-				DispatchSoftSoftPairs(body);
-
+			// ── 2. Elastic constraints ────────────────────────────────────────
+			// Stretch and volume write corrections into the delta buffer.
+			// Postsolve then applies: predict += delta * damping.
 			BindSimBuffers(cs, _kStretch, body);
 			cs.Dispatch(_kStretch, Ceil(body.EdgeCount), 1, 1);
 
@@ -556,6 +527,27 @@ namespace XPBD
 
 			BindSimBuffers(cs, _kPostsolve, body);
 			cs.Dispatch(_kPostsolve, Ceil(body.ParticleCount), 1, 1);
+
+			// ── 3. Collision constraints (AFTER elastic, AFTER postsolve) ────
+			// CRITICAL ORDER: collision must run last so that elastic constraints
+			// (stretch/volume) cannot pull particles back through a surface.
+			// Root cause of the zero-thickness floor pass-through:
+			//   Old order → SolveCollisions corrected predict to floor surface,
+			//   then Stretch/Volume accumulated delta that pulled the particle DOWN,
+			//   then Postsolve applied delta → particle ended up below floor.
+			//   Next substep: position = below floor, CCD outside-check failed → no contact.
+			// New order → elastic deltas are baked into predict by Postsolve first,
+			//   then collision clamps the final predict. Nothing runs after to undo it.
+			if (hasRigid)
+			{
+				ResetColSize(body);
+				DispatchDetectShapes(body);
+				DispatchShapesSolve(body);
+			}
+
+			// Soft-soft collision also runs after elastic constraints for the same reason.
+			if (hasSoftSoft)
+				DispatchSoftSoftPairs(body);
 		}
 
 		void BindSimBuffers(ComputeShader cs, int kernel, SoftBodyGPUState body)
