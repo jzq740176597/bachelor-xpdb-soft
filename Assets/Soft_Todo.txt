@@ -1,3 +1,13 @@
+--3-12
+1. static cld : remove update logic
+2. kinematic cld pass through / tunnel case <See Squash case> ? CCD not working? <ref : rigidbody.MovePosition() API>
+3. soft-soft collision not working at all
+*
+4. surface particle can make static / kinematic CAN connected to SoftAttachJoint<required unity phx rigidbody>: can create joints
+	/links between the SoftAttachJoint-rigidbody and particles (the constrains is dist-contrains with complience CONTROL sitffness like existed, default 0)
+	Then When The SoftAttachJoint-rigidbody moved Then Contrains will be applied to the particles and make them move together with the rigidbody.
+	a. maybe create utility EdiorWindow to visually choose the *particles grps* and later can be used / Ref to create the joints or sth Eg: SoftAttachJoint. of course the *particles grps* data can be store in soft-asset <XXX Type>
+-----------------------
 route map / milestone
 1. CAN dyn create multiple spheres (other model)
 2. create & prepare asset(*) automatic & By Go components info <eg: render, meshFilter>
