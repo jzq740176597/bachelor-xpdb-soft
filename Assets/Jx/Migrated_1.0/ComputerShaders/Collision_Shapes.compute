@@ -1,8 +1,38 @@
 // Collision_Shapes.compute
-// Analytic primitive collision — Sphere / OBB / Capsule.
-// Supports Static, Kinematic, and Dynamic Rigidbody types.
-// Separate file from Collision_Floor.compute so each file only declares
-// the buffers its own kernels use — Unity validates per-file, not per-kernel.
+//
+// Supported shape types:
+//   SHAPE_SPHERE   (0)  analytic — point vs sphere
+//   SHAPE_OBB      (1)  analytic — point vs oriented box
+//   SHAPE_CAPSULE  (2)  analytic — point vs capsule  (spherical end-caps)
+//   SHAPE_CONVEX   (4)  face-plane inside test — convex MeshCollider
+//
+// Collider kinds:
+//   COL_STATIC    (0) — no velocity, no impulse feedback
+//   COL_KINEMATIC (1) — surface velocity inherited by particle
+//   COL_DYNAMIC   (2) — mass-weighted split + Newton-3rd impulse → Rigidbody
+//
+// ShapeDescriptor (64 bytes, 4×float4, 16-byte aligned):
+//   word0  shapeType | colType | dynSlot | rbInvMass
+//   word1  centre.xyz | param0
+//   word2  axis.xyz   | param1
+//   word3  axis2.xyz  | param2
+//
+//   Sphere:   centre, param0=radius
+//   OBB:      centre, axis=worldLocalX, axis2=worldLocalY,
+//             param0=halfX, param1=halfY, param2=halfZ
+//   Capsule:  centre, axis=segAxis, param0=radius, param1=halfHeight
+//   Convex:   centre=meshOrigin,
+//             param0=asuint(faceOffset), param1=asuint(faceCount)
+//
+// _MeshFacePlanes : float4[] — world-space face planes for ALL convex meshes
+//   packed flat; plane = float4(normal.xyz, d)
+//   inside test: dot(normal, worldPoint) + d < 0
+//
+// ImpulseBytes layout per dynamic slot (32 bytes):
+//   +0   impulse.xyz   (float×3, atomic CAS)
+//   +12  hitCount      (uint,    InterlockedAdd)
+//   +16  contactSum.xyz (float×3, atomic CAS — averaged on CPU)
+//   +28  _pad
 
 #pragma kernel ClearImpulseAccum
 #pragma kernel DetectShapes
@@ -10,18 +40,19 @@
 
 #pragma target 5.0
 
-#define EPSILON           1e-6
-#define MAX_CONSTRAINTS   10000
-#define GROUP_SIZE        32
-#define IMPULSE_STRIDE    32u
+#define EPSILON          1e-6
+#define MAX_CONSTRAINTS  10000
+#define GROUP_SIZE       32
+#define IMPULSE_STRIDE   32u
 
-#define COL_STATIC        0u
-#define COL_KINEMATIC     1u
-#define COL_DYNAMIC       2u
+#define COL_STATIC       0u
+#define COL_KINEMATIC    1u
+#define COL_DYNAMIC      2u
 
-#define SHAPE_SPHERE      0u
-#define SHAPE_OBB         1u
-#define SHAPE_CAPSULE     2u
+#define SHAPE_SPHERE     0u
+#define SHAPE_OBB        1u
+#define SHAPE_CAPSULE    2u
+#define SHAPE_CONVEX     4u
 
 // ImpulseBytes layout per dynamic slot (32 bytes):
 //   +0   impulse.xyz  (float×3, atomic CAS)
@@ -33,23 +64,14 @@
 
 struct ShapeDescriptor
 {
-	uint   shapeType; uint colType; uint dynSlot; float rbInvMass; // word 0
-	float3 centre;    float param0;                                 // word 1
-	float3 axis;      float param1;                                 // word 2
-	float3 axis2;     float param2;                                 // word 3
+	uint   shapeType; uint colType; uint dynSlot; float rbInvMass;
+	float3 centre;    float param0;
+	float3 axis;      float param1;
+	float3 axis2;     float param2;
 };
 
-struct Particle
-{
-	float3 position; float _p0;
-	float3 velocity; float invMass;
-};
-
-struct PbdPositions
-{
-	float3 predict; float _p0;
-	float3 delta;   float _p1;
-};
+struct Particle     { float3 position; float _p0; float3 velocity; float invMass; };
+struct PbdPositions { float3 predict;  float _p0; float3 delta;    float _p1;    };
 
 struct ColConstraint
 {
@@ -72,17 +94,17 @@ uint  _DynSlotCount;
 
 // ── Buffers ───────────────────────────────────────────────────────────────────
 
-StructuredBuffer<ShapeDescriptor>  _Shapes;
-StructuredBuffer<float3>           _ShapeVelocities;
+StructuredBuffer<ShapeDescriptor> _Shapes;
+StructuredBuffer<float3>          _ShapeVelocities;  // one per shape
+StructuredBuffer<float4>          _MeshFacePlanes;   // all convex meshes packed
 
-RWStructuredBuffer<Particle>       _Particles;
-RWStructuredBuffer<PbdPositions>   _Positions;
-RWStructuredBuffer<uint>           _ColSize;
-RWStructuredBuffer<ColConstraint>  _ColConstraints;
+RWStructuredBuffer<Particle>      _Particles;
+RWStructuredBuffer<PbdPositions>  _Positions;
+RWStructuredBuffer<uint>          _ColSize;
+RWStructuredBuffer<ColConstraint> _ColConstraints;
+RWByteAddressBuffer               _ImpulseBytes;
 
-RWByteAddressBuffer                _ImpulseBytes;
-
-// ── Atomic float add (CAS) ────────────────────────────────────────────────────
+// ── Atomic float CAS ─────────────────────────────────────────────────────────
 
 void AtomicAddF(uint addr, float v)
 {
@@ -105,14 +127,10 @@ void ClearImpulseAccum(uint3 id : SV_DispatchThreadID)
 {
 	if (id.x >= _DynSlotCount) return;
 	uint b = id.x * IMPULSE_STRIDE;
-	_ImpulseBytes.Store(b +  0, 0u);
-	_ImpulseBytes.Store(b +  4, 0u);
-	_ImpulseBytes.Store(b +  8, 0u);
-	_ImpulseBytes.Store(b + 12, 0u);
-	_ImpulseBytes.Store(b + 16, 0u);
-	_ImpulseBytes.Store(b + 20, 0u);
-	_ImpulseBytes.Store(b + 24, 0u);
-	_ImpulseBytes.Store(b + 28, 0u);
+	_ImpulseBytes.Store(b +  0, 0u); _ImpulseBytes.Store(b +  4, 0u);
+	_ImpulseBytes.Store(b +  8, 0u); _ImpulseBytes.Store(b + 12, 0u);
+	_ImpulseBytes.Store(b + 16, 0u); _ImpulseBytes.Store(b + 20, 0u);
+	_ImpulseBytes.Store(b + 24, 0u); _ImpulseBytes.Store(b + 28, 0u);
 }
 
 // ── Analytic contact helpers ──────────────────────────────────────────────────
@@ -120,13 +138,13 @@ void ClearImpulseAccum(uint3 id : SV_DispatchThreadID)
 bool TestSphere(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 {
 	cp = 0; n = float3(0,1,0);
-	float3 d = p - s.centre;
-	float  r = s.param0;
-	float  d2= dot(d,d);
-	if (d2 >= r*r) return false;
+	float3 d  = p - s.centre;
+	float  r  = s.param0;
+	float  d2 = dot(d, d);
+	if (d2 >= r * r) return false;
 	float dist = sqrt(d2);
-	n  = dist > EPSILON ? d/dist : float3(0,1,0);
-	cp = s.centre + n*r;
+	n  = dist > EPSILON ? d / dist : float3(0,1,0);
+	cp = s.centre + n * r;
 	return true;
 }
 
@@ -135,31 +153,60 @@ bool TestOBB(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 	cp = 0; n = float3(0,1,0);
 	float3 d  = p - s.centre;
 	float3 ax = s.axis, ay = s.axis2, az = cross(ax, ay);
-	float  lx = dot(d,ax), ly = dot(d,ay), lz = dot(d,az);
-	float  hx = s.param0,  hy = s.param1,  hz = s.param2;
-	if (abs(lx)>=hx || abs(ly)>=hy || abs(lz)>=hz) return false;
-	float px=hx-abs(lx), py=hy-abs(ly), pz=hz-abs(lz);
-	if      (px<=py && px<=pz) { n=ax*sign(lx); cp=s.centre+ax*(hx*sign(lx))+ay*ly+az*lz; }
-	else if (py<=pz)           { n=ay*sign(ly); cp=s.centre+ax*lx+ay*(hy*sign(ly))+az*lz; }
-	else                       { n=az*sign(lz); cp=s.centre+ax*lx+ay*ly+az*(hz*sign(lz)); }
+	float  lx = dot(d, ax), ly = dot(d, ay), lz = dot(d, az);
+	float  hx = s.param0,   hy = s.param1,   hz = s.param2;
+	if (abs(lx) >= hx || abs(ly) >= hy || abs(lz) >= hz) return false;
+	float px = hx - abs(lx), py = hy - abs(ly), pz = hz - abs(lz);
+	if      (px <= py && px <= pz) { n = ax*sign(lx); cp = s.centre + ax*(hx*sign(lx)) + ay*ly + az*lz; }
+	else if (py <= pz)             { n = ay*sign(ly); cp = s.centre + ax*lx + ay*(hy*sign(ly)) + az*lz; }
+	else                           { n = az*sign(lz); cp = s.centre + ax*lx + ay*ly + az*(hz*sign(lz)); }
 	return true;
 }
 
 bool TestCapsule(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 {
 	cp = 0; n = float3(0,1,0);
-	float3 a = s.centre - s.axis*s.param1;
-	float3 b = s.centre + s.axis*s.param1;
-	float3 ab= b - a;
-	float  r = s.param0;
-	float  t = saturate(dot(p-a, ab) / max(dot(ab,ab), EPSILON));
-	float3 cl= a + ab*t;
-	float3 d = p - cl;
-	float  d2= dot(d,d);
-	if (d2 >= r*r) return false;
+	float3 a  = s.centre - s.axis * s.param1;
+	float3 b  = s.centre + s.axis * s.param1;
+	float3 ab = b - a;
+	float  r  = s.param0;
+	float  t  = saturate(dot(p - a, ab) / max(dot(ab, ab), EPSILON));
+	float3 cl = a + ab * t;
+	float3 d  = p - cl;
+	float  d2 = dot(d, d);
+	if (d2 >= r * r) return false;
 	float dist = sqrt(d2);
-	n  = dist > EPSILON ? d/dist : float3(0,1,0);
-	cp = cl + n*r;
+	n  = dist > EPSILON ? d / dist : float3(0,1,0);
+	cp = cl + n * r;
+	return true;
+}
+
+
+// Convex mesh: point must be on the negative side of ALL face planes.
+// Contact = shallowest-penetrating face (smallest penetration depth).
+bool TestConvex(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
+{
+	cp = 0; n = float3(0,1,0);
+	uint faceOffset = asuint(s.param0);
+	uint faceCount  = asuint(s.param1);
+	if (faceCount == 0u) return false;
+
+	float minPen   = 1e38;
+	int   bestFace = -1;
+
+	for (uint fi = 0u; fi < faceCount; fi++)
+	{
+		float4 pl   = _MeshFacePlanes[faceOffset + fi]; // (normal.xyz, d)
+		float  dist = dot(pl.xyz, p) + pl.w;            // > 0 → outside this plane
+		if (dist >= 0.0) return false;                  // outside convex hull → no contact
+		float pen = -dist;
+		if (pen < minPen) { minPen = pen; bestFace = (int)fi; }
+	}
+
+	if (bestFace < 0) return false;
+	float4 best = _MeshFacePlanes[faceOffset + (uint)bestFace];
+	n  = best.xyz;
+	cp = p + best.xyz * minPen;  // project p onto the plane surface
 	return true;
 }
 
@@ -180,26 +227,26 @@ void DetectShapes(uint3 id : SV_DispatchThreadID)
 
 	float3 cp, n;
 	bool   hit;
-	if      (s.shapeType == SHAPE_SPHERE)  hit = TestSphere (s, p, cp, n);
-	else if (s.shapeType == SHAPE_OBB)     hit = TestOBB    (s, p, cp, n);
-	else                                   hit = TestCapsule(s, p, cp, n);
+	if      (s.shapeType == SHAPE_SPHERE)   hit = TestSphere  (s, p, cp, n);
+	else if (s.shapeType == SHAPE_OBB)      hit = TestOBB     (s, p, cp, n);
+	else if (s.shapeType == SHAPE_CAPSULE)  hit = TestCapsule (s, p, cp, n);
+	else                                    hit = TestConvex  (s, p, cp, n);
 	if (!hit) return;
 
 	uint slot;
 	InterlockedAdd(_ColSize[0], 1u, slot);
 	if (slot >= MAX_CONSTRAINTS) return;
 
-	float3 sv = _ShapeVelocities[si];
-
+	float3 sv      = _ShapeVelocities[si];
 	ColConstraint c;
-	c.contactPt  = cp;
-	c.pIdx       = pi;
-	c.normal     = n;
-	c.surfVelN   = dot(sv, n);
-	c.colType    = s.colType;
-	c.dynSlot    = s.dynSlot;
-	c.rbInvMass  = s.rbInvMass;
-	c._pad       = 0;
+	c.contactPt    = cp;
+	c.pIdx         = pi;
+	c.normal       = n;
+	c.surfVelN     = dot(sv, n);
+	c.colType      = s.colType;
+	c.dynSlot      = s.dynSlot;
+	c.rbInvMass    = s.rbInvMass;
+	c._pad         = 0;
 	_ColConstraints[slot] = c;
 }
 
@@ -213,11 +260,10 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 	uint i = id.x;
 	if (i >= _ColSize[0] || i >= MAX_CONSTRAINTS) return;
 
-	ColConstraint c = _ColConstraints[i];
-	float3 pos = _Positions[c.pIdx].predict;
-	float3 nrm = c.normal;
-
-	float pen = dot(pos - c.contactPt, nrm);
+	ColConstraint c   = _ColConstraints[i];
+	float3 pos        = _Positions[c.pIdx].predict;
+	float3 nrm        = c.normal;
+	float  pen        = dot(pos - c.contactPt, nrm);
 	if (pen >= 0.0) return;
 
 	float3 corr = -nrm * pen;
@@ -234,10 +280,10 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 	if (vRelN < 0.0)
 		_Particles[c.pIdx].velocity -= nrm * vRelN;
 
-	// Dynamic: Newton-3rd impulse
+	// Dynamic: Newton-3rd impulse accumulation
 	if (c.colType == COL_DYNAMIC && wTot > EPSILON)
 	{
-		float3 rbImp = -corr * (cInv/wTot) / _ColDeltaTime;
+		float3 rbImp = -corr * (cInv / wTot) / _ColDeltaTime;
 		uint   b     = c.dynSlot * IMPULSE_STRIDE;
 		AtomicAddF(b +  0, rbImp.x);
 		AtomicAddF(b +  4, rbImp.y);

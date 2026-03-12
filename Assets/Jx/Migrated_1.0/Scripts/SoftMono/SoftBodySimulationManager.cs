@@ -21,6 +21,10 @@
 // Test path: assign only CollisionFloorCS + CollisionMesh — Phase 2 is skipped
 // entirely unless at least one XpbdColliderSource is registered.
 
+
+// Central XPBD simulation manager. All collision goes through XpbdColliderSource
+// (Sphere / OBB / Capsule / Cylinder / Convex). No static floor mesh.
+
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -40,20 +44,14 @@ namespace XPBD
 		// ── Constants ─────────────────────────────────────────────────────────
 		public const int MAX_COLLISION_CONSTRAINTS = 10000;
 		const int GROUP_SIZE = 32;
-		const int IMPULSE_STRIDE = 32; // bytes — must match Collision_Shapes.compute
+		const int IMPULSE_STRIDE = 32; // bytes, must match Collision_Shapes.compute
 
-		// ── Inspector: Compute shaders ────────────────────────────────────────
+		// ── Inspector ─────────────────────────────────────────────────────────
 		[Header("Compute Shaders")]
 		public ComputeShader SoftBodySimCS;
-		public ComputeShader CollisionFloorCS;   // Collision_Floor.compute
-		public ComputeShader CollisionShapesCS;  // Collision_Shapes.compute (optional)
+		public ComputeShader CollisionShapesCS;
 		public ComputeShader DeformCS;
 
-		// ── Inspector: Static floor ───────────────────────────────────────────
-		[Header("Static Floor Collision Mesh")]
-		public Mesh CollisionMesh;
-
-		// ── Inspector: Simulation ─────────────────────────────────────────────
 		[Header("Simulation")]
 		[Range(10, 240)] public int FixedTimeStepFPS = 60;
 		[Range(1, 25)] public int SubSteps = 20;
@@ -62,35 +60,30 @@ namespace XPBD
 
 		// ── Bodies ────────────────────────────────────────────────────────────
 		readonly List<SoftBodyComponent> _bodies = new();
-
-		// ── Phase 1: static floor ─────────────────────────────────────────────
-		ComputeBuffer _colPositionsBuffer;
-		ComputeBuffer _colIndicesBuffer;
-		int _colTriCount;
-
-		// ── Phase 2: primitive colliders (XpbdColliderSource) ─────────────────
 		readonly List<XpbdColliderSource> _colliders = new();
-		ComputeBuffer _shapesBuffer;
-		ComputeBuffer _shapeVelBuffer;
-		ComputeBuffer _impulseBuffer;
+
+		// ── Collision GPU buffers ─────────────────────────────────────────────
+		ComputeBuffer _shapesBuffer;       // ShapeDescriptor[]  (64 b each)
+		ComputeBuffer _shapeVelBuffer;     // float3[]
+		ComputeBuffer _meshFacePlanesBuffer; // float4[]  — all convex meshes packed
+		ComputeBuffer _impulseBuffer;      // RWByteAddressBuffer
+
 		int _shapeCount;
 		int _dynSlotCount;
+		int _totalFacePlanes;
+
+		// CPU staging — grown lazily, never shrunk
 		ShapeDescriptorCPU[] _cpuShapes = Array.Empty<ShapeDescriptorCPU>();
 		Vector3[] _cpuVels = Array.Empty<Vector3>();
+		Vector4[] _cpuFacePlanes = Array.Empty<Vector4>();
 		byte[] _cpuImpulseReadback = Array.Empty<byte>();
 
-		// ── Kernel IDs — Floor ────────────────────────────────────────────────
-		int _kFloorDetect, _kFloorSolve;
-
-		// ── Kernel IDs — Shapes ───────────────────────────────────────────────
+		// ── Kernel IDs ────────────────────────────────────────────────────────
 		int _kClearImpulse, _kDetectShapes, _kShapesSolve;
-
-		// ── Kernel IDs — Sim / Deform ─────────────────────────────────────────
 		int _kPresolve, _kPostsolve, _kStretch, _kVolume;
 		int _kDirectDeform, _kTetDeform, _kRecalcNormals, _kNormalizeNormals;
 
 		float _timeAccum, _fixedDT, _subDT;
-		//MaterialPropertyBlock _mpb;
 
 		// ─────────────────────────────────────────────────────────────────────
 		void Awake()
@@ -103,19 +96,14 @@ namespace XPBD
 			}
 			Instance = this;
 			CacheKernelIDs();
-			UploadCollisionMesh();
 		}
 
 		void OnDestroy()
 		{
 			foreach (var b in _bodies)
 				Destroy(b);
-
-			_colPositionsBuffer?.Release();
-			_colIndicesBuffer?.Release();
-			ReleaseShapeBuffers();
+			ReleaseCollisionBuffers();
 			SoftBodyGPUState.ClearAssetCache_S();
-
 			if (Instance == this)
 				Instance = null;
 		}
@@ -126,53 +114,33 @@ namespace XPBD
 			_fixedDT = 1f / FixedTimeStepFPS;
 			_subDT = _fixedDT / SubSteps;
 			_timeAccum += Time.deltaTime;
-
 			if (_timeAccum < _fixedDT)
 				return;
 			_timeAccum -= _fixedDT;
 
-			bool hasFloor = _colTriCount > 0;
-			bool hasShapes = _colliders.Count > 0 && CollisionShapesCS != null;
+			bool hasCollision = _colliders.Count > 0 && CollisionShapesCS;
 
-			// ── Phase 2: refresh descriptors + rebuild GPU buffers ─────────
-			if (hasShapes)
-				RebuildShapeBuffers(_fixedDT);
-
-			// ── Clear dynamic impulse slots before detection ───────────────
-			if (hasShapes && _dynSlotCount > 0)
-				DispatchClearImpulse();
-
-			// ── Collision detection (once per fixed step) ──────────────────
-			foreach (var body in _bodies)
+			if (hasCollision)
 			{
-				if (!body)
-					continue;
-				var st = body.State;
-				ResetColSize(st);
-				if (hasFloor)
-					DispatchFloorDetect(st);
-				if (hasShapes)
-					DispatchShapesDetect(st);
+				RebuildCollisionBuffers(_fixedDT);
+				if (_dynSlotCount > 0)
+					DispatchClearImpulse();
 			}
 
-			// ── Physics substeps ───────────────────────────────────────────
 			foreach (var body in _bodies)
 			{
 				if (!body)
 					continue;
 				for (int s = 0; s < SubSteps; s++)
-					DispatchSubstep(body.State, hasFloor, hasShapes);
+					DispatchSubstep(body.State, hasCollision);
 				DispatchDeform(body);
 			}
 
-			// ── Apply rigidbody impulses ───────────────────────────────────
-			if (hasShapes && _dynSlotCount > 0)
+			if (hasCollision && _dynSlotCount > 0)
 				ApplyDynamicImpulses();
 		}
 
-		// ─────────────────────────────────────────────────────────────────────
-		// Public API
-		// ─────────────────────────────────────────────────────────────────────
+		// ── Public API ────────────────────────────────────────────────────────
 
 		public void AddBody(SoftBodyComponent body) => _bodies.Add(body);
 		public void RemoveBody(SoftBodyComponent body) => _bodies.Remove(body);
@@ -186,81 +154,81 @@ namespace XPBD
 		public void UnregisterCollider(XpbdColliderSource src)
 			=> _colliders.Remove(src);
 
-		// ─────────────────────────────────────────────────────────────────────
-		// Phase 1 — Floor collision
-		// ─────────────────────────────────────────────────────────────────────
+		// ── Collision buffer management ───────────────────────────────────────
 
-		void ResetColSize(SoftBodyGPUState body)
-			=> body.ColSizeBuffer.SetData(new uint[] { 0 });
-
-		void DispatchFloorDetect(SoftBodyGPUState body)
-		{
-			var cs = CollisionFloorCS;
-			cs.SetFloat("_ColDeltaTime", _fixedDT);
-			cs.SetInt("_TriCount", _colTriCount);
-			cs.SetInt("_ParticleCount", body.ParticleCount);
-			cs.SetBuffer(_kFloorDetect, "_ColPositions", _colPositionsBuffer);
-			cs.SetBuffer(_kFloorDetect, "_TriIndices", _colIndicesBuffer);
-			cs.SetBuffer(_kFloorDetect, "_Particles", body.ParticleBuffer);
-			cs.SetBuffer(_kFloorDetect, "_Positions", body.PositionsBuffer);
-			cs.SetBuffer(_kFloorDetect, "_ColSize", body.ColSizeBuffer);
-			cs.SetBuffer(_kFloorDetect, "_ColConstraints", body.ColConstraintBuffer);
-			cs.Dispatch(_kFloorDetect, Ceil(_colTriCount), 1, 1);
-		}
-
-		void DispatchFloorSolve(SoftBodyGPUState body)
-		{
-			var cs = CollisionFloorCS;
-			cs.SetFloat("_ColDeltaTime", _fixedDT);
-			cs.SetInt("_ParticleCount", body.ParticleCount);
-			cs.SetBuffer(_kFloorSolve, "_Particles", body.ParticleBuffer);
-			cs.SetBuffer(_kFloorSolve, "_Positions", body.PositionsBuffer);
-			cs.SetBuffer(_kFloorSolve, "_ColSize", body.ColSizeBuffer);
-			cs.SetBuffer(_kFloorSolve, "_ColConstraints", body.ColConstraintBuffer);
-			cs.Dispatch(_kFloorSolve, Ceil(MAX_COLLISION_CONSTRAINTS), 1, 1);
-		}
-
-		// ─────────────────────────────────────────────────────────────────────
-		// Phase 2 — Primitive shape collision
-		// ─────────────────────────────────────────────────────────────────────
-
-		void RebuildShapeBuffers(float dt)
+		void RebuildCollisionBuffers(float dt)
 		{
 			int count = _colliders.Count;
 			_shapeCount = count;
 			_dynSlotCount = 0;
-			foreach (var c in _colliders)
-				if (c.Type == XpbdColliderSource.ColType.Dynamic)
-					_dynSlotCount++;
 
-			if (_cpuShapes.Length < count)
-				_cpuShapes = new ShapeDescriptorCPU[count];
-			if (_cpuVels.Length < count)
-				_cpuVels = new Vector3[count];
-
+			// First pass: assign dynamic slots, set FacePlanesOffset for convex shapes,
+			// call RefreshDescriptor so FacePlanes[] is current world-space.
 			uint dynSlot = 0;
+			uint facePlaneOff = 0;
+
 			for (int i = 0; i < count; i++)
 			{
 				var col = _colliders[i];
 				uint slot = col.Type == XpbdColliderSource.ColType.Dynamic ? dynSlot++ : 0u;
+				if (col.Type == XpbdColliderSource.ColType.Dynamic)
+					_dynSlotCount++;
+
+				if (col.Shape == XpbdColliderSource.ShapeType.Convex)
+					col.FacePlanesOffset = facePlaneOff;
+
 				col.RefreshDescriptor(dt, slot);
+
+				if (col.Shape == XpbdColliderSource.ShapeType.Convex && col.FacePlanes != null)
+					facePlaneOff += (uint) col.FacePlanes.Length;
+			}
+			_totalFacePlanes = (int) facePlaneOff;
+
+			// Grow CPU arrays
+			if (_cpuShapes.Length < count)
+				_cpuShapes = new ShapeDescriptorCPU[count];
+			if (_cpuVels.Length < count)
+				_cpuVels = new Vector3[count];
+			if (_cpuFacePlanes.Length < _totalFacePlanes)
+				_cpuFacePlanes = new Vector4[Mathf.Max(_totalFacePlanes, 1)];
+
+			// Second pass: fill CPU arrays
+			int fpIdx = 0;
+			for (int i = 0; i < count; i++)
+			{
+				var col = _colliders[i];
 				_cpuShapes[i] = col.Descriptor;
 				_cpuVels[i] = col.SurfaceVelocity;
+				if (col.Shape == XpbdColliderSource.ShapeType.Convex && col.FacePlanes != null)
+				{
+					Array.Copy(col.FacePlanes, 0, _cpuFacePlanes, fpIdx, col.FacePlanes.Length);
+					fpIdx += col.FacePlanes.Length;
+				}
 			}
 
-			if (_shapesBuffer == null || _shapesBuffer.count != count)
+			// Reallocate GPU buffers when counts change
+			bool needRebuild = _shapesBuffer == null
+							|| _shapesBuffer.count != count
+							|| _meshFacePlanesBuffer == null
+							|| _meshFacePlanesBuffer.count != Mathf.Max(_totalFacePlanes, 1);
+
+			if (needRebuild)
 			{
-				ReleaseShapeBuffers();
+				ReleaseCollisionBuffers();
 				_shapesBuffer = new ComputeBuffer(count, 64);
 				_shapeVelBuffer = new ComputeBuffer(count, 3 * sizeof(float));
+				_meshFacePlanesBuffer = new ComputeBuffer(Mathf.Max(_totalFacePlanes, 1),
+														   4 * sizeof(float));
 				int iBytes = Mathf.Max(1, _dynSlotCount) * IMPULSE_STRIDE;
 				_impulseBuffer = new ComputeBuffer(iBytes / 4, sizeof(uint),
-													ComputeBufferType.Raw);
+														   ComputeBufferType.Raw);
 				_cpuImpulseReadback = new byte[iBytes];
 			}
 
 			_shapesBuffer.SetData(_cpuShapes, 0, 0, count);
 			_shapeVelBuffer.SetData(_cpuVels, 0, 0, count);
+			if (_totalFacePlanes > 0)
+				_meshFacePlanesBuffer.SetData(_cpuFacePlanes, 0, 0, _totalFacePlanes);
 
 			var cs = CollisionShapesCS;
 			cs.SetInt("_ShapeCount", _shapeCount);
@@ -268,29 +236,36 @@ namespace XPBD
 			cs.SetFloat("_ColDeltaTime", _fixedDT);
 		}
 
-		void ReleaseShapeBuffers()
+		void ReleaseCollisionBuffers()
 		{
 			_shapesBuffer?.Release();
 			_shapesBuffer = null;
 			_shapeVelBuffer?.Release();
 			_shapeVelBuffer = null;
+			_meshFacePlanesBuffer?.Release();
+			_meshFacePlanesBuffer = null;
 			_impulseBuffer?.Release();
 			_impulseBuffer = null;
 		}
 
+		// ── Collision dispatches ──────────────────────────────────────────────
+
+		void ResetColSize(SoftBodyGPUState body)
+			=> body.ColSizeBuffer.SetData(new uint[] { 0 });
+
 		void DispatchClearImpulse()
 		{
-			var cs = CollisionShapesCS;
-			cs.SetBuffer(_kClearImpulse, "_ImpulseBytes", _impulseBuffer);
-			cs.Dispatch(_kClearImpulse, Ceil(_dynSlotCount), 1, 1);
+			CollisionShapesCS.SetBuffer(_kClearImpulse, "_ImpulseBytes", _impulseBuffer);
+			CollisionShapesCS.Dispatch(_kClearImpulse, Ceil(_dynSlotCount), 1, 1);
 		}
 
-		void DispatchShapesDetect(SoftBodyGPUState body)
+		void DispatchDetectShapes(SoftBodyGPUState body)
 		{
 			var cs = CollisionShapesCS;
 			cs.SetInt("_ParticleCount", body.ParticleCount);
 			cs.SetBuffer(_kDetectShapes, "_Shapes", _shapesBuffer);
 			cs.SetBuffer(_kDetectShapes, "_ShapeVelocities", _shapeVelBuffer);
+			cs.SetBuffer(_kDetectShapes, "_MeshFacePlanes", _meshFacePlanesBuffer);
 			cs.SetBuffer(_kDetectShapes, "_ImpulseBytes", _impulseBuffer);
 			cs.SetBuffer(_kDetectShapes, "_Particles", body.ParticleBuffer);
 			cs.SetBuffer(_kDetectShapes, "_Positions", body.PositionsBuffer);
@@ -347,11 +322,9 @@ namespace XPBD
 			}
 		}
 
-		// ─────────────────────────────────────────────────────────────────────
-		// Physics substep
-		// ─────────────────────────────────────────────────────────────────────
+		// ── Physics substep ───────────────────────────────────────────────────
 
-		void DispatchSubstep(SoftBodyGPUState body, bool hasFloor, bool hasShapes)
+		void DispatchSubstep(SoftBodyGPUState body, bool hasCollision)
 		{
 			var cs = SoftBodySimCS;
 			cs.SetFloat("_DeltaTime", _subDT);
@@ -364,13 +337,17 @@ namespace XPBD
 			BindSimBuffers(cs, _kPresolve, body);
 			cs.Dispatch(_kPresolve, Ceil(body.ParticleCount), 1, 1);
 
-			// Each active phase runs its own SolveCollisions kernel.
-			// Order: floor first (static, no velocity field), then shapes
-			// (may carry surface velocity for kinematic/dynamic).
-			if (hasFloor)
-				DispatchFloorSolve(body);
-			if (hasShapes)
+			// Detect every substep with fresh predicted positions so contact
+			// points are never stale. Reusing stale constraints across substeps
+			// causes Postsolve to produce a large oscillating velocity
+			// (velocity = (corrected_predict - old_position) / subDT) that
+			// resonates with the constraint correction each substep → explosion.
+			if (hasCollision)
+			{
+				ResetColSize(body);
+				DispatchDetectShapes(body);
 				DispatchShapesSolve(body);
+			}
 
 			BindSimBuffers(cs, _kStretch, body);
 			cs.Dispatch(_kStretch, Ceil(body.EdgeCount), 1, 1);
@@ -391,9 +368,7 @@ namespace XPBD
 			cs.SetBuffer(kernel, "_DeltaBytes", body.DeltaBytesBuffer);
 		}
 
-		// ─────────────────────────────────────────────────────────────────────
-		// Mesh deformation
-		// ─────────────────────────────────────────────────────────────────────
+		// ── Mesh deformation ──────────────────────────────────────────────────
 
 		void DispatchDeform(SoftBodyComponent bodyCmp)
 		{
@@ -439,30 +414,7 @@ namespace XPBD
 			bodyCmp.InternalOnDeformed();
 		}
 
-		// ─────────────────────────────────────────────────────────────────────
-		// Static floor upload
-		// ─────────────────────────────────────────────────────────────────────
-
-		void UploadCollisionMesh()
-		{
-			if (CollisionMesh == null)
-			{
-				Debug.LogWarning("[XPBD] No CollisionMesh — static floor disabled.");
-				return;
-			}
-			var verts = CollisionMesh.vertices;
-			var tris = CollisionMesh.triangles;
-			_colTriCount = tris.Length / 3;
-
-			_colPositionsBuffer = new ComputeBuffer(verts.Length, 3 * sizeof(float));
-			_colPositionsBuffer.SetData(verts);
-			_colIndicesBuffer = new ComputeBuffer(tris.Length, sizeof(uint));
-			_colIndicesBuffer.SetData(Array.ConvertAll(tris, x => (uint) x));
-		}
-
-		// ─────────────────────────────────────────────────────────────────────
-		// Kernel ID cache
-		// ─────────────────────────────────────────────────────────────────────
+		// ── Kernel ID cache ───────────────────────────────────────────────────
 
 		void CacheKernelIDs()
 		{
@@ -471,15 +423,9 @@ namespace XPBD
 			_kStretch = SoftBodySimCS.FindKernel("StretchConstraint");
 			_kVolume = SoftBodySimCS.FindKernel("VolumeConstraint");
 
-			_kFloorDetect = CollisionFloorCS.FindKernel("DetectCollisions");
-			_kFloorSolve = CollisionFloorCS.FindKernel("SolveCollisions");
-
-			if (CollisionShapesCS != null)
-			{
-				_kClearImpulse = CollisionShapesCS.FindKernel("ClearImpulseAccum");
-				_kDetectShapes = CollisionShapesCS.FindKernel("DetectShapes");
-				_kShapesSolve = CollisionShapesCS.FindKernel("SolveCollisions");
-			}
+			_kClearImpulse = CollisionShapesCS.FindKernel("ClearImpulseAccum");
+			_kDetectShapes = CollisionShapesCS.FindKernel("DetectShapes");
+			_kShapesSolve = CollisionShapesCS.FindKernel("SolveCollisions");
 
 			_kDirectDeform = DeformCS.FindKernel("DirectDeform");
 			_kTetDeform = DeformCS.FindKernel("TetDeform");

@@ -369,10 +369,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   SoftBodySimCS: {fileID: 7200000, guid: 083384a4c37b66743b9a76c82bd162bd, type: 3}
-  CollisionFloorCS: {fileID: 7200000, guid: e79309577b612be469bd3f4a4cfc2a15, type: 3}
   CollisionShapesCS: {fileID: 7200000, guid: 7f9439041d81b494282cf35dd273d234, type: 3}
   DeformCS: {fileID: 7200000, guid: 21cc22ea2a32d254e885707879d019ec, type: 3}
-  CollisionMesh: {fileID: 0}
   FixedTimeStepFPS: 60
   SubSteps: 20
   EdgeCompliance: 0.01
@@ -537,8 +535,8 @@ GameObject:
   - component: {fileID: 1663775684}
   - component: {fileID: 1663775683}
   - component: {fileID: 1663775681}
-  - component: {fileID: 1663775685}
   - component: {fileID: 1663775686}
+  - component: {fileID: 1663775685}
   m_Layer: 0
   m_Name: Floor
   m_TagString: Untagged
@@ -595,7 +593,7 @@ MeshFilter:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1663775680}
-  m_Mesh: {fileID: 878140800973305286, guid: fd8f835872b26364c8194bdc4373a684, type: 3}
+  m_Mesh: {fileID: 10209, guid: 0000000000000000e000000000000000, type: 0}
 --- !u!4 &1663775684
 Transform:
   m_ObjectHideFlags: 0
@@ -611,8 +609,20 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!65 &1663775685
-BoxCollider:
+--- !u!114 &1663775685
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1663775680}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 28c3ed83a957a474f98c289df42a781f, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+--- !u!64 &1663775686
+MeshCollider:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
@@ -629,21 +639,10 @@ BoxCollider:
   m_IsTrigger: 0
   m_ProvidesContacts: 0
   m_Enabled: 1
-  serializedVersion: 3
-  m_Size: {x: 20, y: 0, z: 20}
-  m_Center: {x: 0, y: 0, z: 0}
---- !u!114 &1663775686
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1663775680}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 28c3ed83a957a474f98c289df42a781f, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
+  serializedVersion: 5
+  m_Convex: 1
+  m_CookingOptions: 30
+  m_Mesh: {fileID: 10209, guid: 0000000000000000e000000000000000, type: 0}
 --- !u!1 &1750289253
 GameObject:
   m_ObjectHideFlags: 0
@@ -690,8 +689,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   softPrefab: {fileID: 7423521658402546732, guid: c76862b92945d124bb8b4c8065e230e4, type: 3}
-  minHeight: 1
-  maxHeight: 5
+  minHeight: 3
+  maxHeight: 7
 --- !u!1 &1772512984
 GameObject:
   m_ObjectHideFlags: 0
