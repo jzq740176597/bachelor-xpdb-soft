@@ -169,9 +169,17 @@ bool TestOBB_Interior(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 	return true;
 }
 
-// OBB CCD: segment (prevPos → predict) vs each face of the OBB.
-// Triggered when param1 < 0 (thin/flat box). Catches tunneling particles.
-// Finds the face crossing with smallest t in [0,1] that falls within the face bounds.
+// OBB CCD: segment (prevPos → predict) vs the faces of the OBB.
+//
+// KEY RULE: only test faces that prev is OUTSIDE of (or sitting on).
+// Without this guard, a particle resting on the top face has float-drift that
+// places prev just below it. The 6-face loop then picks the BOTTOM face (which
+// has t > 0 in the downward direction) and returns n = -up, pushing the particle
+// further down → pass-through. The outside-only filter eliminates this completely.
+//
+// For a zero-thickness floor (hy = 1e-4), the top face is the only face prev
+// can be outside of while the particle is approaching from above, so this
+// naturally reduces to a single half-space crossing test in the common case.
 bool TestOBB_CCD(ShapeDescriptor s, float3 prev, float3 p, out float3 cp, out float3 n)
 {
 	cp = 0; n = float3(0,1,0);
@@ -179,7 +187,8 @@ bool TestOBB_CCD(ShapeDescriptor s, float3 prev, float3 p, out float3 cp, out fl
 	float  hx = s.param0, hy = -s.param1, hz = s.param2; // param1 stored negative
 
 	// Segment direction
-	float3 dir = p - prev;
+	float3 dir  = p - prev;
+	float3 drel = prev - s.centre;   // prev relative to box centre
 
 	// Test all 6 faces; keep the crossing with smallest valid t.
 	float  bestT = 2.0;   // > 1 means no hit yet
@@ -201,21 +210,35 @@ bool TestOBB_CCD(ShapeDescriptor s, float3 prev, float3 p, out float3 cp, out fl
 		else if (fi == 4) { fax = az;  fh = hz; fs =  1; }
 		else              { fax = az;  fh = hz; fs = -1; }
 
+		// ── ENTRY FILTER (two conditions, both required) ────────────────
+		// 1. prev must be OUTSIDE this face (or on it):
+		//      dot(fax*fs, prev-centre) >= -EPSILON
+		//    Without this: a particle drifted just inside the slab skips the top
+		//    face correctly, but then hits the bottom face (t>0, n=-up) and gets
+		//    pushed downward → tunnels through.
+		// 2. Segment must be ENTERING (moving inward through this face):
+		//      denom * fs < 0
+		//    Without this: fi=3 (bottom face, n=-up) passes condition 1 when prev
+		//    is barely inside the slab, and its t is valid → wrong downward push.
+		//    denom*fs < 0 means the particle moves against the face outward normal,
+		//    which is the definition of entering that face.
 		float denom = dot(fax, dir);
-		if (abs(denom) < EPSILON) continue;    // segment parallel to face
+		if (dot(fax, drel) * fs < -EPSILON) continue;  // prev not outside this face
+		if (denom * fs >= 0.0) continue;               // not entering (parallel or exiting)
 
-		float num = fh * fs - dot(fax, prev - s.centre);
-		float t   = num / denom;
-		if (t < 0.0 || t > 1.0) continue;     // not in this step
-		if (t >= bestT) continue;             // already have better hit
+		// t at which segment hits the face plane
+		// plane eq: dot(fax, q - centre) = fh * fs
+		// → t = (fh*fs - dot(fax, drel)) / denom
+		float t = (fh * fs - dot(fax, drel)) / denom;
+		if (t < 0.0 || t > 1.0) continue;     // crossing outside this substep
+		if (t >= bestT) continue;
 
-		// Intersection point
+		// Candidate crossing point — check lateral bounds
 		float3 q  = prev + dir * t;
 		float3 qd = q - s.centre;
-		// Check the other two axes (inside face bounds)
-		if      (fi < 2) { if (abs(dot(ay,qd)) >= hy || abs(dot(az,qd)) >= hz) continue; }
-		else if (fi < 4) { if (abs(dot(ax,qd)) >= hx || abs(dot(az,qd)) >= hz) continue; }
-		else             { if (abs(dot(ax,qd)) >= hx || abs(dot(ay,qd)) >= hy) continue; }
+		if      (fi < 2) { if (abs(dot(ay,qd)) > hy + EPSILON || abs(dot(az,qd)) > hz + EPSILON) continue; }
+		else if (fi < 4) { if (abs(dot(ax,qd)) > hx + EPSILON || abs(dot(az,qd)) > hz + EPSILON) continue; }
+		else             { if (abs(dot(ax,qd)) > hx + EPSILON || abs(dot(ay,qd)) > hy + EPSILON) continue; }
 
 		bestT = t;
 		bestN = fax * fs;
@@ -230,15 +253,19 @@ bool TestOBB_CCD(ShapeDescriptor s, float3 prev, float3 p, out float3 cp, out fl
 
 bool TestOBB(ShapeDescriptor s, float3 prev, float3 p, out float3 cp, out float3 n)
 {
-	// Route to CCD or interior via sign-bit of param1 (NOT a magnitude comparison).
-	// A flat BoxCollider (Size.y=0) encodes -0.0f on the CPU. In IEEE 754, -0.0 == +0.0
-	// so "param1 < 0.0" is false for -0.0 on all conforming GPUs. The sign-bit test
-	// (asuint & 0x80000000) correctly identifies -0.0 as "negative" → CCD path.
+	// param1 sign bit: negative → CCD mode (thin/flat box), positive → Interior only.
 	bool isCCD = (asuint(s.param1) & 0x80000000u) != 0u;
 	if (isCCD)
-		return TestOBB_CCD(s, prev, p, cp, n);
-	else
+	{
+		// CCD first: catches particles crossing a face this substep (outside → inside).
+		// The outside-only face filter means CCD MISSES particles that are already
+		// inside the slab (e.g. float drift placed prev just below the top face).
+		// Interior fallback catches those: penetration is at most one subDT of motion
+		// (a tiny depth), so the correction is small and stable.
+		if (TestOBB_CCD(s, prev, p, cp, n)) return true;
 		return TestOBB_Interior(s, p, cp, n);
+	}
+	return TestOBB_Interior(s, p, cp, n);
 }
 
 bool TestCapsule(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
@@ -299,13 +326,12 @@ bool TestConvex(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 }
 
 // ── Kernel: DetectShapes ──────────────────────────────────────────────────────
-// One thread per (shape × particle). Thread index = si*_ParticleCount + pi.
+// One thread per (shape × particle). Index = si * _ParticleCount + pi.
 
 [numthreads(GROUP_SIZE, 1, 1)]
 void DetectShapes(uint3 id : SV_DispatchThreadID)
 {
-	uint total = _ShapeCount * _ParticleCount;
-	if (id.x >= total) return;
+	if (id.x >= _ShapeCount * _ParticleCount) return;
 	uint si = id.x / _ParticleCount;
 	uint pi = id.x % _ParticleCount;
 
