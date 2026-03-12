@@ -225,15 +225,15 @@ namespace XPBD
 			for (int i = 0; i < _bodies.Count; i++)
 			{
 				var a = _bodies[i];
-				if (!a || a.CollisionMask == 0)
+				if (!a || a.SoftCollisionMask == 0)
 					continue;
 				for (int j = i + 1; j < _bodies.Count; j++)
 				{
 					var b = _bodies[j];
-					if (!b || b.CollisionMask == 0)
+					if (!b || b.SoftCollisionMask == 0)
 						continue;
-					bool aSeesB = (a.CollisionMask & (1 << b.CollisionLayer)) != 0;
-					bool bSeesA = (b.CollisionMask & (1 << a.CollisionLayer)) != 0;
+					bool aSeesB = (a.SoftCollisionMask & (1 << b.SoftCollisionLayer)) != 0;
+					bool bSeesA = (b.SoftCollisionMask & (1 << a.SoftCollisionLayer)) != 0;
 					if (aSeesB && bSeesA)
 						AddSoftSoftPair(a, b);
 					else
@@ -489,15 +489,15 @@ namespace XPBD
 					cs.Dispatch(_kClearSoftSoftDelta, Ceil(nB), 1, 1);
 
 					// Detect: 2D dispatch over CountA x CountB particles
-					cs.SetInt  ("_CountA",    nA);
-					cs.SetInt  ("_CountB",    nB);
+					cs.SetInt("_CountA", nA);
+					cs.SetInt("_CountB", nB);
 					cs.SetFloat("_ColRadius", radius);
 					cs.SetBuffer(_kDetectSoftSoft, "_ParticlesA", a.State.ParticleBuffer);
 					cs.SetBuffer(_kDetectSoftSoft, "_PositionsA", a.State.PositionsBuffer);
-					cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufA",  bufs.DeltaA);
+					cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufA", bufs.DeltaA);
 					cs.SetBuffer(_kDetectSoftSoft, "_ParticlesB", b.State.ParticleBuffer);
 					cs.SetBuffer(_kDetectSoftSoft, "_PositionsB", b.State.PositionsBuffer);
-					cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufB",  bufs.DeltaB);
+					cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufB", bufs.DeltaB);
 					cs.Dispatch(_kDetectSoftSoft, CeilN(nA, 8), CeilN(nB, 8), 1);
 				}
 

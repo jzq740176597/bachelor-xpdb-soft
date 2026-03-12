@@ -24,9 +24,11 @@ namespace XPBD
 		TetrahedralMeshAsset tetMeshAsset;
 		//for soft-collision [3/12/2026 jzq]
 		[Header("Soft-Soft-Collision")]
-		public int CollisionLayer = 0;
-		public int CollisionMask = 0;   // 0 = no layer-based pairing
-		public float SoftSoftParticleRadius = 0f; // 0 = use manager's SoftSoftDefaultRadius
+		public int SoftCollisionLayer = 0;
+		[Tooltip("0 = no layer-based pairing")]
+		public int SoftCollisionMask = 0;
+		[Tooltip("0 = use manager's SoftSoftDefaultRadius")]
+		public float SoftSoftParticleRadius = 0f;
 		#endregion
 
 		#region Imp
