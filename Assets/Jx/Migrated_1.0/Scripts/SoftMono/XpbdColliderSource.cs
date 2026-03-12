@@ -88,11 +88,45 @@ namespace XPBD
 		Quaternion _prevRot;
 		// Local-space planes for convex mesh (computed once in Awake).
 		Vector4[] _localPlanes;
-
+		// [3/12/2026 jzq]
+		static bool ValidateCld_S(Collider c)
+		{
+			if (c is MeshCollider mc)
+			{
+				if (!mc.convex)
+				{
+					Debug.LogError($"[XPBD] '{c.name}': MeshCollider must have convex = true", c);
+					return false;
+				}
+			}
+			return c.enabled;
+		}
 		// ─────────────────────────────────────────────────────────────────────
 		void Awake()
 		{
 			_col = GetComponent<Collider>();
+			// [3/12/2026 jzq]
+			if (_col && !ValidateCld_S(_col))
+			{
+				var oldCol = _col;
+				_col = null;
+				// try find the first valid collider if multiple are present
+				foreach (var c in GetComponents<Collider>())
+				{
+					if (c != oldCol && ValidateCld_S(c))
+					{
+						_col = c;
+						break;
+					}
+				}
+			}
+			if (_col == null)
+			{
+				Debug.LogError($"[XPBD] '{name}': No valid Collider found. " +
+					"Ensure at least one Collider component is enabled and valid.", this);
+				enabled = false;
+				return;
+			}
 			Body = GetComponent<Rigidbody>();
 
 			Type = Body == null ? ColType.Static
@@ -102,20 +136,20 @@ namespace XPBD
 			switch (_col)
 			{
 				case MeshCollider mc:
-					if (!mc.convex)
-					{
-						Debug.LogError(
-							$"[XPBD] '{name}': MeshCollider must have convex=true. " +
-							"Enable Convex on the MeshCollider component.", this);
-						enabled = false;
-						return;
-					}
+					///Did ValidateCld_S [3/12/2026 jzq]
+					//if (!mc.convex)
+					//{
+					//	Debug.LogError(
+					//		$"[XPBD] '{name}': MeshCollider must have convex=true. " +
+					//		"Enable Convex on the MeshCollider component.", this);
+					//	enabled = false;
+					//	return;
+					//}
 					Shape = ShapeType.Convex;
 					_localPlanes = ExtractConvexPlanes(mc.sharedMesh);
 					if (Type == ColType.Static)
 						FacePlanes = TransformPlanes(_localPlanes, transform.localToWorldMatrix);
 					break;
-
 				case SphereCollider:
 					Shape = ShapeType.Sphere;
 					break;
