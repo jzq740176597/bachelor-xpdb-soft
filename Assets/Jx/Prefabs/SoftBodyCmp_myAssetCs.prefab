@@ -97,3 +97,6 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   tetMeshAsset: {fileID: 11400000, guid: c623d8191f6735c43a1bcd9d5a81d94a, type: 2}
+  SoftCollisionLayer: 0
+  SoftCollisionMask: 1
+  SoftSoftParticleRadius: 0

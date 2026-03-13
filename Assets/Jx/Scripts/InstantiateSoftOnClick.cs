@@ -16,6 +16,8 @@ public sealed class InstantiateSoftOnClick : MonoBehaviour
 	float minHeight = 5;
 	[SerializeField]
 	float maxHeight = 10;
+	[SerializeField]
+	bool tryAddSoftToCol;
 	#endregion
 
 	#region Pub
@@ -25,7 +27,9 @@ public sealed class InstantiateSoftOnClick : MonoBehaviour
 		Debug.Log($"Instantiate pos = {p}");
 		var prefab = instantiateAnother ? anotherPrefab : softPrefab;
 		var soft = Instantiate(prefab, p, Quaternion.identity).GetComponent<SoftBodyComponent>();
-		//soft.Init()
+		//Post : Invoke RebuildLayerPairs() for soft-soft-col [3/13/2026 jzq]
+		if (tryAddSoftToCol)
+			TryAddSoftToCol(soft);
 	}
 	#endregion
 
@@ -45,5 +49,14 @@ public sealed class InstantiateSoftOnClick : MonoBehaviour
 
 	#region Imp
 	bool instantiateAnother;
+	#endregion
+
+	#region Static
+	public static void TryAddSoftToCol(SoftBodyComponent soft)
+	{
+		soft.Init(); ///Ensure added to manager [3/13/2026 jzq]
+		if (soft.SoftCollisionMask != 0)
+			SoftBodySimulationManager.Instance.RebuildLayerPairs();
+	}
 	#endregion
 }
