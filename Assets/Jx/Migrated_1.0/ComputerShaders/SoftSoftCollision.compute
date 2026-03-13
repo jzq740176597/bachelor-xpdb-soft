@@ -1,35 +1,74 @@
 // SoftSoftCollision.compute
 //
-// Particle-particle bilateral collision between two XPBD soft bodies.
-// One dispatch per registered (BodyA, BodyB) pair, per substep.
+// Kernels: ComputeBounds, ClearSoftSoftDelta, DetectSoftSoft
 //
-// Strategy: point-vs-point proximity test.
-//   If dist(pA, pB) < CollisionRadius → bilateral push-apart correction,
-//   mass-weighted, accumulated atomically into per-body SoftSoftDeltaBuffers.
-//   A separate ApplySoftSoftDelta kernel commits the accumulated deltas.
+// !! SPLIT-FILE RULE — CRITICAL FOR FUTURE PATCHES !!
+// ─────────────────────────────────────────────────────────────────────────────
+// Unity validates ALL file-scope buffer/texture declarations against EVERY
+// kernel in the same .compute file at dispatch time — even if a given kernel
+// never references that buffer.
 //
-// GPU buffers (A-side and B-side bound separately per dispatch):
-//   _ParticlesA / _PositionsA / _DeltaBufA   — body A
-//   _ParticlesB / _PositionsB / _DeltaBufB   — body B
+// Example of the failure this caused:
+//   _ParticlesA was declared at file scope.
+//   ApplySoftSoftDelta (kernel index 3) WRITES _ParticlesA.velocity.
+//   ClearSoftSoftDelta (kernel index 1) does NOT touch _ParticlesA at all.
+//   Unity error: "Property (_ParticlesA) at kernel index (1) is not set."
+//   The CPU dispatch only bound _DeltaBufA for Clear — correct per the kernel,
+//   but Unity still demanded _ParticlesA because it's declared at file scope.
 //
-// Uniforms:
-//   _CountA          particle count for A
-//   _CountB          particle count for B
-//   _ColRadius       contact distance threshold (sum of both particle radii)
+// Fix: split kernels into two .compute files so each file only declares the
+// buffers its kernels actually need:
 //
-// DeltaBuf layout per particle (12 bytes, 3 atomic floats):
-//   [particleIdx * 12 + 0]  delta.x
-//   [particleIdx * 12 + 4]  delta.y
-//   [particleIdx * 12 + 8]  delta.z
+//   SoftSoftCollision.compute  ← this file
+//     ComputeBounds     buffers: _PositionsA (RO), _BoundsBuf (RW)
+//     ClearSoftSoftDelta buffers: _DeltaBufA (RW)
+//     DetectSoftSoft    buffers: _ParticlesA/B (RO), _PositionsA/B (RO),
+//                                _DeltaBufA/B (RW)
+//
+//   SoftSoftApply.compute      ← sibling file
+//     ApplySoftSoftDelta buffers: _ParticlesA (RW, writes velocity),
+//                                _PositionsA (RW, writes predict),
+//                                _DeltaBufA (RO, reads corrections)
+//
+// The Apply kernel needs _ParticlesA as RW (writes velocity).
+// The Detect kernel only needs _ParticlesA as read-only (reads invMass).
+// Keeping them in the same file would force both kernels to share the
+// same RW declaration — wasteful and fragile.
+//
+// ── Pipeline (per substep, per pair) ─────────────────────────────────────────
+//
+//   Phase 1 — after DispatchIntegrate, one dispatch per body:
+//     ComputeBounds: accumulate live centroid + max dist² → _BoundsBuf
+//     CPU reads _BoundsBuf → circumsphere. If spheres don't overlap → skip pair.
+//
+//   Phase 2 — per overlapping pair:
+//     ClearSoftSoftDelta  (×2, once per side)
+//     DetectSoftSoft      (O(N×M) point-point proximity)
+//     ApplySoftSoftDelta  (in SoftSoftApply.compute, ×2, once per side)
+//
+// ── _BoundsBuf layout (32 bytes, ComputeBufferType.Raw) ──────────────────────
+//   byte  0: centroid_x  int (fixed-point: real = value / (FP_SCALE * count))
+//   byte  4: centroid_y  int
+//   byte  8: centroid_z  int
+//   byte 12: count       uint  (number of particles accumulated)
+//   byte 16: maxDistSq   uint  (asuint(float), max dist² from origin, CAS max)
+//   byte 20..31: unused
+//   CPU must zero this buffer before each ComputeBounds dispatch.
+//
+// ── _DeltaBufA / _DeltaBufB layout (12 bytes per particle) ───────────────────
+//   particleIdx * 12 + 0: delta.x  (float, atomic CAS accumulation)
+//   particleIdx * 12 + 4: delta.y
+//   particleIdx * 12 + 8: delta.z
 
+#pragma kernel ComputeBounds
 #pragma kernel ClearSoftSoftDelta
 #pragma kernel DetectSoftSoft
-#pragma kernel ApplySoftSoftDelta
 
 #pragma target 5.0
 
 #define EPSILON     1e-6
-#define GROUP_SIZE  64   // larger group for 2D dispatch
+#define GROUP_SIZE  64
+#define FP_SCALE    1000.0
 
 struct Particle     { float3 position; float _p0; float3 velocity; float invMass; };
 struct PbdPositions { float3 predict;  float _p0; float3 delta;    float _p1;    };
@@ -38,19 +77,21 @@ struct PbdPositions { float3 predict;  float _p0; float3 delta;    float _p1;   
 
 uint  _CountA;
 uint  _CountB;
-float _ColRadius;   // contact threshold (e.g. 0.05 for small soft bodies)
+float _ColRadius;
 
-// ── Buffers ───────────────────────────────────────────────────────────────────
+// ── Buffers — only what the kernels in THIS file actually use ─────────────────
 
-StructuredBuffer<Particle>     _ParticlesA;
-RWStructuredBuffer<PbdPositions> _PositionsA;
-RWByteAddressBuffer              _DeltaBufA;
+StructuredBuffer<Particle>       _ParticlesA;   // DetectSoftSoft: read invMass
+RWStructuredBuffer<PbdPositions> _PositionsA;   // ComputeBounds + DetectSoftSoft: read predict
+RWByteAddressBuffer              _DeltaBufA;    // ClearSoftSoftDelta: write 0; DetectSoftSoft: CAS add
 
-StructuredBuffer<Particle>     _ParticlesB;
-RWStructuredBuffer<PbdPositions> _PositionsB;
-RWByteAddressBuffer              _DeltaBufB;
+StructuredBuffer<Particle>       _ParticlesB;   // DetectSoftSoft: read invMass
+RWStructuredBuffer<PbdPositions> _PositionsB;   // DetectSoftSoft: read predict
+RWByteAddressBuffer              _DeltaBufB;    // ClearSoftSoftDelta (rebound): write 0; DetectSoftSoft: CAS add
 
-// ── Atomic float add (CAS) ────────────────────────────────────────────────────
+RWByteAddressBuffer              _BoundsBuf;    // ComputeBounds: write; CPU: readback
+
+// ── Atomic helpers ────────────────────────────────────────────────────────────
 
 void AtomicAddFA(RWByteAddressBuffer buf, uint addr, float v)
 {
@@ -66,11 +107,48 @@ void AtomicAddFA(RWByteAddressBuffer buf, uint addr, float v)
 	} while (true);
 }
 
+void AtomicMaxF(RWByteAddressBuffer buf, uint addr, float v)
+{
+	// IEEE 754 positive floats sort identically to their uint bit patterns.
+	// InterlockedMax on the bits == fmax for values >= 0 (distances always are). ✓
+	uint prev = buf.Load(addr);
+	uint next = asuint(v);
+	[allow_uav_condition]
+	do {
+		if (prev >= next) break;
+		uint orig;
+		buf.InterlockedCompareExchange(addr, prev, next, orig);
+		if (orig == prev) break;
+		prev = orig;
+	} while (true);
+}
+
+// ── Kernel: ComputeBounds ─────────────────────────────────────────────────────
+// Single-body dispatch. CPU must zero _BoundsBuf before dispatch.
+// Dispatch: Ceil(_CountA / GROUP_SIZE) groups.
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ComputeBounds(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= _CountA) return;
+
+	float3 p = _PositionsA[id.x].predict;
+
+	int fx = (int)(p.x * FP_SCALE);
+	int fy = (int)(p.y * FP_SCALE);
+	int fz = (int)(p.z * FP_SCALE);
+	int dummy;
+	_BoundsBuf.InterlockedAdd( 0u, fx, dummy);
+	_BoundsBuf.InterlockedAdd( 4u, fy, dummy);
+	_BoundsBuf.InterlockedAdd( 8u, fz, dummy);
+	_BoundsBuf.InterlockedAdd(12u,  1, dummy);
+
+	float d2 = dot(p, p);
+	AtomicMaxF(_BoundsBuf, 16u, d2);
+}
+
 // ── Kernel: ClearSoftSoftDelta ────────────────────────────────────────────────
-// Zeros one body's delta buffer. Dispatch with count = particle count of that body.
-// Call twice (once for A, once for B) by rebinding _DeltaBufA / _CountA.
-// (Manager dispatches ClearSoftSoftDelta twice per pair, swapping which buffer
-//  is bound to _DeltaBufA — simpler than a separate clear-B kernel.)
+// Zero one body's delta buffer. Rebind _DeltaBufA + _CountA, dispatch twice.
 
 [numthreads(GROUP_SIZE, 1, 1)]
 void ClearSoftSoftDelta(uint3 id : SV_DispatchThreadID)
@@ -83,9 +161,8 @@ void ClearSoftSoftDelta(uint3 id : SV_DispatchThreadID)
 }
 
 // ── Kernel: DetectSoftSoft ────────────────────────────────────────────────────
-// 2D dispatch: thread (i, j) tests particle i of A against particle j of B.
-// Dispatch groups: Ceil(CountA / GROUP_SIZE_X), Ceil(CountB / GROUP_SIZE_Y), 1
-// where GROUP_SIZE_X = GROUP_SIZE_Y = 8 → 64 threads per group in 8×8 tile.
+// 2D dispatch: thread (i,j) = particle i of A vs particle j of B.
+// Groups: Ceil(CountA/8) × Ceil(CountB/8).
 
 [numthreads(8, 8, 1)]
 void DetectSoftSoft(uint3 id : SV_DispatchThreadID)
@@ -104,17 +181,16 @@ void DetectSoftSoft(uint3 id : SV_DispatchThreadID)
 
 	float  dist = sqrt(r2);
 	float  pen  = cr - dist;
-	float3 n    = d / dist;   // normal pointing from B toward A
+	float3 n    = d / dist;   // B → A
 
-	float wA  = _ParticlesA[ai].invMass;
-	float wB  = _ParticlesB[bi].invMass;
+	float wA   = _ParticlesA[ai].invMass;
+	float wB   = _ParticlesB[bi].invMass;
 	float wTot = wA + wB;
 	if (wTot < EPSILON) return;
 
 	float3 corrA =  n * pen * (wA / wTot);
 	float3 corrB = -n * pen * (wB / wTot);
 
-	// Accumulate into per-body delta buffers (atomic)
 	uint ba = ai * 12u;
 	AtomicAddFA(_DeltaBufA, ba + 0u, corrA.x);
 	AtomicAddFA(_DeltaBufA, ba + 4u, corrA.y);
@@ -124,21 +200,4 @@ void DetectSoftSoft(uint3 id : SV_DispatchThreadID)
 	AtomicAddFA(_DeltaBufB, bb + 0u, corrB.x);
 	AtomicAddFA(_DeltaBufB, bb + 4u, corrB.y);
 	AtomicAddFA(_DeltaBufB, bb + 8u, corrB.z);
-}
-
-// ── Kernel: ApplySoftSoftDelta ────────────────────────────────────────────────
-// Reads accumulated delta for each particle and adds it to predict.
-// Bind _DeltaBufA + _PositionsA, dispatch Ceil(CountA). Then repeat for B.
-
-[numthreads(GROUP_SIZE, 1, 1)]
-void ApplySoftSoftDelta(uint3 id : SV_DispatchThreadID)
-{
-	if (id.x >= _CountA) return;
-
-	uint   b  = id.x * 12u;
-	float  dx = asfloat(_DeltaBufA.Load(b + 0u));
-	float  dy = asfloat(_DeltaBufA.Load(b + 4u));
-	float  dz = asfloat(_DeltaBufA.Load(b + 8u));
-
-	_PositionsA[id.x].predict += float3(dx, dy, dz);
 }

@@ -53,7 +53,8 @@ namespace XPBD
 		[Header("Compute Shaders")]
 		public ComputeShader SoftBodySimCS;
 		public ComputeShader CollisionShapesCS;
-		public ComputeShader SoftSoftCollisionCS; // SoftSoftCollision.compute
+		public ComputeShader SoftSoftCollisionCS; // SoftSoftCollision.compute  — ComputeBounds, ClearSoftSoftDelta, DetectSoftSoft
+		public ComputeShader SoftSoftApplyCS;     // SoftSoftApply.compute      — ApplySoftSoftDelta
 		public ComputeShader DeformCS;
 
 		// ── Inspector: Simulation ─────────────────────────────────────────────
@@ -65,10 +66,11 @@ namespace XPBD
 
 		// ── Inspector: Soft-Soft Collision ────────────────────────────────────
 		[Header("Soft-Soft Collision")]
-		[Tooltip("Fallback contact-distance threshold used when a body does not " +
-				 "set its own SoftSoftParticleRadius. Roughly equal to the mean " +
-				 "spacing between physics particles.")]
-		public float SoftSoftDefaultRadius = 0.05f;
+		[Tooltip("Multiplier for the auto-computed contact radius (default 1.5). " +
+				 "ColRadius = AutoRadiusMul * sqrt(4π * R² / N) where R is the body's " +
+				 "bounding radius and N is its particle count. Override per-body via " +
+				 "SoftBodyComponent.SoftSoftParticleRadius (set > 0 to bypass auto).")]
+		public float AutoRadiusMul = 1.5f;
 
 		// ── Bodies and rigid colliders ─────────────────────────────────────────
 		readonly List<SoftBodyComponent> _bodies = new();
@@ -99,9 +101,15 @@ namespace XPBD
 
 		// ── Kernel IDs ────────────────────────────────────────────────────────
 		int _kClearImpulse, _kDetectShapes, _kShapesSolve;
-		int _kClearSoftSoftDelta, _kDetectSoftSoft, _kApplySoftSoftDelta;
+		int _kComputeBounds, _kClearSoftSoftDelta, _kDetectSoftSoft, _kApplySoftSoftDelta;
 		int _kPresolve, _kPostsolve, _kStretch, _kVolume;
 		int _kDirectDeform, _kTetDeform, _kRecalcNormals, _kNormalizeNormals;
+
+		// Per-body GPU bounds buffer + CPU readback (4 uints: centroid_fp×3, count, maxDistSq, pad×3)
+		// Allocated once per body in AddBody, freed in RemoveBody.
+		// ComputeBounds writes to this; manager reads it to get live circumsphere.
+		readonly Dictionary<int, ComputeBuffer> _bodyBoundsBuffers = new();
+		readonly int[] _boundsReadback = new int[8]; // scratch, reused every substep
 
 		float _timeAccum, _fixedDT, _subDT;
 
@@ -139,8 +147,8 @@ namespace XPBD
 				return;
 			_timeAccum -= _fixedDT;
 
-			bool hasRigid = _colliders.Count > 0 && CollisionShapesCS;
-			bool hasSoftSoft = _softSoftPairs.Count > 0 && SoftSoftCollisionCS;
+			bool hasRigid    = _colliders.Count > 0 && CollisionShapesCS;
+			bool hasSoftSoft = _softSoftPairs.Count > 0 && SoftSoftCollisionCS && SoftSoftApplyCS;
 
 			if (hasRigid)
 			{
@@ -152,30 +160,23 @@ namespace XPBD
 			if (hasSoftSoft)
 				EnsureSoftSoftPairBuffers();
 
-			// ── Substep loop: OUTER=substep, INNER=bodies ────────────────────
-			// This order is REQUIRED for soft-soft collision correctness.
-			// If the loop were bodies-outer/substeps-inner, body A would complete
-			// all substeps before body B starts. Body A's soft-soft detect would
-			// read B's positions from the PREVIOUS fixed step (stale by one full
-			// frame), and B would read A's already-fully-settled positions.
-			// The corrections would be completely asymmetric and out-of-sync
-			// → bodies pass through each other as if they don't exist.
-			//
-			// With substep-outer: at substep S, ALL bodies integrate (Presolve→
-			// Postsolve) first, THEN ALL bodies run collision. Every body sees
-			// every other body at the same substep position → symmetric ✓
+			// Substep-outer / bodies-inner with two phases:
+			//   Phase 1: ALL bodies integrate (Presolve→Stretch→Volume→Postsolve)
+			//   Phase 2: ALL bodies run collision
+			// Required for soft-soft: both bodies must be at the same substep
+			// position when detect runs. Also preserves the floor fix — for each
+			// body, Postsolve always completes before its collision runs.
 			for (int s = 0; s < SubSteps; s++)
 			{
-				// ── Phase 1: integrate all bodies ──────────────────────────
 				foreach (var body in _bodies)
 				{
 					if (!body) continue;
 					DispatchIntegrate(body.State);
+					// Recompute live circumsphere after Postsolve so it reflects
+					// the current deformed shape. Used by broad-phase in Phase 2.
+					if (hasSoftSoft) DispatchComputeBounds(body);
 				}
 
-				// ── Phase 2: collision for all bodies ──────────────────────
-				// Runs after ALL bodies have integrated so each body sees the
-				// other bodies at the current substep position, not last frame.
 				_softSoftDetectedThisStep.Clear();
 				foreach (var body in _bodies)
 				{
@@ -203,8 +204,61 @@ namespace XPBD
 
 		// ── Public API ────────────────────────────────────────────────────────
 
-		public void AddBody(SoftBodyComponent body) => _bodies.Add(body);
-		public void RemoveBody(SoftBodyComponent body) => _bodies.Remove(body);
+		public void AddBody(SoftBodyComponent body)
+		{
+			_bodies.Add(body);
+			// Rest-pose bounding radius — drives the ColRadius auto-formula only.
+			// Live circumsphere is re-computed each substep via ComputeBounds kernel.
+			ComputeRestBoundingRadius(body);
+			// Allocate per-body GPU bounds buffer (8 × uint = 32 bytes, Raw).
+			// [0..2] centroid fixed-point sum, [3] count, [4] maxDistSq (float CAS), [5..7] pad
+			if (SoftSoftCollisionCS && body.State != null)
+			{
+				var buf = new ComputeBuffer(8, sizeof(uint), ComputeBufferType.Raw);
+				buf.SetData(new uint[8]);
+				_bodyBoundsBuffers[body.GetInstanceID()] = buf;
+			}
+		}
+
+		public void RemoveBody(SoftBodyComponent body)
+		{
+			_bodies.Remove(body);
+			int id = body.GetInstanceID();
+			if (_bodyBoundsBuffers.TryGetValue(id, out var buf))
+			{
+				buf?.Release();
+				_bodyBoundsBuffers.Remove(id);
+			}
+		}
+
+		// One-time GPU readback at spawn to get rest-pose circumsphere radius.
+		// Used only for the ColRadius auto-formula (not live collision detection).
+		void ComputeRestBoundingRadius(SoftBodyComponent body)
+		{
+			var state = body.State;
+			if (state == null || state.ParticleCount == 0) return;
+
+			int floatsPerParticle = 8; // float3 pos + float pad + float3 vel + float invMass = 32 bytes
+			var raw = new float[state.ParticleCount * floatsPerParticle];
+			state.ParticleBuffer.GetData(raw);
+
+			var centroid = Vector3.zero;
+			for (int i = 0; i < state.ParticleCount; i++)
+			{
+				int o = i * floatsPerParticle;
+				centroid += new Vector3(raw[o], raw[o + 1], raw[o + 2]);
+			}
+			centroid /= state.ParticleCount;
+
+			float maxDist = 0f;
+			for (int i = 0; i < state.ParticleCount; i++)
+			{
+				int o = i * floatsPerParticle;
+				maxDist = Mathf.Max(maxDist,
+					Vector3.Distance(new Vector3(raw[o], raw[o + 1], raw[o + 2]), centroid));
+			}
+			body.BoundingRadius = Mathf.Max(maxDist, 0.01f);
+		}
 
 		public void RegisterCollider(XpbdColliderSource src)
 		{
@@ -241,9 +295,9 @@ namespace XPBD
 
 		/// <summary>
 		/// Scan all registered bodies and auto-register / auto-remove soft-soft
-		/// pairs according to their CollisionLayer / CollisionMask bitmasks.
+		/// pairs according to their SoftCollisionLayer / SoftCollisionMask bitmasks.
 		/// Two bodies collide iff each one's mask includes the other's layer.
-		/// CollisionMask = 0 means "no layer-based collision" for that body.
+		/// SoftCollisionMask = 0 means "no layer-based collision" for that body.
 		/// Call this after adding bodies or changing their layer/mask values.
 		/// </summary>
 		public void RebuildLayerPairs()
@@ -461,19 +515,62 @@ namespace XPBD
 			_softSoftPairs.Clear();
 		}
 
+		// ── Live circumsphere (broad phase) ──────────────────────────────────
+
+		// Resets the bounds buffer to zero, then dispatches ComputeBounds which
+		// accumulates centroid (fixed-point) and max-dist-sq for all particles.
+		void DispatchComputeBounds(SoftBodyComponent body)
+		{
+			int id = body.GetInstanceID();
+			if (!_bodyBoundsBuffers.TryGetValue(id, out var buf) || buf == null) return;
+
+			// Zero the accumulator
+			buf.SetData(new uint[8]);
+
+			var cs = SoftSoftCollisionCS;
+			cs.SetInt("_CountA", body.State.ParticleCount);
+			cs.SetBuffer(_kComputeBounds, "_PositionsA", body.State.PositionsBuffer);
+			cs.SetBuffer(_kComputeBounds, "_BoundsBuf",  buf);
+			cs.Dispatch(_kComputeBounds, Ceil(body.State.ParticleCount), 1, 1);
+		}
+
+		// Reads the bounds buffer (GPU→CPU sync) and returns centroid + circumsphere radius.
+		// This is a synchronous readback — cheap because the buffer is only 32 bytes.
+		// Returns false if no bounds buffer exists for this body.
+		bool ReadLiveBounds(SoftBodyComponent body, out Vector3 centroid, out float radius)
+		{
+			centroid = Vector3.zero;
+			radius   = body.BoundingRadius; // fallback to rest-pose
+
+			int id = body.GetInstanceID();
+			if (!_bodyBoundsBuffers.TryGetValue(id, out var buf) || buf == null)
+				return false;
+
+			buf.GetData(_boundsReadback);
+
+			int count = _boundsReadback[3];
+			if (count == 0) return false;
+
+			const float FP_SCALE = 1000f;
+			centroid = new Vector3(
+				_boundsReadback[0] / (FP_SCALE * count),
+				_boundsReadback[1] / (FP_SCALE * count),
+				_boundsReadback[2] / (FP_SCALE * count));
+
+			// _boundsReadback[4] stores asuint(maxDistSq from origin).
+			// The true circumsphere radius from centroid is <= sqrt(maxDistSq) + |centroid|.
+			// We use sqrt(maxDistSq) as a conservative (slightly inflated) bound — safe.
+			float maxDistSqFromOrigin = System.BitConverter.Int32BitsToSingle(_boundsReadback[4]);
+			radius = Mathf.Sqrt(Mathf.Max(maxDistSqFromOrigin, 0f));
+			return true;
+		}
+
 		// ── Soft-Soft collision dispatches ────────────────────────────────────
 
-		// Called once per substep per body, after all bodies have integrated.
-		// _softSoftDetectedThisStep is cleared once per substep in the Update loop.
-		//
-		// For each pair (A,B) involving this body:
-		//   First body to reach it:  Clear → Detect → Apply BOTH A and B
-		//   Second body to reach it: already in HashSet → skip entirely
-		//
-		// This guarantees:
-		//   1. Detect runs exactly once per pair per substep (not twice)
-		//   2. Both corrections come from the same detection snapshot
-		//   3. Corrections are symmetric (same detect pass, same positions)
+		// Called in Phase 2 of each substep, after all bodies have integrated.
+		// _softSoftDetectedThisStep cleared once per substep in Update.
+		// First body to reach pair (A,B): Clear+Detect+Apply-both → mark done.
+		// Second body to reach pair (A,B): already in set → skip entirely.
 		void DispatchSoftSoftPairs(SoftBodyGPUState bodyState)
 		{
 			var cs = SoftSoftCollisionCS;
@@ -489,20 +586,34 @@ namespace XPBD
 				if (a == null || b == null)
 					continue;
 
-				// Only process this pair if the current body is one of the two
 				if (a.State != bodyState && b.State != bodyState)
 					continue;
 
-				// If already processed this substep, skip entirely.
-				// The FIRST body to reach this pair does all the work (both sides).
 				var pairKey = kvp.Key;
 				if (_softSoftDetectedThisStep.Contains(pairKey))
 					continue;
 				_softSoftDetectedThisStep.Add(pairKey);
 
-				float radius = Mathf.Max(
-					a.SoftSoftParticleRadius > 0 ? a.SoftSoftParticleRadius : SoftSoftDefaultRadius,
-					b.SoftSoftParticleRadius > 0 ? b.SoftSoftParticleRadius : SoftSoftDefaultRadius);
+				// ColRadius auto-formula: AutoRadiusMul * sqrt(4π * R² / N)
+				// For unit sphere (R=1, N=313): ~0.30m. Manual override via SoftSoftParticleRadius > 0.
+				float AutoRadius(SoftBodyComponent body) =>
+					AutoRadiusMul * Mathf.Sqrt(4f * Mathf.PI * body.BoundingRadius * body.BoundingRadius
+					                           / Mathf.Max(body.State.ParticleCount, 1));
+				float rA = a.SoftSoftParticleRadius > 0 ? a.SoftSoftParticleRadius : AutoRadius(a);
+				float rB = b.SoftSoftParticleRadius > 0 ? b.SoftSoftParticleRadius : AutoRadius(b);
+				float radius = Mathf.Max(rA, rB);
+
+				// ── Broad phase: live circumsphere overlap ─────────────────────
+				// ReadLiveBounds returns the circumsphere computed by DispatchComputeBounds
+				// this substep — reflects the current deformed shape, not rest pose.
+				// If (centreA-centreB distance) > (radA + radB + colRadius), bodies
+				// can't possibly have any particle pairs within colRadius → skip N×M.
+				if (ReadLiveBounds(a, out var centA, out var radA) &&
+				    ReadLiveBounds(b, out var centB, out var radB))
+				{
+					if (Vector3.Distance(centA, centB) > radA + radB + radius)
+						continue;
+				}
 
 				int nA = a.State.ParticleCount;
 				int nB = b.State.ParticleCount;
@@ -517,35 +628,37 @@ namespace XPBD
 				cs.Dispatch(_kClearSoftSoftDelta, Ceil(nB), 1, 1);
 
 				// ── Detect ────────────────────────────────────────────────────
-				// Reads both bodies' current-substep predict positions.
-				// Both bodies have already integrated this substep (Phase 1).
-				cs.SetInt  ("_CountA",    nA);
-				cs.SetInt  ("_CountB",    nB);
+				cs.SetInt("_CountA", nA);
+				cs.SetInt("_CountB", nB);
 				cs.SetFloat("_ColRadius", radius);
 				cs.SetBuffer(_kDetectSoftSoft, "_ParticlesA", a.State.ParticleBuffer);
 				cs.SetBuffer(_kDetectSoftSoft, "_PositionsA", a.State.PositionsBuffer);
-				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufA",  bufs.DeltaA);
+				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufA", bufs.DeltaA);
 				cs.SetBuffer(_kDetectSoftSoft, "_ParticlesB", b.State.ParticleBuffer);
 				cs.SetBuffer(_kDetectSoftSoft, "_PositionsB", b.State.PositionsBuffer);
-				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufB",  bufs.DeltaB);
+				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufB", bufs.DeltaB);
 				cs.Dispatch(_kDetectSoftSoft, CeilN(nA, 8), CeilN(nB, 8), 1);
 
-				// ── Apply BOTH sides ──────────────────────────────────────────
-				// Both corrections come from the same detect pass → symmetric.
-				cs.SetInt("_CountA", nA);
-				cs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA",  bufs.DeltaA);
-				cs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", a.State.PositionsBuffer);
-				cs.Dispatch(_kApplySoftSoftDelta, Ceil(nA), 1, 1);
+				// ── Apply both sides ──────────────────────────────────────────
+				// Uses SoftSoftApplyCS (separate file from SoftSoftCollisionCS).
+				// Must bind _ParticlesA — ApplySoftSoftDelta writes velocity.
+				var applyCs = SoftSoftApplyCS;
+				applyCs.SetInt("_CountA", nA);
+				applyCs.SetBuffer(_kApplySoftSoftDelta, "_ParticlesA", a.State.ParticleBuffer);
+				applyCs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", a.State.PositionsBuffer);
+				applyCs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA",  bufs.DeltaA);
+				applyCs.Dispatch(_kApplySoftSoftDelta, Ceil(nA), 1, 1);
 
-				cs.SetInt("_CountA", nB);
-				cs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA",  bufs.DeltaB);
-				cs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", b.State.PositionsBuffer);
-				cs.Dispatch(_kApplySoftSoftDelta, Ceil(nB), 1, 1);
+				applyCs.SetInt("_CountA", nB);
+				applyCs.SetBuffer(_kApplySoftSoftDelta, "_ParticlesA", b.State.ParticleBuffer);
+				applyCs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", b.State.PositionsBuffer);
+				applyCs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA",  bufs.DeltaB);
+				applyCs.Dispatch(_kApplySoftSoftDelta, Ceil(nB), 1, 1);
 			}
 		}
 
-		// ── Physics: elastic integration (Presolve + Stretch + Volume + Postsolve) ──
-		// Called once per substep per body, before any collision.
+		// ── Elastic integration (Presolve + Stretch + Volume + Postsolve) ─────
+		// Collision is NOT here — it runs after ALL bodies integrate (see Update).
 		void DispatchIntegrate(SoftBodyGPUState body)
 		{
 			var cs = SoftBodySimCS;
@@ -658,10 +771,15 @@ namespace XPBD
 
 			if (SoftSoftCollisionCS)
 			{
+				_kComputeBounds      = SoftSoftCollisionCS.FindKernel("ComputeBounds");
 				_kClearSoftSoftDelta = SoftSoftCollisionCS.FindKernel("ClearSoftSoftDelta");
-				_kDetectSoftSoft = SoftSoftCollisionCS.FindKernel("DetectSoftSoft");
-				_kApplySoftSoftDelta = SoftSoftCollisionCS.FindKernel("ApplySoftSoftDelta");
+				_kDetectSoftSoft     = SoftSoftCollisionCS.FindKernel("DetectSoftSoft");
 			}
+			// ApplySoftSoftDelta lives in its own file (SoftSoftApply.compute).
+			// See SoftSoftCollision.compute header: split-file rule prevents Unity
+			// from demanding _ParticlesA/B be bound for kernels that don't use them.
+			if (SoftSoftApplyCS)
+				_kApplySoftSoftDelta = SoftSoftApplyCS.FindKernel("ApplySoftSoftDelta");
 
 			_kDirectDeform = DeformCS.FindKernel("DirectDeform");
 			_kTetDeform = DeformCS.FindKernel("TetDeform");

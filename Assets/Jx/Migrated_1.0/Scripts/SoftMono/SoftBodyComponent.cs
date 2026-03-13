@@ -29,6 +29,13 @@ namespace XPBD
 		public int SoftCollisionMask = 0;
 		[Tooltip("0 = use manager's SoftSoftDefaultRadius")]
 		public float SoftSoftParticleRadius = 0f;
+		/// <summary>
+		/// Bounding sphere radius of this body's particle cloud.
+		/// Set automatically by SoftBodySimulationManager.AddBody.
+		/// Used to auto-derive the soft-soft contact radius when
+		/// SoftSoftParticleRadius == 0.
+		/// </summary>
+		public float BoundingRadius { get; internal set; }
 		#endregion
 
 		#region Imp

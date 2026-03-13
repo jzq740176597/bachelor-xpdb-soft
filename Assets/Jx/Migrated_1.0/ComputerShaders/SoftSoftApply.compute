@@ -1,0 +1,78 @@
+// SoftSoftApply.compute
+//
+// Kernel: ApplySoftSoftDelta
+//
+// !! SPLIT-FILE RULE — see SoftSoftCollision.compute header for full explanation !!
+// Short version: this kernel is in its own file because it writes _ParticlesA.velocity
+// (RW), while DetectSoftSoft in the sibling file only reads _ParticlesA.invMass (RO).
+// Combining them forces _ParticlesA to be RW in the Detect kernel too, and — more
+// importantly — Unity would require _ParticlesA/B to be bound for ClearSoftSoftDelta
+// even though Clear never touches them.  That causes:
+//   "Property (_ParticlesA) at kernel index (N) is not set"
+// Splitting files means each dispatch only needs the buffers its kernel actually uses.
+//
+// ── What this kernel does ─────────────────────────────────────────────────────
+// After DetectSoftSoft has accumulated position corrections into _DeltaBufA,
+// this kernel:
+//   1. Reads the accumulated delta for each particle.
+//   2. Adds it to _PositionsA[i].predict  (positional correction).
+//   3. Kills the inward velocity component along the correction normal.
+//      Without this, Presolve next substep does:
+//        predict = position + velocity*dt
+//      and velocity still points into the other body → predict re-penetrates.
+//      The positional correction wins each substep but the body "sinks in".
+//      Zeroing the inward component prevents re-penetration from velocity alone.
+//
+// Dispatch: Ceil(_CountA / GROUP_SIZE) — once for side A, rebind for side B.
+// Manager calls this twice per pair (once per side), rebinding _DeltaBufA,
+// _PositionsA, _ParticlesA, and _CountA to the appropriate body's buffers.
+
+#pragma kernel ApplySoftSoftDelta
+
+#pragma target 5.0
+
+#define EPSILON    1e-6
+#define GROUP_SIZE 64
+
+struct Particle     { float3 position; float _p0; float3 velocity; float invMass; };
+struct PbdPositions { float3 predict;  float _p0; float3 delta;    float _p1;    };
+
+// ── Uniforms ──────────────────────────────────────────────────────────────────
+
+uint _CountA;
+
+// ── Buffers — only what ApplySoftSoftDelta actually uses ─────────────────────
+
+RWStructuredBuffer<Particle>     _ParticlesA;   // RW: read velocity, write velocity
+RWStructuredBuffer<PbdPositions> _PositionsA;   // RW: write predict
+RWByteAddressBuffer              _DeltaBufA;    // RO (load only): read accumulated delta
+
+// ── Kernel: ApplySoftSoftDelta ────────────────────────────────────────────────
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ApplySoftSoftDelta(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= _CountA) return;
+
+	uint   b  = id.x * 12u;
+	float  dx = asfloat(_DeltaBufA.Load(b + 0u));
+	float  dy = asfloat(_DeltaBufA.Load(b + 4u));
+	float  dz = asfloat(_DeltaBufA.Load(b + 8u));
+
+	float3 delta = float3(dx, dy, dz);
+
+	// Positional correction
+	_PositionsA[id.x].predict += delta;
+
+	// Velocity damping: zero the inward component along the correction normal.
+	// delta points away from penetration. If velocity has a component opposing
+	// delta (i.e. still pointing into the other body), remove it.
+	float dLen = length(delta);
+	if (dLen > EPSILON)
+	{
+		float3 n    = delta / dLen;
+		float  vDot = dot(_ParticlesA[id.x].velocity, n);
+		if (vDot < 0.0)
+			_ParticlesA[id.x].velocity -= n * vDot;
+	}
+}
