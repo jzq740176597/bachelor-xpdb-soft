@@ -78,6 +78,9 @@ namespace XPBD
 		// Canonical key: (lower instanceID, higher instanceID) so (A,B)==(B,A).
 		// Value is null until first EnsureSoftSoftPairBuffers allocates it.
 		readonly Dictionary<(int, int), SoftSoftPairBuffers> _softSoftPairs = new();
+		// Tracks which pairs have already run Clear+Detect this substep.
+		// First body to reach a pair does Clear+Detect+Apply-both; second skips.
+		readonly HashSet<(int, int)> _softSoftDetectedThisStep = new();
 
 		// ── Rigid-collision GPU buffers ───────────────────────────────────────
 		ComputeBuffer _shapesBuffer;
@@ -149,12 +152,48 @@ namespace XPBD
 			if (hasSoftSoft)
 				EnsureSoftSoftPairBuffers();
 
+			// ── Substep loop: OUTER=substep, INNER=bodies ────────────────────
+			// This order is REQUIRED for soft-soft collision correctness.
+			// If the loop were bodies-outer/substeps-inner, body A would complete
+			// all substeps before body B starts. Body A's soft-soft detect would
+			// read B's positions from the PREVIOUS fixed step (stale by one full
+			// frame), and B would read A's already-fully-settled positions.
+			// The corrections would be completely asymmetric and out-of-sync
+			// → bodies pass through each other as if they don't exist.
+			//
+			// With substep-outer: at substep S, ALL bodies integrate (Presolve→
+			// Postsolve) first, THEN ALL bodies run collision. Every body sees
+			// every other body at the same substep position → symmetric ✓
+			for (int s = 0; s < SubSteps; s++)
+			{
+				// ── Phase 1: integrate all bodies ──────────────────────────
+				foreach (var body in _bodies)
+				{
+					if (!body) continue;
+					DispatchIntegrate(body.State);
+				}
+
+				// ── Phase 2: collision for all bodies ──────────────────────
+				// Runs after ALL bodies have integrated so each body sees the
+				// other bodies at the current substep position, not last frame.
+				_softSoftDetectedThisStep.Clear();
+				foreach (var body in _bodies)
+				{
+					if (!body) continue;
+					if (hasRigid)
+					{
+						ResetColSize(body.State);
+						DispatchDetectShapes(body.State);
+						DispatchShapesSolve(body.State);
+					}
+					if (hasSoftSoft)
+						DispatchSoftSoftPairs(body.State);
+				}
+			}
+
 			foreach (var body in _bodies)
 			{
-				if (!body)
-					continue;
-				for (int s = 0; s < SubSteps; s++)
-					DispatchSubstep(body.State, hasRigid, hasSoftSoft);
+				if (!body) continue;
 				DispatchDeform(body);
 			}
 
@@ -424,10 +463,17 @@ namespace XPBD
 
 		// ── Soft-Soft collision dispatches ────────────────────────────────────
 
-		// Called inside DispatchSubstep for the current body.
-		// Iterates all registered pairs that involve this body and runs
-		//   Clear → Detect → Apply
-		// for that pair's side.
+		// Called once per substep per body, after all bodies have integrated.
+		// _softSoftDetectedThisStep is cleared once per substep in the Update loop.
+		//
+		// For each pair (A,B) involving this body:
+		//   First body to reach it:  Clear → Detect → Apply BOTH A and B
+		//   Second body to reach it: already in HashSet → skip entirely
+		//
+		// This guarantees:
+		//   1. Detect runs exactly once per pair per substep (not twice)
+		//   2. Both corrections come from the same detection snapshot
+		//   3. Corrections are symmetric (same detect pass, same positions)
 		void DispatchSoftSoftPairs(SoftBodyGPUState bodyState)
 		{
 			var cs = SoftSoftCollisionCS;
@@ -443,13 +489,17 @@ namespace XPBD
 				if (a == null || b == null)
 					continue;
 
-				bool isA = a.State == bodyState;
-				bool isB = b.State == bodyState;
-				if (!isA && !isB)
+				// Only process this pair if the current body is one of the two
+				if (a.State != bodyState && b.State != bodyState)
 					continue;
 
-				// Contact radius = max of the two bodies' per-particle radii
-				// (or the global default if a body leaves theirs at 0).
+				// If already processed this substep, skip entirely.
+				// The FIRST body to reach this pair does all the work (both sides).
+				var pairKey = kvp.Key;
+				if (_softSoftDetectedThisStep.Contains(pairKey))
+					continue;
+				_softSoftDetectedThisStep.Add(pairKey);
+
 				float radius = Mathf.Max(
 					a.SoftSoftParticleRadius > 0 ? a.SoftSoftParticleRadius : SoftSoftDefaultRadius,
 					b.SoftSoftParticleRadius > 0 ? b.SoftSoftParticleRadius : SoftSoftDefaultRadius);
@@ -457,9 +507,7 @@ namespace XPBD
 				int nA = a.State.ParticleCount;
 				int nB = b.State.ParticleCount;
 
-				// ── Clear delta buffers ────────────────────────────────────────
-				// ClearSoftSoftDelta zeros _DeltaBufA for _CountA particles.
-				// Call twice, rebinding to clear both sides.
+				// ── Clear ─────────────────────────────────────────────────────
 				cs.SetInt("_CountA", nA);
 				cs.SetBuffer(_kClearSoftSoftDelta, "_DeltaBufA", bufs.DeltaA);
 				cs.Dispatch(_kClearSoftSoftDelta, Ceil(nA), 1, 1);
@@ -469,40 +517,36 @@ namespace XPBD
 				cs.Dispatch(_kClearSoftSoftDelta, Ceil(nB), 1, 1);
 
 				// ── Detect ────────────────────────────────────────────────────
-				// 2D dispatch: X covers CountA (group=8), Y covers CountB (group=8).
-				cs.SetInt("_CountA", nA);
-				cs.SetInt("_CountB", nB);
+				// Reads both bodies' current-substep predict positions.
+				// Both bodies have already integrated this substep (Phase 1).
+				cs.SetInt  ("_CountA",    nA);
+				cs.SetInt  ("_CountB",    nB);
 				cs.SetFloat("_ColRadius", radius);
 				cs.SetBuffer(_kDetectSoftSoft, "_ParticlesA", a.State.ParticleBuffer);
 				cs.SetBuffer(_kDetectSoftSoft, "_PositionsA", a.State.PositionsBuffer);
-				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufA", bufs.DeltaA);
+				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufA",  bufs.DeltaA);
 				cs.SetBuffer(_kDetectSoftSoft, "_ParticlesB", b.State.ParticleBuffer);
 				cs.SetBuffer(_kDetectSoftSoft, "_PositionsB", b.State.PositionsBuffer);
-				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufB", bufs.DeltaB);
+				cs.SetBuffer(_kDetectSoftSoft, "_DeltaBufB",  bufs.DeltaB);
 				cs.Dispatch(_kDetectSoftSoft, CeilN(nA, 8), CeilN(nB, 8), 1);
 
-				// ── Apply ─────────────────────────────────────────────────────
-				// ApplySoftSoftDelta reuses _DeltaBufA + _PositionsA + _CountA.
-				if (isA)
-				{
-					cs.SetInt("_CountA", nA);
-					cs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA", bufs.DeltaA);
-					cs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", a.State.PositionsBuffer);
-					cs.Dispatch(_kApplySoftSoftDelta, Ceil(nA), 1, 1);
-				}
-				if (isB)
-				{
-					cs.SetInt("_CountA", nB);
-					cs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA", bufs.DeltaB);
-					cs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", b.State.PositionsBuffer);
-					cs.Dispatch(_kApplySoftSoftDelta, Ceil(nB), 1, 1);
-				}
+				// ── Apply BOTH sides ──────────────────────────────────────────
+				// Both corrections come from the same detect pass → symmetric.
+				cs.SetInt("_CountA", nA);
+				cs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA",  bufs.DeltaA);
+				cs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", a.State.PositionsBuffer);
+				cs.Dispatch(_kApplySoftSoftDelta, Ceil(nA), 1, 1);
+
+				cs.SetInt("_CountA", nB);
+				cs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA",  bufs.DeltaB);
+				cs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", b.State.PositionsBuffer);
+				cs.Dispatch(_kApplySoftSoftDelta, Ceil(nB), 1, 1);
 			}
 		}
 
-		// ── Physics substep ───────────────────────────────────────────────────
-
-		void DispatchSubstep(SoftBodyGPUState body, bool hasRigid, bool hasSoftSoft)
+		// ── Physics: elastic integration (Presolve + Stretch + Volume + Postsolve) ──
+		// Called once per substep per body, before any collision.
+		void DispatchIntegrate(SoftBodyGPUState body)
 		{
 			var cs = SoftBodySimCS;
 			cs.SetFloat("_DeltaTime", _subDT);
@@ -512,13 +556,9 @@ namespace XPBD
 			cs.SetInt("_EdgeCount", body.EdgeCount);
 			cs.SetInt("_TetCount", body.TetCount);
 
-			// ── 1. Integrate ──────────────────────────────────────────────────
 			BindSimBuffers(cs, _kPresolve, body);
 			cs.Dispatch(_kPresolve, Ceil(body.ParticleCount), 1, 1);
 
-			// ── 2. Elastic constraints ────────────────────────────────────────
-			// Stretch and volume write corrections into the delta buffer.
-			// Postsolve then applies: predict += delta * damping.
 			BindSimBuffers(cs, _kStretch, body);
 			cs.Dispatch(_kStretch, Ceil(body.EdgeCount), 1, 1);
 
@@ -527,27 +567,6 @@ namespace XPBD
 
 			BindSimBuffers(cs, _kPostsolve, body);
 			cs.Dispatch(_kPostsolve, Ceil(body.ParticleCount), 1, 1);
-
-			// ── 3. Collision constraints (AFTER elastic, AFTER postsolve) ────
-			// CRITICAL ORDER: collision must run last so that elastic constraints
-			// (stretch/volume) cannot pull particles back through a surface.
-			// Root cause of the zero-thickness floor pass-through:
-			//   Old order → SolveCollisions corrected predict to floor surface,
-			//   then Stretch/Volume accumulated delta that pulled the particle DOWN,
-			//   then Postsolve applied delta → particle ended up below floor.
-			//   Next substep: position = below floor, CCD outside-check failed → no contact.
-			// New order → elastic deltas are baked into predict by Postsolve first,
-			//   then collision clamps the final predict. Nothing runs after to undo it.
-			if (hasRigid)
-			{
-				ResetColSize(body);
-				DispatchDetectShapes(body);
-				DispatchShapesSolve(body);
-			}
-
-			// Soft-soft collision also runs after elastic constraints for the same reason.
-			if (hasSoftSoft)
-				DispatchSoftSoftPairs(body);
 		}
 
 		void BindSimBuffers(ComputeShader cs, int kernel, SoftBodyGPUState body)

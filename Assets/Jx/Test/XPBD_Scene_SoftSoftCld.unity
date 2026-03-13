@@ -211,7 +211,7 @@ PrefabInstance:
     m_Modifications:
     - target: {fileID: 575781222504388722, guid: c76862b92945d124bb8b4c8065e230e4, type: 3}
       propertyPath: m_LocalPosition.x
-      value: 0
+      value: 1.5
       objectReference: {fileID: 0}
     - target: {fileID: 575781222504388722, guid: c76862b92945d124bb8b4c8065e230e4, type: 3}
       propertyPath: m_LocalPosition.y
@@ -251,6 +251,10 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 3537703485345858134, guid: c76862b92945d124bb8b4c8065e230e4, type: 3}
       propertyPath: CollisionMask
+      value: 1
+      objectReference: {fileID: 0}
+    - target: {fileID: 3537703485345858134, guid: c76862b92945d124bb8b4c8065e230e4, type: 3}
+      propertyPath: SoftCollisionMask
       value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 7423521658402546732, guid: c76862b92945d124bb8b4c8065e230e4, type: 3}
@@ -604,6 +608,10 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 3537703485345858134, guid: c76862b92945d124bb8b4c8065e230e4, type: 3}
       propertyPath: CollisionMask
+      value: 1
+      objectReference: {fileID: 0}
+    - target: {fileID: 3537703485345858134, guid: c76862b92945d124bb8b4c8065e230e4, type: 3}
+      propertyPath: SoftCollisionMask
       value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 7423521658402546732, guid: c76862b92945d124bb8b4c8065e230e4, type: 3}
