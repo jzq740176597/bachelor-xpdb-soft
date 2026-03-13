@@ -1,6 +1,3 @@
-#if UNITY_EDITOR
-using UnityEditor;
-#endif
 // TetrahedralMeshAsset.cs
 // ScriptableObject that holds all per-body tetrahedral mesh 
 // Replaces the ResourceManager + TetrahedralMeshData loading pipeline.
@@ -48,6 +45,15 @@ namespace XPBD
 		public uint TetIndex;
 	}
 
+	// ─── Particle group ─────────────────────────────────────────────────────
+	[System.Serializable]
+	public sealed class ParticleGroup
+	{
+		public string Name = "Group";
+		/// <summary>Indices into TetrahedralMeshAsset.Particles[].</summary>
+		public int[] ParticleIndices = System.Array.Empty<int>();
+	}
+
 	// ─── ScriptableObject asset ───────────────────────────────────────────────
 	//[CreateAssetMenu(menuName = "XPBD/TetrahedralMeshAsset", fileName = "NewTetMesh")]
 	public sealed class TetrahedralMeshAsset : ScriptableObject
@@ -69,6 +75,10 @@ namespace XPBD
 
 		// [3/6/2026 jzq]
 		public Mesh RenderMesh; ///reference to the high-res render mesh
+
+		[Header("Particle Groups")]
+		[Tooltip("Named sets of particle indices. Created via the TetMeshAssetEditor paint tool.")]
+		public ParticleGroup[] Groups = System.Array.Empty<ParticleGroup>();
 		#endregion
 
 		#region Pub
@@ -110,16 +120,4 @@ namespace XPBD
 		}
 #endif
 	}
-#if UNITY_EDITOR
-	[CustomEditor(typeof(TetrahedralMeshAsset))]
-	class TetrahedralMeshAssetEditor : UnityEditor.Editor
-	{
-		public override void OnInspectorGUI()
-		{
-			EditorGUI.BeginDisabledGroup(true);
-			base.OnInspectorGUI();
-			EditorGUI.EndDisabledGroup();
-		}
-	}
-#endif
 }
