@@ -35,7 +35,10 @@ namespace XPBD
 		/// Used to auto-derive the soft-soft contact radius when
 		/// SoftSoftParticleRadius == 0.
 		/// </summary>
-		public float BoundingRadius { get; internal set; }
+		public float BoundingRadius
+		{
+			get; internal set;
+		}
 		#endregion
 
 		#region Imp
@@ -64,6 +67,7 @@ namespace XPBD
 		#endregion
 
 		#region Pub
+		public TetrahedralMeshAsset TetMeshAsset => tetMeshAsset;
 		public SoftBodyGPUState State => _state;
 		public void Init(TetrahedralMeshAsset tetMeshAsset)
 		{

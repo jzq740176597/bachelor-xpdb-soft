@@ -36,29 +36,40 @@ namespace XPBD
 		bool _editing;
 
 		// Selection
-		enum SelectMode { Paint, Rectangle }
+		enum SelectMode
+		{
+			Paint, Rectangle
+		}
 		SelectMode _selectMode = SelectMode.Paint;
-		float      _brushSize  = 0.15f;   // world-space radius
-		enum CullingMode { None, Back, Depth }
+		float _brushSize = 0.15f;   // world-space radius
+		enum CullingMode
+		{
+			None, Back, Depth
+		}
 		CullingMode _cullingMode = CullingMode.Back;
 
 		readonly HashSet<int> _selected = new();
 
 		// Rectangle-drag state
-		bool    _rectDragging;
+		bool _rectDragging;
 		Vector2 _rectStart;
+		SelectOp _rectOp = SelectOp.New;   // op captured at drag-start
+		SelectOp _paintStrokeOp = SelectOp.New;  // op captured at stroke-start (MouseDown)
 
 		// Render modes (bitmask flags)
-		bool _showParticles  = true;
-		bool _showMesh       = true;
-		bool _showEdges      = false;
-		bool _showTets       = false;
+		bool _showParticles = true;
+		bool _showMesh = true;
+		bool _showEdges = false;
+		bool _showTets = false;
 
 		// Property panel
-		enum EditProperty { InvMass }
-		EditProperty _editProp   = EditProperty.InvMass;
-		float        _propValue  = 0f;
-		bool         _propMixed  = false;
+		enum EditProperty
+		{
+			InvMass
+		}
+		EditProperty _editProp = EditProperty.InvMass;
+		float _propValue = 0f;
+		bool _propMixed = false;
 
 		// Property-based selection
 		float _selMinMass = 0f, _selMaxMass = 0f;
@@ -69,26 +80,26 @@ namespace XPBD
 		// ── Dirty / save state ────────────────────────────────────────────────
 		// _dirty: true when any edit has happened since entering Edit mode.
 		// _snapshot: deep copy of asset data captured at Edit-enter used for Discard.
-		bool          _dirty;
+		bool _dirty;
 		ParticleData[] _snapshotParticles;
 		ParticleGroup[] _snapshotGroups;
 
 		// Particle display
 		float _particleSizeScale = 1.0f;    // multiplier on the auto-computed handle size
-		bool  _showInnerParticles = true;    // draw occluded/inner particles in dim colour
+		bool _showInnerParticles = true;    // draw occluded/inner particles in dim colour
 
 		// Colours
-		static readonly Color ColParticle    = new Color(1f, 0.55f, 0.05f, 0.9f);
-		static readonly Color ColInner       = new Color(1f, 0.55f, 0.05f, 0.25f); // dim: inner/occluded
-		static readonly Color ColSelected    = new Color(0.15f, 0.8f, 1f,  1.0f);
-		static readonly Color ColEdge        = new Color(0.5f, 0.5f, 0.5f, 0.4f);
-		static readonly Color ColTet         = new Color(0.3f, 1.0f, 0.3f, 0.15f);
-		static readonly Color ColBrush       = new Color(1f, 1f, 1f, 0.25f);
+		static readonly Color ColParticle = new Color(1f, 0.55f, 0.05f, 0.9f);
+		static readonly Color ColInner = new Color(1f, 0.55f, 0.05f, 0.25f); // dim: inner/occluded
+		static readonly Color ColSelected = new Color(0.15f, 0.8f, 1f, 1.0f);
+		static readonly Color ColEdge = new Color(0.5f, 0.5f, 0.5f, 0.4f);
+		static readonly Color ColTet = new Color(0.3f, 1.0f, 0.3f, 0.15f);
+		static readonly Color ColBrush = new Color(1f, 1f, 1f, 0.25f);
 
 		// ── Inspector GUI ─────────────────────────────────────────────────────
 		public override void OnInspectorGUI()
 		{
-			var asset = (TetrahedralMeshAsset)target;
+			var asset = (TetrahedralMeshAsset) target;
 
 			// Header stat bar
 			EditorGUILayout.LabelField(
@@ -116,45 +127,52 @@ namespace XPBD
 				return;
 			}
 
-			// While editing: show Discard / Save As / Save & Exit row
+			// While editing: Save As | Done (2 buttons)
+			// Done behaviour:
+			//   clean (no changes) → exit immediately, no dialog
+			//   dirty (changes)    → 3-option dialog: Save / Discard / Cancel
 			EditorGUILayout.Space(4);
 			using (new EditorGUILayout.HorizontalScope())
 			{
-				// Discard — always confirms to protect against accidental clicks
-				var discardStyle = new GUIStyle(GUI.skin.button);
-				if (_dirty)
-				{
-					discardStyle.normal.textColor = new Color(1f, 0.35f, 0.35f);
-					discardStyle.hover.textColor  = new Color(1f, 0.35f, 0.35f);
-				}
-				if (GUILayout.Button("Discard", discardStyle, GUILayout.Height(22)))
-				{
-					string discardMsg = _dirty
-						? "All edits since you clicked Edit will be lost."
-						: "Exit edit mode? (No changes to discard.)";
-					if (EditorUtility.DisplayDialog("Discard?", discardMsg, "Discard", "Cancel"))
-					{
-						DoDiscard(asset);
-						SetEditing(false);
-					}
-				}
-
-				// Save As — always available; pops a save-file dialog
-				if (GUILayout.Button("Save As…", GUILayout.Height(22)))
+				// Save As — always available; pops a save-file dialog for a copy
+				if (GUILayout.Button("Save As…", GUILayout.Height(24)))
 					DoSaveAs(asset);
 
-				// Save & Exit — always confirms to prevent accidental overwrite
-				var saveStyle = new GUIStyle(GUI.skin.button);
-				if (_dirty) saveStyle.fontStyle = FontStyle.Bold;
-				if (GUILayout.Button(_dirty ? "Save & Exit *" : "Save & Exit", saveStyle, GUILayout.Height(22)))
+				// Done — smart exit
+				var doneStyle = new GUIStyle(GUI.skin.button);
+				if (_dirty)
+					doneStyle.fontStyle = FontStyle.Bold;
+				string doneLabel = _dirty ? "Done  *" : "Done";
+				if (GUILayout.Button(doneLabel, doneStyle, GUILayout.Height(24)))
 				{
-					string saveMsg = _dirty
-						? "Save all edits to the original asset and exit?"
-						: "No changes to save. Exit edit mode?";
-					if (EditorUtility.DisplayDialog("Save & Exit?", saveMsg, "Save & Exit", "Cancel"))
+					if (!_dirty)
 					{
-						DoSave(asset);
+						// No changes → silent exit
 						SetEditing(false);
+					}
+					else
+					{
+						// Changes exist → ask what to do (3 options via two dialogs:
+						// Unity's DisplayDialog only supports 2 buttons natively;
+						// we use the 3-button overload available since Unity 2019.1)
+						int choice = EditorUtility.DisplayDialogComplex(
+							"Exit edit mode",
+							"You have unsaved changes.",
+							"Save",      // 0
+							"Cancel",    // 1  (middle = cancel is Unity convention)
+							"Discard"    // 2
+						);
+						if (choice == 0)
+						{
+							DoSave(asset);
+							SetEditing(false);
+						}
+						else if (choice == 2)
+						{
+							DoDiscard(asset);
+							SetEditing(false);
+						}
+						// choice == 1 → Cancel: do nothing, stay in edit mode
 					}
 				}
 			}
@@ -170,19 +188,20 @@ namespace XPBD
 			// Visible set = the particles currently shown (respects culling + _showInnerParticles).
 			// All selection ops (count, All/None/Invert) operate on this set only.
 			var visibleSet = GetVisibleSet(asset);
-			int visCount   = visibleSet.Count;
-			int selCount   = _selected.Count(i => visibleSet.Contains(i));
+			int visCount = visibleSet.Count;
+			int selCount = _selected.Count(i => visibleSet.Contains(i));
 
 			string selInfo = selCount == 0
-				? "No particles selected. Click and drag over particles to select them."
-				: $"{selCount} / {visCount} visible selected  ({totCount} total in asset)";
+				? "Click/drag: new sel.  Shift+click/drag: append.  Ctrl+click/drag: subtract."
+				: $"{selCount} / {visCount} visible selected  ({totCount} total)"
+				  + "Shift=append  Ctrl=subtract  (paint & rect modes)";
 			EditorGUILayout.HelpBox(selInfo, MessageType.None);
 
 			// Mode toolbar
 			using (new EditorGUILayout.HorizontalScope())
 			{
 				GUILayout.Label("Mode", GUILayout.Width(42));
-				_selectMode = (SelectMode)GUILayout.Toolbar((int)_selectMode,
+				_selectMode = (SelectMode) GUILayout.Toolbar((int) _selectMode,
 					new[] { "Paint", "Rectangle" }, GUILayout.Height(22));
 			}
 
@@ -191,7 +210,7 @@ namespace XPBD
 			using (new EditorGUILayout.HorizontalScope())
 			{
 				GUILayout.Label("Culling", GUILayout.Width(52));
-				_cullingMode = (CullingMode)GUILayout.Toolbar((int)_cullingMode,
+				_cullingMode = (CullingMode) GUILayout.Toolbar((int) _cullingMode,
 					new[] { "None", "Back", "Depth" }, GUILayout.Height(20));
 			}
 			if (_cullingMode == CullingMode.Depth)
@@ -203,12 +222,19 @@ namespace XPBD
 			using (new EditorGUILayout.HorizontalScope())
 			{
 				if (GUILayout.Button("All"))
-					foreach (int i in visibleSet) _selected.Add(i);
+					foreach (int i in visibleSet)
+						_selected.Add(i);
 				if (GUILayout.Button("None"))
-					foreach (int i in visibleSet) _selected.Remove(i);
+					foreach (int i in visibleSet)
+						_selected.Remove(i);
 				if (GUILayout.Button("Invert"))
 					foreach (int i in visibleSet)
-					{ if (_selected.Contains(i)) _selected.Remove(i); else _selected.Add(i); }
+					{
+						if (_selected.Contains(i))
+							_selected.Remove(i);
+						else
+							_selected.Add(i);
+					}
 			}
 
 			EditorGUILayout.Space(4);
@@ -228,8 +254,10 @@ namespace XPBD
 				foreach (int i in vis)
 				{
 					float m = asset.Particles[i].InvMass < 1e-6f ? 0f : 1f / asset.Particles[i].InvMass;
-					if (m >= _selMinMass && m <= _selMaxMass) _selected.Add(i);
-					else _selected.Remove(i);
+					if (m >= _selMinMass && m <= _selMaxMass)
+						_selected.Add(i);
+					else
+						_selected.Remove(i);
 				}
 			}
 
@@ -241,10 +269,10 @@ namespace XPBD
 			{
 				EditorGUILayout.LabelField(
 					selCount == 0 ? "Select particles to edit their properties."
-					              : $"Editing {selCount} particle(s). Property: {_editProp}",
+								  : $"Editing {selCount} particle(s). Property: {_editProp}",
 					EditorStyles.miniLabel);
 
-				_editProp = (EditProperty)EditorGUILayout.EnumPopup("Property", _editProp);
+				_editProp = (EditProperty) EditorGUILayout.EnumPopup("Property", _editProp);
 
 				RefreshPropertyValue(asset);
 
@@ -275,14 +303,14 @@ namespace XPBD
 			DrawSectionHeader("Render modes");
 			using (new EditorGUILayout.HorizontalScope())
 			{
-				_showParticles = GUILayout.Toggle(_showParticles, "Particles",  GUI.skin.button, GUILayout.Height(20));
-				_showMesh      = GUILayout.Toggle(_showMesh,      "Mesh",       GUI.skin.button, GUILayout.Height(20));
-				_showEdges     = GUILayout.Toggle(_showEdges,     "Edges",      GUI.skin.button, GUILayout.Height(20));
-				_showTets      = GUILayout.Toggle(_showTets,      "Tets",       GUI.skin.button, GUILayout.Height(20));
+				_showParticles = GUILayout.Toggle(_showParticles, "Particles", GUI.skin.button, GUILayout.Height(20));
+				_showMesh = GUILayout.Toggle(_showMesh, "Mesh", GUI.skin.button, GUILayout.Height(20));
+				_showEdges = GUILayout.Toggle(_showEdges, "Edges", GUI.skin.button, GUILayout.Height(20));
+				_showTets = GUILayout.Toggle(_showTets, "Tets", GUI.skin.button, GUILayout.Height(20));
 			}
 			if (_showParticles)
 			{
-				_particleSizeScale  = EditorGUILayout.Slider("Particle size",       _particleSizeScale,  0.1f, 5f);
+				_particleSizeScale = EditorGUILayout.Slider("Particle size", _particleSizeScale, 0.1f, 5f);
 				_showInnerParticles = EditorGUILayout.Toggle("Show inner particles", _showInnerParticles);
 				if (_showInnerParticles)
 					EditorGUILayout.HelpBox(
@@ -304,7 +332,8 @@ namespace XPBD
 		// ── Groups panel ──────────────────────────────────────────────────────
 		void DrawGroupsPanel(TetrahedralMeshAsset asset)
 		{
-			if (asset.Groups == null) asset.Groups = System.Array.Empty<ParticleGroup>();
+			if (asset.Groups == null)
+				asset.Groups = System.Array.Empty<ParticleGroup>();
 
 			EditorGUILayout.LabelField("Groups", EditorStyles.boldLabel);
 
@@ -345,7 +374,8 @@ namespace XPBD
 					{
 						_selected.Clear();
 						if (grp.ParticleIndices != null)
-							foreach (int i in grp.ParticleIndices) _selected.Add(i);
+							foreach (int i in grp.ParticleIndices)
+								_selected.Add(i);
 					}
 					// Set → overwrite group's particles with current selection
 					if (GUILayout.Button("Set"))
@@ -370,7 +400,7 @@ namespace XPBD
 					MarkDirty(asset);
 				}
 				if (GUILayout.Button("−", GUILayout.Width(28), GUILayout.Height(20))
-				    && asset.Groups.Length > 0)
+					&& asset.Groups.Length > 0)
 				{
 					Undo.RecordObject(asset, "Remove Particle Group");
 					var list = asset.Groups.ToList();
@@ -381,12 +411,49 @@ namespace XPBD
 			}
 		}
 
+		// ── Selection operation from modifier keys ──────────────────────────────
+		// LMB         → New      (replace)
+		// Shift+LMB   → Append   (add)
+		// Ctrl+LMB    → Subtract (remove)
+		// Ctrl is checked before Shift so Ctrl+Shift = Subtract.
+		enum SelectOp
+		{
+			New, Append, Subtract
+		}
+		static SelectOp GetSelectOp(Event e) =>
+			e.control ? SelectOp.Subtract :
+			e.shift ? SelectOp.Append :
+						SelectOp.New;
+
+		// Apply op to a set of candidate indices.
+		void ApplySelectOp(IEnumerable<int> candidates, SelectOp op)
+		{
+			switch (op)
+			{
+				case SelectOp.New:
+					_selected.Clear();
+					foreach (int i in candidates)
+						_selected.Add(i);
+					break;
+				case SelectOp.Append:
+					foreach (int i in candidates)
+						_selected.Add(i);
+					break;
+				case SelectOp.Subtract:
+					foreach (int i in candidates)
+						_selected.Remove(i);
+					break;
+			}
+		}
+
 		// ── Scene View drawing & input ────────────────────────────────────────
 		void OnSceneGUI(SceneView sv)
 		{
-			if (!_editing) return;
-			var asset = (TetrahedralMeshAsset)target;
-			if (asset?.Particles == null || asset.Particles.Length == 0) return;
+			if (!_editing)
+				return;
+			var asset = (TetrahedralMeshAsset) target;
+			if (asset?.Particles == null || asset.Particles.Length == 0)
+				return;
 
 			Event e = Event.current;
 
@@ -396,7 +463,7 @@ namespace XPBD
 			if (!altHeld)
 				HandleUtility.AddDefaultControl(GUIUtility.GetControlID(FocusType.Passive));
 
-			bool  repaint = false;
+			bool repaint = false;
 
 			// ── Draw geometry ─────────────────────────────────────────────
 			if (_showMesh && asset.RenderMesh != null)
@@ -418,8 +485,8 @@ namespace XPBD
 			{
 				if (!altHeld && (e.type == EventType.MouseMove || e.type == EventType.MouseDrag))
 				{
-					_lastBrushCenter  = EstimateBrushCenter(asset,
-					    HandleUtility.GUIPointToWorldRay(e.mousePosition));
+					_lastBrushCenter = EstimateBrushCenter(asset,
+						HandleUtility.GUIPointToWorldRay(e.mousePosition));
 					_brushCenterValid = true;
 					repaint = true;
 				}
@@ -455,13 +522,17 @@ namespace XPBD
 				{
 					if (_selectMode == SelectMode.Paint)
 					{
-						PaintAtMouse(asset, e, sv, replace: !e.shift);
+						// MouseDown starts a new paint stroke.
+						// SelectOp is sampled once at stroke-start and stored for the drag.
+						_paintStrokeOp = GetSelectOp(e);
+						PaintAtMouse(asset, e, sv, _paintStrokeOp);
 						e.Use();
 					}
 					else // Rectangle
 					{
 						_rectDragging = true;
-						_rectStart    = e.mousePosition;
+						_rectStart = e.mousePosition;
+						_rectOp = GetSelectOp(e);   // capture op at drag-start
 						e.Use();
 					}
 					repaint = true;
@@ -470,7 +541,8 @@ namespace XPBD
 				{
 					if (_selectMode == SelectMode.Paint)
 					{
-						PaintAtMouse(asset, e, sv, replace: false);
+						// Drag continues same stroke → always Append (never replace again)
+						PaintAtMouse(asset, e, sv, SelectOp.Append);
 						e.Use();
 					}
 					repaint = true;
@@ -479,7 +551,7 @@ namespace XPBD
 				{
 					if (_selectMode == SelectMode.Rectangle && _rectDragging)
 					{
-						RectSelect(asset, e, sv, replace: !e.shift);
+						RectSelect(asset, e, sv, _rectOp);
 						_rectDragging = false;
 						e.Use();
 					}
@@ -488,7 +560,7 @@ namespace XPBD
 			}
 			else if (_rectDragging)
 			{
-				// Alt pressed mid-rect-drag: cancel the rect selection cleanly
+				// Alt pressed mid-rect-drag: cancel cleanly
 				_rectDragging = false;
 				repaint = true;
 			}
@@ -507,22 +579,28 @@ namespace XPBD
 
 		// ── Per-frame caches ─────────────────────────────────────────────────────
 		bool[] _occlusionCache;
-		int    _occlusionFrame = -1;   // Time.frameCount guard: rebuild once per frame
+		// Occlusion is invalidated when the camera moves or culling settings change.
+		// We store the last camera position used for the build; any significant
+		// movement (>0.001 units) triggers a rebuild. This works in Edit mode where
+		// Time.frameCount does NOT tick between OnSceneGUI mouse-move events.
+		Vector3 _occlusionCamPos = new Vector3(float.MaxValue, 0, 0);
+		int _occlusionN = -1;   // particle count at last build
+		CullingMode _occlusionLastMode = (CullingMode) (-1);
 
 		Vector3 _meshCentroid;
-		int     _meshCentroidCount = -1;
+		int _meshCentroidCount = -1;
 
 		Vector3 _lastBrushCenter;
-		bool    _brushCenterValid;
+		bool _brushCenterValid;
 
 		// Batched wire-line cache for render mesh
 		Vector3[] _wireLinesCache;
-		Mesh      _wireLinesMesh;
+		Mesh _wireLinesMesh;
 
 		// Depth-cull mesh data cached to avoid per-frame .vertices/.triangles alloc
 		Vector3[] _depthVerts;
-		int[]     _depthTris;
-		Mesh      _depthMesh;
+		int[] _depthTris;
+		Mesh _depthMesh;
 
 		// Visible set = indices not occluded, OR occluded but _showInnerParticles is on.
 		// Uses the last-built occlusion cache (frame-guarded). When the cache is stale
@@ -530,13 +608,15 @@ namespace XPBD
 		HashSet<int> GetVisibleSet(TetrahedralMeshAsset asset)
 		{
 			var set = new HashSet<int>();
-			if (asset?.Particles == null) return set;
-			int  n     = asset.Particles.Length;
+			if (asset?.Particles == null)
+				return set;
+			int n = asset.Particles.Length;
 			bool valid = _occlusionCache != null && _occlusionCache.Length == n;
 			for (int i = 0; i < n; i++)
 			{
 				bool occ = valid && _occlusionCache[i];
-				if (!occ || _showInnerParticles) set.Add(i);
+				if (!occ || _showInnerParticles)
+					set.Add(i);
 			}
 			return set;
 		}
@@ -544,40 +624,49 @@ namespace XPBD
 		Vector3 GetMeshCentroid(TetrahedralMeshAsset asset)
 		{
 			int n = asset.Particles.Length;
-			if (_meshCentroidCount == n) return _meshCentroid;
+			if (_meshCentroidCount == n)
+				return _meshCentroid;
 			Vector3 sum = Vector3.zero;
-			foreach (var p in asset.Particles) sum += p.Position;
-			_meshCentroid      = n > 0 ? sum / n : Vector3.zero;
+			foreach (var p in asset.Particles)
+				sum += p.Position;
+			_meshCentroid = n > 0 ? sum / n : Vector3.zero;
 			_meshCentroidCount = n;
 			return _meshCentroid;
 		}
 
 		void RebuildOcclusionCache(TetrahedralMeshAsset asset, Camera cam)
 		{
-			// Frame-guard: multiple callers per frame (DrawParticles, PaintAtMouse,
-			// RectSelect) all share one rebuild. Free on second+ call per frame.
-			int frame = Time.frameCount;
-			if (_occlusionFrame == frame
-			    && _occlusionCache != null
-			    && _occlusionCache.Length == asset.Particles.Length)
-				return;
-			_occlusionFrame = frame;
-
 			int n = asset.Particles.Length;
+			Vector3 camPos = cam.transform.position;
+
+			// Rebuild whenever: camera moved, particle count changed, or culling mode changed.
+			// Using camera-position change rather than Time.frameCount because the Editor does
+			// NOT tick frameCount between OnSceneGUI events — a frameCount guard would cause
+			// the occlusion to be computed once at "init view" and never updated as you orbit.
+			bool camMoved = (camPos - _occlusionCamPos).sqrMagnitude > 1e-6f;
+			bool countChanged = n != _occlusionN;
+			bool modeChanged = _cullingMode != _occlusionLastMode;
+
+			if (!camMoved && !countChanged && !modeChanged
+				&& _occlusionCache != null && _occlusionCache.Length == n)
+				return;
+
+			_occlusionCamPos = camPos;
+			_occlusionN = n;
+			_occlusionLastMode = _cullingMode;
+
 			if (_occlusionCache == null || _occlusionCache.Length != n)
 				_occlusionCache = new bool[n];
 
-			Vector3 camPos   = cam.transform.position;
-			Vector3 centre   = GetMeshCentroid(asset);
+			Vector3 centre = GetMeshCentroid(asset);
 			Vector3 frontDir = (centre - camPos).normalized;
 
-			// Cache mesh triangles for Depth mode (avoid .vertices/.triangles every frame)
 			if (_cullingMode == CullingMode.Depth && asset.RenderMesh != null
-			    && asset.RenderMesh != _depthMesh)
+				&& asset.RenderMesh != _depthMesh)
 			{
 				_depthVerts = asset.RenderMesh.vertices;
-				_depthTris  = asset.RenderMesh.triangles;
-				_depthMesh  = asset.RenderMesh;
+				_depthTris = asset.RenderMesh.triangles;
+				_depthMesh = asset.RenderMesh;
 			}
 
 			for (int i = 0; i < n; i++)
@@ -589,6 +678,7 @@ namespace XPBD
 						_occlusionCache[i] = false;
 						break;
 					case CullingMode.Back:
+						// Positive projection → particle is behind the mesh centre → occluded.
 						_occlusionCache[i] = Vector3.Dot(wpos - centre, frontDir) > 0f;
 						break;
 					case CullingMode.Depth:
@@ -602,22 +692,25 @@ namespace XPBD
 		// Uses pre-cached _depthVerts/_depthTris (no per-call alloc).
 		bool IsOccludedByMesh(Vector3 wpos, Vector3 camPos)
 		{
-			Vector3 dir  = wpos - camPos;
-			float   dist = dir.magnitude;
-			if (dist < 1e-4f) return false;
+			Vector3 dir = wpos - camPos;
+			float dist = dir.magnitude;
+			if (dist < 1e-4f)
+				return false;
 			Vector3 dirN = dir / dist;
 
-			if (Physics.Raycast(camPos, dirN, dist - 0.01f)) return true;
+			if (Physics.Raycast(camPos, dirN, dist - 0.01f))
+				return true;
 
-			if (_depthVerts == null || _depthTris == null) return false;
+			if (_depthVerts == null || _depthTris == null)
+				return false;
 			var ray = new Ray(camPos, dirN);
 			for (int t = 0; t < _depthTris.Length; t += 3)
 			{
 				if (RayTriangleIntersect(ray,
-				        _depthVerts[_depthTris[t]],
-				        _depthVerts[_depthTris[t + 1]],
-				        _depthVerts[_depthTris[t + 2]],
-				        out float hitT) && hitT > 0 && hitT < dist - 0.01f)
+						_depthVerts[_depthTris[t]],
+						_depthVerts[_depthTris[t + 1]],
+						_depthVerts[_depthTris[t + 2]],
+						out float hitT) && hitT > 0 && hitT < dist - 0.01f)
 					return true;
 			}
 			return false;
@@ -627,18 +720,21 @@ namespace XPBD
 		static bool RayTriangleIntersect(Ray ray, Vector3 v0, Vector3 v1, Vector3 v2, out float t)
 		{
 			t = 0;
-			Vector3 e1  = v1 - v0;
-			Vector3 e2  = v2 - v0;
-			Vector3 h   = Vector3.Cross(ray.direction, e2);
-			float   det = Vector3.Dot(e1, h);
-			if (Mathf.Abs(det) < 1e-7f) return false;
-			float   invDet = 1f / det;
-			Vector3 s      = ray.origin - v0;
-			float   u      = Vector3.Dot(s, h) * invDet;
-			if (u < 0 || u > 1) return false;
+			Vector3 e1 = v1 - v0;
+			Vector3 e2 = v2 - v0;
+			Vector3 h = Vector3.Cross(ray.direction, e2);
+			float det = Vector3.Dot(e1, h);
+			if (Mathf.Abs(det) < 1e-7f)
+				return false;
+			float invDet = 1f / det;
+			Vector3 s = ray.origin - v0;
+			float u = Vector3.Dot(s, h) * invDet;
+			if (u < 0 || u > 1)
+				return false;
 			Vector3 q = Vector3.Cross(s, e1);
-			float   v = Vector3.Dot(ray.direction, q) * invDet;
-			if (v < 0 || u + v > 1) return false;
+			float v = Vector3.Dot(ray.direction, q) * invDet;
+			if (v < 0 || u + v > 1)
+				return false;
 			t = Vector3.Dot(e2, q) * invDet;
 			return t > 1e-7f;
 		}
@@ -652,27 +748,31 @@ namespace XPBD
 			Camera cam = sv.camera;
 			RebuildOcclusionCache(asset, cam);   // frame-guarded, free if already done
 
-			Event e       = Event.current;
-			bool  isClick = e.type == EventType.MouseDown && e.button == 0 && !e.alt
-			                && _selectMode == SelectMode.Paint;
+			Event e = Event.current;
+			bool isClick = e.type == EventType.MouseDown && e.button == 0 && !e.alt
+							&& _selectMode == SelectMode.Paint;
 
 			for (int i = 0; i < asset.Particles.Length; i++)
 			{
-				Vector3 wpos     = asset.Particles[i].Position;
-				bool    occluded = _occlusionCache[i];
+				Vector3 wpos = asset.Particles[i].Position;
+				bool occluded = _occlusionCache[i];
 
-				if (occluded && !_showInnerParticles) continue;
+				if (occluded && !_showInnerParticles)
+					continue;
 
-				bool sel    = _selected.Contains(i);
+				bool sel = _selected.Contains(i);
 				bool pinned = asset.Particles[i].InvMass < 1e-6f;
 
 				float size = HandleUtility.GetHandleSize(wpos) * 0.04f * _particleSizeScale;
 				size = Mathf.Clamp(size, 0.003f, 0.15f);
 
 				Color col;
-				if (sel)         col = ColSelected;
-				else if (pinned) col = occluded ? new Color(0f, 1f, 1f, 0.2f) : Color.cyan;
-				else             col = occluded ? ColInner : ColParticle;
+				if (sel)
+					col = ColSelected;
+				else if (pinned)
+					col = occluded ? new Color(0f, 1f, 1f, 0.2f) : Color.cyan;
+				else
+					col = occluded ? ColInner : ColParticle;
 
 				Handles.color = col;
 
@@ -689,12 +789,14 @@ namespace XPBD
 					if (isClick)
 					{
 						Vector2 screenPt = HandleUtility.WorldToGUIPoint(wpos);
-						float   pixelR   = Mathf.Clamp(
-						    HandleUtility.GetHandleSize(wpos) * _particleSizeScale * 28f, 5f, 36f);
+						float pixelR = Mathf.Clamp(
+							HandleUtility.GetHandleSize(wpos) * _particleSizeScale * 28f, 5f, 36f);
 						if (Vector2.Distance(screenPt, e.mousePosition) <= pixelR)
 						{
-							if (e.shift) { if (sel) _selected.Remove(i); else _selected.Add(i); }
-							else         { _selected.Clear(); _selected.Add(i); }
+							// Use same modifier-key scheme as brush/rect:
+							// Ctrl=subtract, Shift=append, bare=new(replace)
+							SelectOp op = GetSelectOp(e);
+							ApplySelectOp(new[] { i }, op);
 							e.Use();
 							Repaint();
 							isClick = false;   // one pick per click
@@ -712,7 +814,8 @@ namespace XPBD
 			Handles.color = ColEdge;
 			foreach (var e in asset.Edges)
 			{
-				if (e.IndexA >= asset.Particles.Length || e.IndexB >= asset.Particles.Length) continue;
+				if (e.IndexA >= asset.Particles.Length || e.IndexB >= asset.Particles.Length)
+					continue;
 				Handles.DrawLine(asset.Particles[e.IndexA].Position, asset.Particles[e.IndexB].Position);
 			}
 		}
@@ -722,14 +825,19 @@ namespace XPBD
 			Handles.color = ColTet;
 			foreach (var t in asset.Tetrahedrals)
 			{
-				if (t.I0 >= asset.Particles.Length) continue;
+				if (t.I0 >= asset.Particles.Length)
+					continue;
 				Vector3 p0 = asset.Particles[t.I0].Position;
 				Vector3 p1 = asset.Particles[t.I1].Position;
 				Vector3 p2 = asset.Particles[t.I2].Position;
 				Vector3 p3 = asset.Particles[t.I3].Position;
 				// 4 faces of the tet as lines
-				Handles.DrawLine(p0, p1); Handles.DrawLine(p0, p2); Handles.DrawLine(p0, p3);
-				Handles.DrawLine(p1, p2); Handles.DrawLine(p1, p3); Handles.DrawLine(p2, p3);
+				Handles.DrawLine(p0, p1);
+				Handles.DrawLine(p0, p2);
+				Handles.DrawLine(p0, p3);
+				Handles.DrawLine(p1, p2);
+				Handles.DrawLine(p1, p3);
+				Handles.DrawLine(p2, p3);
 			}
 		}
 
@@ -745,9 +853,12 @@ namespace XPBD
 				int w = 0;
 				for (int i = 0; i < t.Length; i += 3)
 				{
-					_wireLinesCache[w++] = v[t[i]];     _wireLinesCache[w++] = v[t[i + 1]];
-					_wireLinesCache[w++] = v[t[i + 1]]; _wireLinesCache[w++] = v[t[i + 2]];
-					_wireLinesCache[w++] = v[t[i + 2]]; _wireLinesCache[w++] = v[t[i]];
+					_wireLinesCache[w++] = v[t[i]];
+					_wireLinesCache[w++] = v[t[i + 1]];
+					_wireLinesCache[w++] = v[t[i + 1]];
+					_wireLinesCache[w++] = v[t[i + 2]];
+					_wireLinesCache[w++] = v[t[i + 2]];
+					_wireLinesCache[w++] = v[t[i]];
 				}
 				_wireLinesMesh = mesh;
 			}
@@ -756,85 +867,103 @@ namespace XPBD
 		}
 
 		// ── Selection helpers ─────────────────────────────────────────────────
-		void PaintAtMouse(TetrahedralMeshAsset asset, Event e, SceneView sv, bool replace)
+		void PaintAtMouse(TetrahedralMeshAsset asset, Event e, SceneView sv, SelectOp op)
 		{
-			if (replace) _selected.Clear();
-
-			// Reuse cached brush center (updated on MouseMove/Drag, never on Repaint).
 			Vector3 brushCenter = _brushCenterValid
 				? _lastBrushCenter
 				: EstimateBrushCenter(asset, HandleUtility.GUIPointToWorldRay(e.mousePosition));
 
-			// Frame-guarded: free if already built this frame.
 			RebuildOcclusionCache(asset, sv.camera);
 
 			float r2 = _brushSize * _brushSize;
+			var hits = new List<int>();
 			for (int i = 0; i < asset.Particles.Length; i++)
 			{
-				if (_cullingMode != CullingMode.None && _occlusionCache[i]) continue;
+				if (_cullingMode != CullingMode.None && _occlusionCache[i])
+					continue;
 				if ((asset.Particles[i].Position - brushCenter).sqrMagnitude <= r2)
-					_selected.Add(i);
+					hits.Add(i);
 			}
+			ApplySelectOp(hits, op);
 			Repaint();
 		}
 
-		void RectSelect(TetrahedralMeshAsset asset, Event e, SceneView sv, bool replace)
+		void RectSelect(TetrahedralMeshAsset asset, Event e, SceneView sv, SelectOp op)
 		{
-			if (replace) _selected.Clear();
-			var  rect = GUIRectFromPoints(_rectStart, e.mousePosition);
-			var  cam  = sv.camera;
-
-			// Rebuild occlusion cache so rect-select respects culling
+			var rect = GUIRectFromPoints(_rectStart, e.mousePosition);
+			var cam = sv.camera;
 			RebuildOcclusionCache(asset, cam);
 
+			var hits = new List<int>();
 			for (int i = 0; i < asset.Particles.Length; i++)
 			{
-				// Respect culling: don't select occluded particles
-				if (_cullingMode != CullingMode.None && _occlusionCache[i]) continue;
-
-				Vector3 wpos   = asset.Particles[i].Position;
+				if (_cullingMode != CullingMode.None && _occlusionCache[i])
+					continue;
+				Vector3 wpos = asset.Particles[i].Position;
 				Vector3 screen = cam.WorldToScreenPoint(wpos);
-				// Convert pixel coords to GUI space (Y-axis is flipped)
 				Vector2 gui = new Vector2(screen.x, cam.pixelHeight - screen.y);
 				if (screen.z > 0 && rect.Contains(gui))
-					_selected.Add(i);
+					hits.Add(i);
 			}
+			ApplySelectOp(hits, op);
 			Repaint();
 		}
 
-		// Returns the closest particle to the ray, as a proxy brush anchor.
+		// Returns the world position of the particle nearest to the ray.
+		// Using the particle's OWN position (not the foot of the perpendicular)
+		// ensures the brush disc "sticks" to the particle cloud surface and
+		// the brush volume in world-space correctly encloses neighbouring particles.
+		// The old approach (foot of perpendicular) placed the disc at varying depths
+		// inside the mesh, causing visible wobble and missing particles in paint mode.
 		Vector3 EstimateBrushCenter(TetrahedralMeshAsset asset, Ray ray)
 		{
-			float   best = float.MaxValue;
-			Vector3 res  = ray.origin + ray.direction * 2f;
+			float bestDist2 = float.MaxValue;
+			Vector3 bestPos = ray.origin + ray.direction * 2f;
 			foreach (var p in asset.Particles)
 			{
-				// Closest point on ray to particle
 				float t = Vector3.Dot(p.Position - ray.origin, ray.direction);
-				if (t < 0) continue;
-				Vector3 closest = ray.origin + ray.direction * t;
-				float   dist    = Vector3.Distance(closest, p.Position);
-				if (dist < best) { best = dist; res = closest; }
+				if (t < 0)
+					continue;
+				Vector3 foot = ray.origin + ray.direction * t;
+				float dist2 = (foot - p.Position).sqrMagnitude;
+				if (dist2 < bestDist2)
+				{
+					bestDist2 = dist2;
+					bestPos = p.Position;
+				}
 			}
-			return res;
+			return bestPos;
 		}
 
 		static Rect GUIRectFromPoints(Vector2 a, Vector2 b) =>
 			new Rect(Mathf.Min(a.x, b.x), Mathf.Min(a.y, b.y),
-			         Mathf.Abs(a.x - b.x), Mathf.Abs(a.y - b.y));
+					 Mathf.Abs(a.x - b.x), Mathf.Abs(a.y - b.y));
 
 		// ── Property helpers ──────────────────────────────────────────────────
 		void RefreshPropertyValue(TetrahedralMeshAsset asset)
 		{
-			if (_selected.Count == 0) { _propValue = 0; _propMixed = false; return; }
+			if (_selected.Count == 0)
+			{
+				_propValue = 0;
+				_propMixed = false;
+				return;
+			}
 
 			float first = float.NaN;
-			_propMixed  = false;
+			_propMixed = false;
 			foreach (int idx in _selected)
 			{
 				float v = asset.Particles[idx].InvMass;
-				if (float.IsNaN(first)) { first = v; continue; }
-				if (!Mathf.Approximately(v, first)) { _propMixed = true; break; }
+				if (float.IsNaN(first))
+				{
+					first = v;
+					continue;
+				}
+				if (!Mathf.Approximately(v, first))
+				{
+					_propMixed = true;
+					break;
+				}
 			}
 			_propValue = float.IsNaN(first) ? 0f : first;
 		}
@@ -845,7 +974,7 @@ namespace XPBD
 			_editing = on;
 			if (on)
 			{
-				TakeSnapshot((TetrahedralMeshAsset)target);
+				TakeSnapshot((TetrahedralMeshAsset) target);
 				_dirty = false;
 				SceneView.duringSceneGui += OnSceneGUI;
 				if (SceneView.lastActiveSceneView == null)
@@ -857,7 +986,7 @@ namespace XPBD
 				SceneView.duringSceneGui -= OnSceneGUI;
 				_selected.Clear();
 				_rectDragging = false;
-				_dirty        = false;
+				_dirty = false;
 				SceneView.RepaintAll();
 			}
 			Repaint();
@@ -867,17 +996,21 @@ namespace XPBD
 		void TakeSnapshot(TetrahedralMeshAsset asset)
 		{
 			_snapshotParticles = asset.Particles == null ? null
-				: (ParticleData[])asset.Particles.Clone();
-			if (asset.Groups == null) { _snapshotGroups = null; return; }
+				: (ParticleData[]) asset.Particles.Clone();
+			if (asset.Groups == null)
+			{
+				_snapshotGroups = null;
+				return;
+			}
 			_snapshotGroups = new ParticleGroup[asset.Groups.Length];
 			for (int g = 0; g < asset.Groups.Length; g++)
 			{
 				var src = asset.Groups[g];
 				_snapshotGroups[g] = new ParticleGroup
 				{
-					Name            = src.Name,
+					Name = src.Name,
 					ParticleIndices = src.ParticleIndices == null ? null
-						: (int[])src.ParticleIndices.Clone()
+						: (int[]) src.ParticleIndices.Clone()
 				};
 			}
 		}
@@ -887,13 +1020,13 @@ namespace XPBD
 		{
 			Undo.RecordObject(asset, "Discard Particle Edits");
 			asset.Particles = _snapshotParticles == null ? null
-				: (ParticleData[])_snapshotParticles.Clone();
+				: (ParticleData[]) _snapshotParticles.Clone();
 			asset.Groups = _snapshotGroups == null ? null
 				: System.Array.ConvertAll(_snapshotGroups, g => new ParticleGroup
 				{
-					Name            = g.Name,
+					Name = g.Name,
 					ParticleIndices = g.ParticleIndices == null ? null
-						: (int[])g.ParticleIndices.Clone()
+						: (int[]) g.ParticleIndices.Clone()
 				});
 			EditorUtility.SetDirty(asset);
 			AssetDatabase.SaveAssets();
@@ -910,28 +1043,29 @@ namespace XPBD
 		// Pop a save-file dialog and write a copy to the chosen location
 		void DoSaveAs(TetrahedralMeshAsset asset)
 		{
-			string srcPath  = AssetDatabase.GetAssetPath(asset);
-			string dir      = System.IO.Path.GetDirectoryName(srcPath);
+			string srcPath = AssetDatabase.GetAssetPath(asset);
+			string dir = System.IO.Path.GetDirectoryName(srcPath);
 			string baseName = System.IO.Path.GetFileNameWithoutExtension(srcPath);
 			string destPath = EditorUtility.SaveFilePanelInProject(
 				"Save Copy As", baseName + "_copy", "asset",
 				"Choose where to save the copy.", dir);
-			if (string.IsNullOrEmpty(destPath)) return;
+			if (string.IsNullOrEmpty(destPath))
+				return;
 
 			// Write current (possibly edited) asset data into a brand-new asset
 			var copy = CreateInstance<TetrahedralMeshAsset>();
-			copy.Particles    = asset.Particles == null ? null : (ParticleData[])asset.Particles.Clone();
-			copy.Edges        = asset.Edges;
+			copy.Particles = asset.Particles == null ? null : (ParticleData[]) asset.Particles.Clone();
+			copy.Edges = asset.Edges;
 			copy.Tetrahedrals = asset.Tetrahedrals;
-			copy.OrigIndices  = asset.OrigIndices;
-			copy.Skinning     = asset.Skinning;
-			copy.RenderMesh   = asset.RenderMesh;
-			copy.Groups       = asset.Groups == null ? null
+			copy.OrigIndices = asset.OrigIndices;
+			copy.Skinning = asset.Skinning;
+			copy.RenderMesh = asset.RenderMesh;
+			copy.Groups = asset.Groups == null ? null
 				: System.Array.ConvertAll(asset.Groups, g => new ParticleGroup
 				{
-					Name            = g.Name,
+					Name = g.Name,
 					ParticleIndices = g.ParticleIndices == null ? null
-						: (int[])g.ParticleIndices.Clone()
+						: (int[]) g.ParticleIndices.Clone()
 				});
 
 			AssetDatabase.CreateAsset(copy, destPath);
@@ -944,7 +1078,11 @@ namespace XPBD
 		void MarkDirty(TetrahedralMeshAsset asset)
 		{
 			EditorUtility.SetDirty(asset);
-			if (!_dirty) { _dirty = true; Repaint(); }
+			if (!_dirty)
+			{
+				_dirty = true;
+				Repaint();
+			}
 		}
 
 		void OnDisable()

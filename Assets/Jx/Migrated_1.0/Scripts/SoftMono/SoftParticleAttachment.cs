@@ -33,9 +33,13 @@ using UnityEngine;
 
 namespace XPBD
 {
-	public enum AttachmentType { Static, Dynamic }
+	public enum AttachmentType
+	{
+		Static, Dynamic
+	}
 
 	[AddComponentMenu("XPBD/Soft Particle Attachment")]
+	[RequireComponent(typeof(SoftBodyComponent))]
 	public sealed class SoftParticleAttachment : MonoBehaviour
 	{
 		// ── Inspector ─────────────────────────────────────────────────────────
@@ -47,7 +51,7 @@ namespace XPBD
 		public ParticleGroup ParticleGrp;
 
 		[Tooltip("Static: hard-pin (zero velocity, teleport). " +
-		         "Dynamic: spring-drive (two-way coupling with Rigidbody target).")]
+				 "Dynamic: spring-drive (two-way coupling with Rigidbody target).")]
 		public AttachmentType Type = AttachmentType.Static;
 
 		[Header("Dynamic settings (ignored for Static)")]
@@ -59,8 +63,8 @@ namespace XPBD
 		[Tooltip("Velocity damping applied to attachment correction. 1 = fully damped.")]
 		public float Damping = 0.5f;
 
-		[Header("Reference (auto-found if null)")]
-		public SoftBodyComponent SoftBody;
+		//[Header("Reference (auto-found if null)")]
+		SoftBodyComponent _softBody;
 
 		// ── Runtime state ─────────────────────────────────────────────────────
 		// Rest offsets in AttachTarget's LOCAL space, computed at Enable time.
@@ -77,13 +81,34 @@ namespace XPBD
 		// ── Lifecycle ─────────────────────────────────────────────────────────
 		void Awake()
 		{
-			if (SoftBody == null)
-				SoftBody = GetComponent<SoftBodyComponent>();
+			if (_softBody == null)
+			{
+				_softBody = GetComponent<SoftBodyComponent>();
+				//ensure it Init() for pass : later OnEnable() Validate [3/14/2026 jzq]
+				_softBody.Init();
+			}
+			//**Temp ReFetch By Name, Later fix by custom-editor Choose from _softBody.TetMeshAsset.Groups [3/14/2026 jzq]
+			var find = false;
+			foreach (var g in _softBody.TetMeshAsset.Groups)
+			{
+				if (g.Name == ParticleGrp.Name)
+				{
+					ParticleGrp = g;
+					find = true;
+					break;
+				}
+			}
+			if (!find)
+			{
+				Debug.LogError($"ParticleGrp.Name = {ParticleGrp.Name} not found in softbody '{_softBody.name}'");
+				enabled = false;
+			}
 		}
 
 		void OnEnable()
 		{
-			if (!Validate()) return;
+			if (!Validate())
+				return;
 			CacheIndices();
 			ComputeRestOffsets();
 		}
@@ -99,12 +124,16 @@ namespace XPBD
 		// ── FixedUpdate — apply attachment each physics step ──────────────────
 		void FixedUpdate()
 		{
-			if (!Validate()) return;
-			if (_indices == null || _indices.Length == 0) return;
-			if (AttachTarget == null) return;
+			if (!Validate())
+				return;
+			if (_indices == null || _indices.Length == 0)
+				return;
+			if (AttachTarget == null)
+				return;
 
-			var state = SoftBody.State;
-			if (state == null) return;
+			var state = _softBody.State;
+			if (state == null)
+				return;
 
 			int n = state.ParticleCount;
 			int floatsPerParticle = 8; // float3 pos(12) + float pad(4) + float3 vel(12) + float invMass(4) = 32
@@ -119,7 +148,8 @@ namespace XPBD
 			for (int g = 0; g < _indices.Length; g++)
 			{
 				int idx = _indices[g];
-				if (idx < 0 || idx >= n) continue;
+				if (idx < 0 || idx >= n)
+					continue;
 
 				// Compute target world position from rest offset
 				Vector3 targetWorld = AttachTarget.TransformPoint(
@@ -132,7 +162,7 @@ namespace XPBD
 				if (Type == AttachmentType.Static)
 				{
 					// Hard pin: teleport to target, zero velocity
-					_particleRaw[o]     = targetWorld.x;
+					_particleRaw[o] = targetWorld.x;
 					_particleRaw[o + 1] = targetWorld.y;
 					_particleRaw[o + 2] = targetWorld.z;
 					_particleRaw[o + 4] = 0f;
@@ -145,20 +175,22 @@ namespace XPBD
 				{
 					// Spring-damper: compute correction impulse toward target
 					float dt = Time.fixedDeltaTime;
-					if (dt < 1e-6f) continue;
+					if (dt < 1e-6f)
+						continue;
 
 					Vector3 delta = targetWorld - curPos;
-					float   dist  = delta.magnitude;
-					if (dist < 1e-5f) continue;
+					float dist = delta.magnitude;
+					if (dist < 1e-5f)
+						continue;
 
 					// XPBD compliance: correction = delta / (1 + compliance / dt²)
-					float invDt2     = 1f / (dt * dt);
-					float corrScale  = 1f / (1f + Compliance * invDt2);
-					Vector3 corr     = delta * corrScale;
+					float invDt2 = 1f / (dt * dt);
+					float corrScale = 1f / (1f + Compliance * invDt2);
+					Vector3 corr = delta * corrScale;
 
 					// Apply damping to existing velocity component along correction
-					Vector3 n_      = delta / dist;
-					float   vDot    = Vector3.Dot(curVel, n_);
+					Vector3 n_ = delta / dist;
+					float vDot = Vector3.Dot(curVel, n_);
 					Vector3 dampedVel = curVel - n_ * vDot * Damping;
 
 					// New velocity = (corr / dt) + damped lateral velocity
@@ -193,8 +225,10 @@ namespace XPBD
 		// ── Helpers ───────────────────────────────────────────────────────────
 		bool Validate()
 		{
-			if (SoftBody == null || SoftBody.State == null) return false;
-			if (ParticleGrp == null) return false;
+			if (_softBody == null || _softBody.State == null)
+				return false;
+			if (ParticleGrp == null)
+				return false;
 			return true;
 		}
 
@@ -205,9 +239,10 @@ namespace XPBD
 
 		void ComputeRestOffsets()
 		{
-			if (AttachTarget == null || SoftBody?.State == null) return;
+			if (AttachTarget == null || _softBody?.State == null)
+				return;
 
-			var state = SoftBody.State;
+			var state = _softBody.State;
 			int n = state.ParticleCount;
 			int floatsPerParticle = 8;
 
@@ -220,7 +255,11 @@ namespace XPBD
 			for (int g = 0; g < _indices.Length; g++)
 			{
 				int idx = _indices[g];
-				if (idx < 0 || idx >= n) { _restOffsets[g] = Vector3.zero; continue; }
+				if (idx < 0 || idx >= n)
+				{
+					_restOffsets[g] = Vector3.zero;
+					continue;
+				}
 
 				int o = idx * floatsPerParticle;
 				Vector3 worldPos = new Vector3(_particleRaw[o], _particleRaw[o + 1], _particleRaw[o + 2]);
@@ -238,7 +277,8 @@ namespace XPBD
 			// invMass is at float offset 7 in each particle record
 			foreach (int idx in _indices)
 			{
-				if (idx < 0 || idx >= n) continue;
+				if (idx < 0 || idx >= n)
+					continue;
 				_particleRaw[idx * floatsPerParticle + 7] = 0f; // invMass = 0 → pinned
 			}
 			state.ParticleBuffer.SetData(_particleRaw);
@@ -258,8 +298,10 @@ namespace XPBD
 #if UNITY_EDITOR
 		void OnDrawGizmosSelected()
 		{
-			if (AttachTarget == null || ParticleGrp?.ParticleIndices == null) return;
-			if (SoftBody?.State == null) return;
+			if (AttachTarget == null || ParticleGrp?.ParticleIndices == null)
+				return;
+			if (_softBody?.State == null)
+				return;
 
 			Gizmos.color = Type == AttachmentType.Static
 				? new Color(0.2f, 0.8f, 1f, 0.8f)
@@ -268,7 +310,7 @@ namespace XPBD
 			// Draw lines from each grouped particle's rest position to the target
 			var asset = UnityEditor.AssetDatabase.LoadAssetAtPath<TetrahedralMeshAsset>(
 				UnityEditor.AssetDatabase.GetAssetPath(
-					SoftBody.GetComponent<UnityEngine.MeshFilter>()?.sharedMesh));
+					_softBody.GetComponent<UnityEngine.MeshFilter>()?.sharedMesh));
 
 			// Fallback: draw a sphere at the target
 			Gizmos.DrawWireSphere(AttachTarget.position, 0.08f);
