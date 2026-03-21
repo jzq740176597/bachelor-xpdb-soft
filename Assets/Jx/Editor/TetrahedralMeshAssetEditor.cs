@@ -1432,12 +1432,19 @@ namespace XPBD.Editor
 
 		static XpbdIsolationStartupRestorer()
 		{
-			// Defer one frame so SceneVisibilityManager is fully initialised.
-			EditorApplication.delayCall += RestoreIfNeeded;
+			// EditorApplication.delayCall only fires when the editor loop ticks
+			// (requires user interaction on cold start — too late).
+			// EditorApplication.update fires every editor tick automatically,
+			// including immediately after startup with no user input required.
+			// Unsubscribe inside the callback so it only runs once.
+			EditorApplication.update += RestoreIfNeeded;
 		}
 
 		static void RestoreIfNeeded()
 		{
+			// Unsubscribe first — run exactly once regardless of outcome.
+			EditorApplication.update -= RestoreIfNeeded;
+
 			if (!EditorPrefs.HasKey(Key))
 				return;
 			EditorPrefs.DeleteKey(Key);
