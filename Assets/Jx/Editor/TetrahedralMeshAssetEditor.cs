@@ -35,6 +35,8 @@ namespace XPBD.Editor
 	{
 		// ── Edit-mode state ───────────────────────────────────────────────────
 		bool _editing;
+		// Scene isolation: GameObjects hidden on edit-enter, restored on exit.
+		GameObject[] _hiddenObjects;
 
 		// Selection
 		enum SelectMode
@@ -42,7 +44,7 @@ namespace XPBD.Editor
 			Paint, Rectangle
 		}
 		SelectMode _selectMode = SelectMode.Paint;
-		float _brushSize = 0.15f;   // world-space radius
+		float _brushSize = 40f;     // screen-space circle radius in pixels
 		enum CullingMode
 		{
 			None, Back, Depth
@@ -87,7 +89,7 @@ namespace XPBD.Editor
 
 		// Particle display
 		float _particleSizeScale = 1.0f;    // multiplier on the auto-computed handle size
-		bool _showInnerParticles = true;    // draw occluded/inner particles in dim colour
+		bool _showInnerParticles = false;   // draw interior (geometrically inside mesh) particles in dim colour
 
 		// Colours
 		static readonly Color ColParticle = new Color(1f, 0.55f, 0.05f, 0.9f);
@@ -193,9 +195,9 @@ namespace XPBD.Editor
 			int selCount = _selected.Count(i => visibleSet.Contains(i));
 
 			string selInfo = selCount == 0
-				? "Click/drag: new sel.  Shift+click/drag: append.  Ctrl+click/drag: subtract."
+				? "Drag: new.  Shift+drag: append (teal).  Ctrl+drag: subtract (red)."
 				: $"{selCount} / {visCount} visible selected  ({totCount} total)"
-				  + "Shift=append  Ctrl=subtract  (paint & rect modes)";
+				+ "Shift=append  Ctrl=subtract  (circle & rect modes)";
 			EditorGUILayout.HelpBox(selInfo, MessageType.None);
 
 			// Mode toolbar
@@ -206,7 +208,7 @@ namespace XPBD.Editor
 					new[] { "Paint", "Rectangle" }, GUILayout.Height(22));
 			}
 
-			_brushSize = EditorGUILayout.Slider("Brush size", _brushSize, 0.01f, 2f);
+			_brushSize = EditorGUILayout.Slider("Circle radius (px)", _brushSize, 5f, 200f);
 
 			using (new EditorGUILayout.HorizontalScope())
 			{
@@ -214,10 +216,15 @@ namespace XPBD.Editor
 				_cullingMode = (CullingMode) GUILayout.Toolbar((int) _cullingMode,
 					new[] { "None", "Back", "Depth" }, GUILayout.Height(20));
 			}
-			if (_cullingMode == CullingMode.Depth)
-				EditorGUILayout.HelpBox(
-					"Depth culling uses mesh raycasting. Accurate but slower for high-res meshes.",
-					MessageType.None);
+			// Culling controls which particles are SELECTABLE (not how the circle looks).
+			// The 2D circle still draws at fixed pixel size; culling prevents back/hidden
+			// particles from being selected even when the circle overlaps them on screen.
+			string cullingTip = _cullingMode == CullingMode.None
+				? "None: all particles selectable, front and back."
+				: _cullingMode == CullingMode.Back
+					? "Back: back-hemisphere particles not selectable (fast, good for convex meshes)."
+					: "Depth: raycasts for accurate occlusion. Slower on high-res meshes.";
+			EditorGUILayout.HelpBox(cullingTip, MessageType.None);
 
 			// All / None / Invert operate on the VISIBLE set only
 			using (new EditorGUILayout.HorizontalScope())
@@ -315,8 +322,8 @@ namespace XPBD.Editor
 				_showInnerParticles = EditorGUILayout.Toggle("Show inner particles", _showInnerParticles);
 				if (_showInnerParticles)
 					EditorGUILayout.HelpBox(
-						"Inner/occluded particles shown in dim colour. " +
-						"Culling (below) controls whether they are selectable.",
+						"Interior particles (geometrically inside the mesh volume) shown in dim colour. " +
+						"This is camera-independent — based on mesh geometry only.",
 						MessageType.None);
 			}
 
@@ -413,14 +420,16 @@ namespace XPBD.Editor
 		}
 
 		// ── Selection operation from modifier keys ──────────────────────────────
-		// LMB         → New      (replace)
-		// Shift+LMB   → Append   (add)
-		// Ctrl+LMB    → Subtract (remove)
+		// Applies identically to Paint circle and Rectangle:
+		//   bare LMB/drag  → New      (replace selection)
+		//   Shift+drag     → Append   (add to selection)
+		//   Ctrl+drag      → Subtract (remove from selection, circle shows red)
 		// Ctrl is checked before Shift so Ctrl+Shift = Subtract.
 		enum SelectOp
 		{
 			New, Append, Subtract
 		}
+
 		static SelectOp GetSelectOp(Event e) =>
 			e.control ? SelectOp.Subtract :
 			e.shift ? SelectOp.Append :
@@ -461,6 +470,10 @@ namespace XPBD.Editor
 			// Alt is held → user wants to orbit / pan / zoom the scene view camera.
 			// Do NOT consume mouse events or grab default control; let Unity handle it.
 			bool altHeld = e.alt;
+			bool ctrlHeld = e.control;
+			// Alt → camera orbit/pan/zoom: don't grab default control.
+			// Ctrl → circle-subtract: we still grab default control so Unity doesn't
+			// intercept our click, but we skip it only for Alt (camera navigation).
 			if (!altHeld)
 				HandleUtility.AddDefaultControl(GUIUtility.GetControlID(FocusType.Passive));
 
@@ -479,23 +492,19 @@ namespace XPBD.Editor
 			if (_showParticles)
 				DrawParticles(asset, sv);
 
-			// ── Brush overlay ─────────────────────────────────────────────
-			// PERF: EstimateBrushCenter iterates all particles. Only recalculate when
-			// the mouse actually moves — reuse _lastBrushCenter on every Repaint.
-			if (_selectMode == SelectMode.Paint)
+			// ── Brush overlay — 2D screen-space circle (Blender-style) ─────────
+			// Fixed pixel radius: never wobbles. Red tint when Ctrl held (deselect mode).
+			if (_selectMode == SelectMode.Paint && e.type != EventType.Layout && !altHeld)
 			{
-				if (!altHeld && (e.type == EventType.MouseMove || e.type == EventType.MouseDrag))
-				{
-					_lastBrushCenter = EstimateBrushCenter(asset,
-						HandleUtility.GUIPointToWorldRay(e.mousePosition));
-					_brushCenterValid = true;
-					repaint = true;
-				}
-				if (_brushCenterValid && e.type != EventType.Layout)
-				{
-					Handles.color = ColBrush;
-					Handles.DrawWireDisc(_lastBrushCenter, sv.camera.transform.forward, _brushSize);
-				}
+				// Circle colour signals current mode:
+				//   red   = Ctrl held (subtract mode)
+				//   teal  = Shift held (append mode)
+				//   white = bare (new-select / append during drag)
+				Color circleCol = ctrlHeld ? new Color(1f, 0.25f, 0.25f, 0.9f)
+								: e.shift ? new Color(0.3f, 1f, 0.5f, 0.8f)
+								: ColBrush;
+				DrawScreenCircle(e.mousePosition, _brushSize, circleCol);
+				repaint = true;
 			}
 
 			// ── Rect-select overlay ─────────────────────────────────────
@@ -515,16 +524,17 @@ namespace XPBD.Editor
 			}
 
 			// ── Input ─────────────────────────────────────────────────────
-			// Skip ALL paint/select input when Alt is held so the scene-view camera
-			// orbit (Alt+LMB), pan (Alt+MMB) and zoom (Alt+RMB / scroll) work normally.
+			// Modifier summary:
+			//   bare   → New select (replace)   | works for both circle and rect
+			//   Shift  → Append                 | circle turns white; rect adds
+			//   Ctrl   → Subtract               | circle turns red;   rect removes
 			if (!altHeld)
 			{
 				if (e.type == EventType.MouseDown && e.button == 0)
 				{
 					if (_selectMode == SelectMode.Paint)
 					{
-						// MouseDown starts a new paint stroke.
-						// SelectOp is sampled once at stroke-start and stored for the drag.
+						// Capture op at stroke-start; locked for this stroke's first paint.
 						_paintStrokeOp = GetSelectOp(e);
 						PaintAtMouse(asset, e, sv, _paintStrokeOp);
 						e.Use();
@@ -533,7 +543,7 @@ namespace XPBD.Editor
 					{
 						_rectDragging = true;
 						_rectStart = e.mousePosition;
-						_rectOp = GetSelectOp(e);   // capture op at drag-start
+						_rectOp = GetSelectOp(e);   // captured at drag-start
 						e.Use();
 					}
 					repaint = true;
@@ -542,8 +552,12 @@ namespace XPBD.Editor
 				{
 					if (_selectMode == SelectMode.Paint)
 					{
-						// Drag continues same stroke → always Append (never replace again)
-						PaintAtMouse(asset, e, sv, SelectOp.Append);
+						// During a drag, re-read modifier live so user can hold/release
+						// Ctrl or Shift mid-stroke and get the expected result.
+						SelectOp dragOp = ctrlHeld ? SelectOp.Subtract :
+										  e.shift ? SelectOp.Append :
+													  SelectOp.Append;   // bare drag = append-extend
+						PaintAtMouse(asset, e, sv, dragOp);
 						e.Use();
 					}
 					repaint = true;
@@ -561,7 +575,6 @@ namespace XPBD.Editor
 			}
 			else if (_rectDragging)
 			{
-				// Alt pressed mid-rect-drag: cancel cleanly
 				_rectDragging = false;
 				repaint = true;
 			}
@@ -578,21 +591,25 @@ namespace XPBD.Editor
 
 		// ── Drawing helpers ───────────────────────────────────────────────────
 
-		// ── Per-frame caches ─────────────────────────────────────────────────────
+		// ── Caches ──────────────────────────────────────────────────────────────
+
+		// Static geometric interior test — computed once on edit-enter from RenderMesh.
+		// _isInterior[i] = true  → particle is geometrically INSIDE the mesh volume.
+		// _isInterior[i] = false → particle is on/outside the surface.
+		// This is camera-independent; it never changes as you orbit.
+		bool[] _isInterior;
+		int _isInteriorN = -1;   // particle count at last build
+		Mesh _isInteriorMesh;       // mesh used at last build
+
+		// Per-frame camera-dependent occlusion cache (used only for CULLING selectability,
+		// NOT for the show/hide inner-particle toggle — that now uses _isInterior).
 		bool[] _occlusionCache;
-		// Occlusion is invalidated when the camera moves or culling settings change.
-		// We store the last camera position used for the build; any significant
-		// movement (>0.001 units) triggers a rebuild. This works in Edit mode where
-		// Time.frameCount does NOT tick between OnSceneGUI mouse-move events.
 		Vector3 _occlusionCamPos = new Vector3(float.MaxValue, 0, 0);
-		int _occlusionN = -1;   // particle count at last build
+		int _occlusionN = -1;
 		CullingMode _occlusionLastMode = (CullingMode) (-1);
 
 		Vector3 _meshCentroid;
 		int _meshCentroidCount = -1;
-
-		Vector3 _lastBrushCenter;
-		bool _brushCenterValid;
 
 		// Batched wire-line cache for render mesh
 		Vector3[] _wireLinesCache;
@@ -603,20 +620,19 @@ namespace XPBD.Editor
 		int[] _depthTris;
 		Mesh _depthMesh;
 
-		// Visible set = indices not occluded, OR occluded but _showInnerParticles is on.
-		// Uses the last-built occlusion cache (frame-guarded). When the cache is stale
-		// (e.g. Inspector draw before first scene-view frame) all particles are visible.
+		// Visible set = surface particles + interior particles if _showInnerParticles is on.
+		// "Interior" is the static geometric test (_isInterior), not camera-dependent culling.
 		HashSet<int> GetVisibleSet(TetrahedralMeshAsset asset)
 		{
 			var set = new HashSet<int>();
 			if (asset?.Particles == null)
 				return set;
 			int n = asset.Particles.Length;
-			bool valid = _occlusionCache != null && _occlusionCache.Length == n;
+			bool hasCache = _isInterior != null && _isInterior.Length == n;
 			for (int i = 0; i < n; i++)
 			{
-				bool occ = valid && _occlusionCache[i];
-				if (!occ || _showInnerParticles)
+				bool interior = hasCache && _isInterior[i];
+				if (!interior || _showInnerParticles)
 					set.Add(i);
 			}
 			return set;
@@ -689,29 +705,27 @@ namespace XPBD.Editor
 			}
 		}
 
-		// True if the ray from camPos to wpos is blocked.
-		// Uses pre-cached _depthVerts/_depthTris (no per-call alloc).
+		// True if the ray from camPos to wpos is blocked by the asset's own RenderMesh.
+		// IMPORTANT: we deliberately do NOT use Physics.Raycast here because that hits
+		// every collider in the scene (floors, walls, other objects). During editing we
+		// only care about the asset itself as an occluder — nothing else should affect
+		// which particles are considered "inner".
 		bool IsOccludedByMesh(Vector3 wpos, Vector3 camPos)
 		{
+			if (_depthVerts == null || _depthTris == null)
+				return false;
 			Vector3 dir = wpos - camPos;
 			float dist = dir.magnitude;
 			if (dist < 1e-4f)
 				return false;
-			Vector3 dirN = dir / dist;
-
-			if (Physics.Raycast(camPos, dirN, dist - 0.01f))
-				return true;
-
-			if (_depthVerts == null || _depthTris == null)
-				return false;
-			var ray = new Ray(camPos, dirN);
+			var ray = new Ray(camPos, dir / dist);
 			for (int t = 0; t < _depthTris.Length; t += 3)
 			{
 				if (RayTriangleIntersect(ray,
 						_depthVerts[_depthTris[t]],
 						_depthVerts[_depthTris[t + 1]],
 						_depthVerts[_depthTris[t + 2]],
-						out float hitT) && hitT > 0 && hitT < dist - 0.01f)
+						out float hitT) && hitT > 0f && hitT < dist - 0.01f)
 					return true;
 			}
 			return false;
@@ -747,7 +761,11 @@ namespace XPBD.Editor
 		void DrawParticles(TetrahedralMeshAsset asset, SceneView sv)
 		{
 			Camera cam = sv.camera;
-			RebuildOcclusionCache(asset, cam);   // frame-guarded, free if already done
+			RebuildOcclusionCache(asset, cam);   // for culling/selectability only
+
+			// Ensure interior cache exists (should be built on enter, but guard anyway)
+			if (_isInterior == null || _isInterior.Length != asset.Particles.Length)
+				BuildInteriorCache(asset);
 
 			Event e = Event.current;
 			bool isClick = e.type == EventType.MouseDown && e.button == 0 && !e.alt
@@ -756,9 +774,14 @@ namespace XPBD.Editor
 			for (int i = 0; i < asset.Particles.Length; i++)
 			{
 				Vector3 wpos = asset.Particles[i].Position;
-				bool occluded = _occlusionCache[i];
 
-				if (occluded && !_showInnerParticles)
+				// INTERIOR = geometrically inside the mesh volume (static, camera-independent).
+				// OCCLUDED  = camera-angle culling (Back/Depth), only affects selectability.
+				bool interior = _isInterior != null && i < _isInterior.Length && _isInterior[i];
+				bool occluded = _occlusionCache != null && i < _occlusionCache.Length && _occlusionCache[i];
+
+				// Hide interior particles when toggle is off — purely geometric, never flickers.
+				if (interior && !_showInnerParticles)
 					continue;
 
 				bool sel = _selected.Contains(i);
@@ -767,47 +790,72 @@ namespace XPBD.Editor
 				float size = HandleUtility.GetHandleSize(wpos) * 0.04f * _particleSizeScale;
 				size = Mathf.Clamp(size, 0.003f, 0.15f);
 
+				// Colour priority: selected > pinned > interior > back-culled > normal
 				Color col;
 				if (sel)
 					col = ColSelected;
 				else if (pinned)
-					col = occluded ? new Color(0f, 1f, 1f, 0.2f) : Color.cyan;
+					col = (interior || occluded) ? new Color(0f, 1f, 1f, 0.2f) : Color.cyan;
+				else if (interior)
+					col = ColInner;
+				else if (occluded && _cullingMode != CullingMode.None)
+					col = ColInner;   // back/depth-occluded surface particles dim the same way
 				else
-					col = occluded ? ColInner : ColParticle;
+					col = ColParticle;
 
 				Handles.color = col;
 
-				if (occluded)
+				bool dimmed = interior || (occluded && _cullingMode != CullingMode.None);
+				if (dimmed)
 				{
+					// Interior OR back-culled: flat disc, smaller, visually de-emphasised
 					Handles.DrawSolidDisc(wpos, cam.transform.forward, size * 0.6f);
 				}
 				else
 				{
-					// Render-only: zero hit-test overhead
+					// Fully visible surface particle: full sphere
 					Handles.SphereHandleCap(0, wpos, Quaternion.identity, size * 2f, EventType.Repaint);
 
-					// Click-test only on actual MouseDown — project to GUI pixels
-					if (isClick)
+					// Precise single-particle click — skip occluded/back-culled particles.
+					if (isClick && !occluded)
 					{
 						Vector2 screenPt = HandleUtility.WorldToGUIPoint(wpos);
 						float pixelR = Mathf.Clamp(
 							HandleUtility.GetHandleSize(wpos) * _particleSizeScale * 28f, 5f, 36f);
 						if (Vector2.Distance(screenPt, e.mousePosition) <= pixelR)
 						{
-							// Use same modifier-key scheme as brush/rect:
-							// Ctrl=subtract, Shift=append, bare=new(replace)
-							SelectOp op = GetSelectOp(e);
-							ApplySelectOp(new[] { i }, op);
+							ApplySelectOp(new[] { i }, GetSelectOp(e));
 							e.Use();
 							Repaint();
-							isClick = false;   // one pick per click
+							isClick = false;
 						}
 					}
 				}
 
-				if (pinned && !occluded)
+				if (pinned && !dimmed)
 					Handles.Label(wpos + Vector3.up * size * 2.5f, "📌", EditorStyles.miniLabel);
 			}
+		}
+
+		// Fixed-pixel 2D screen-circle. Drawn in GUI layer so it never wobbles.
+		static void DrawScreenCircle(Vector2 center, float radiusPx, Color col)
+		{
+			Handles.BeginGUI();
+			const int segs = 48;
+			Color prev = Handles.color;
+			Handles.color = col;
+			for (int s = 0; s < segs; s++)
+			{
+				float a0 = s / (float) segs * Mathf.PI * 2f;
+				float a1 = (s + 1) / (float) segs * Mathf.PI * 2f;
+				Handles.DrawLine(
+					new Vector3(center.x + Mathf.Cos(a0) * radiusPx,
+								center.y + Mathf.Sin(a0) * radiusPx),
+					new Vector3(center.x + Mathf.Cos(a1) * radiusPx,
+								center.y + Mathf.Sin(a1) * radiusPx));
+			}
+			Handles.color = prev;
+			Handles.EndGUI();
 		}
 
 		void DrawEdges(TetrahedralMeshAsset asset)
@@ -868,21 +916,31 @@ namespace XPBD.Editor
 		}
 
 		// ── Selection helpers ─────────────────────────────────────────────────
+		// 2D screen-space circle selection (Blender-style).
+		// Projects particles to GUI pixels; selects all within pixel radius.
+		// Culling still controls which particles are eligible to be selected.
 		void PaintAtMouse(TetrahedralMeshAsset asset, Event e, SceneView sv, SelectOp op)
 		{
-			Vector3 brushCenter = _brushCenterValid
-				? _lastBrushCenter
-				: EstimateBrushCenter(asset, HandleUtility.GUIPointToWorldRay(e.mousePosition));
-
 			RebuildOcclusionCache(asset, sv.camera);
+			Camera cam = sv.camera;
+			Vector2 mousePos = e.mousePosition;
+			float r2px = _brushSize * _brushSize;
+			bool hasInner = _isInterior != null && _isInterior.Length == asset.Particles.Length;
 
-			float r2 = _brushSize * _brushSize;
 			var hits = new List<int>();
 			for (int i = 0; i < asset.Particles.Length; i++)
 			{
-				if (_cullingMode != CullingMode.None && _occlusionCache[i])
+				// Never select interior particles — they are inside the mesh volume.
+				if (hasInner && _isInterior[i])
 					continue;
-				if ((asset.Particles[i].Position - brushCenter).sqrMagnitude <= r2)
+				// Camera-based culling still applies for surface particles.
+				if (_cullingMode != CullingMode.None && _occlusionCache != null && _occlusionCache[i])
+					continue;
+				Vector3 vp = cam.WorldToScreenPoint(asset.Particles[i].Position);
+				if (vp.z <= 0f)
+					continue;
+				Vector2 guiPt = new Vector2(vp.x, cam.pixelHeight - vp.y);
+				if ((guiPt - mousePos).sqrMagnitude <= r2px)
 					hits.Add(i);
 			}
 			ApplySelectOp(hits, op);
@@ -894,14 +952,16 @@ namespace XPBD.Editor
 			var rect = GUIRectFromPoints(_rectStart, e.mousePosition);
 			var cam = sv.camera;
 			RebuildOcclusionCache(asset, cam);
+			bool hasInner = _isInterior != null && _isInterior.Length == asset.Particles.Length;
 
 			var hits = new List<int>();
 			for (int i = 0; i < asset.Particles.Length; i++)
 			{
-				if (_cullingMode != CullingMode.None && _occlusionCache[i])
+				if (hasInner && _isInterior[i])
+					continue;   // skip interior particles
+				if (_cullingMode != CullingMode.None && _occlusionCache != null && _occlusionCache[i])
 					continue;
-				Vector3 wpos = asset.Particles[i].Position;
-				Vector3 screen = cam.WorldToScreenPoint(wpos);
+				Vector3 screen = cam.WorldToScreenPoint(asset.Particles[i].Position);
 				Vector2 gui = new Vector2(screen.x, cam.pixelHeight - screen.y);
 				if (screen.z > 0 && rect.Contains(gui))
 					hits.Add(i);
@@ -977,6 +1037,9 @@ namespace XPBD.Editor
 			{
 				TakeSnapshot((TetrahedralMeshAsset) target);
 				_dirty = false;
+				BuildInteriorCache((TetrahedralMeshAsset) target);
+				IsolateAssetInScene((TetrahedralMeshAsset) target);
+				Selection.selectionChanged += OnSelectionChanged;
 				SceneView.duringSceneGui += OnSceneGUI;
 				if (SceneView.lastActiveSceneView == null)
 					EditorWindow.GetWindow<SceneView>();
@@ -984,6 +1047,8 @@ namespace XPBD.Editor
 			}
 			else
 			{
+				RestoreSceneVisibility();
+				Selection.selectionChanged -= OnSelectionChanged;
 				SceneView.duringSceneGui -= OnSceneGUI;
 				_selected.Clear();
 				_rectDragging = false;
@@ -991,6 +1056,191 @@ namespace XPBD.Editor
 				SceneView.RepaintAll();
 			}
 			Repaint();
+		}
+
+		// Hide all renderers in the scene except those belonging to the asset being edited.
+		// Uses SceneVisibilityManager so no GameObject dirty state is modified.
+		void IsolateAssetInScene(TetrahedralMeshAsset asset)
+		{
+			// Find which GameObjects share the asset's RenderMesh — those are "ours".
+			var ownedGOs = new HashSet<GameObject>();
+			if (asset.RenderMesh != null)
+			{
+				foreach (var mf in Object.FindObjectsByType<MeshFilter>(FindObjectsSortMode.None))
+					if (mf.sharedMesh == asset.RenderMesh)
+						ownedGOs.Add(mf.gameObject);
+				foreach (var mr in Object.FindObjectsByType<SkinnedMeshRenderer>(FindObjectsSortMode.None))
+					if (mr.sharedMesh == asset.RenderMesh)
+						ownedGOs.Add(mr.gameObject);
+			}
+
+			// Collect every root GO in every loaded scene, hide those not in ownedGOs.
+			var toHide = new List<GameObject>();
+			for (int s = 0; s < UnityEngine.SceneManagement.SceneManager.sceneCount; s++)
+			{
+				var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(s);
+				if (!scene.isLoaded)
+					continue;
+				foreach (var root in scene.GetRootGameObjects())
+					CollectHideTargets(root, ownedGOs, toHide);
+			}
+
+			var svm = SceneVisibilityManager.instance;
+			foreach (var go in toHide)
+				svm.Hide(go, includeDescendants: true);
+			_hiddenObjects = toHide.ToArray();
+
+			// Inform the user that other objects are now hidden.
+			// This is a lightweight notification (no blocking choice) shown once per edit session.
+			//if (_hiddenObjects.Length > 0)
+			//	EditorUtility.DisplayDialog(
+			//		"Particle Editor — Isolated View",
+			//		$"{_hiddenObjects.Length} other scene object(s) are now hidden." +
+			//		"They will be restored automatically when you click Done." +
+			//		"If you deselect the asset without clicking Done, the editor will " +
+			//		"still restore visibility automatically.",
+			//		"OK");
+		}
+
+		// Recursively collect GOs to hide: hide any GO that is not an ancestor/descendant of owned ones.
+		static void CollectHideTargets(GameObject go, HashSet<GameObject> owned, List<GameObject> result)
+		{
+			if (owned.Contains(go))
+				return;   // this GO is the asset's mesh object — keep visible
+						  // Check if any owned GO is a descendant of this one (keep ancestors visible too)
+			bool isAncestor = false;
+			foreach (var o in owned)
+				if (o.transform.IsChildOf(go.transform))
+				{
+					isAncestor = true;
+					break;
+				}
+			if (isAncestor)
+				return;
+			result.Add(go);
+		}
+
+		// ── Static geometric interior test ─────────────────────────────────────
+		// A particle is "interior" if its minimum distance to any triangle of the
+		// RenderMesh surface is greater than a threshold.
+		//
+		// Why NOT ray-crossing: Unity sphere RenderMesh triangles are in local space
+		// and have outward normals. Surface particles sit exactly on the mesh shell.
+		// Floating-point places some of them a hair *inside* the shell, giving an odd
+		// crossing count (→ wrongly classified as interior). This is especially bad
+		// for back-hemisphere particles whose ray exits from behind.
+		//
+		// Why distance-to-surface works:
+		//   • Surface particles (placed by the tet generator ON the mesh) are within
+		//     a very small epsilon of a triangle. dist ≈ 0 → NOT interior.
+		//   • Interior tet particles are well inside the mesh shell. dist >> epsilon.
+		//   • Threshold is set relative to the mean edge length of the mesh so it
+		//     adapts to any mesh scale automatically.
+		//   • Camera-independent: purely geometric, never flickers on orbit.
+		void BuildInteriorCache(TetrahedralMeshAsset asset)
+		{
+			int n = asset?.Particles?.Length ?? 0;
+			if (n == _isInteriorN && asset.RenderMesh == _isInteriorMesh
+				&& _isInterior != null && _isInterior.Length == n)
+				return;
+
+			_isInteriorN = n;
+			_isInteriorMesh = asset.RenderMesh;
+			_isInterior = new bool[n];
+
+			if (asset.RenderMesh == null || n == 0)
+				return;
+
+			var verts = asset.RenderMesh.vertices;
+			var tris = asset.RenderMesh.triangles;
+
+			// Adaptive threshold: half the mean triangle edge length.
+			// For the sphere asset (r=1, ~2800 verts) this is roughly 0.05–0.08.
+			// Surface particles are within 1e-4 of the surface; interior ones are 0.1+.
+			double edgeSum = 0;
+			int edgeCount = 0;
+			for (int t = 0; t < tris.Length; t += 3)
+			{
+				edgeSum += (verts[tris[t + 1]] - verts[tris[t]]).magnitude;
+				edgeSum += (verts[tris[t + 2]] - verts[tris[t + 1]]).magnitude;
+				edgeSum += (verts[tris[t]] - verts[tris[t + 2]]).magnitude;
+				edgeCount += 3;
+			}
+			float threshold = edgeCount > 0 ? (float) (edgeSum / edgeCount) * 0.4f : 0.05f;
+
+			for (int i = 0; i < n; i++)
+			{
+				Vector3 p = asset.Particles[i].Position;
+				float min2 = float.MaxValue;
+
+				for (int t = 0; t < tris.Length; t += 3)
+				{
+					float d2 = PointTriangleDist2(p,
+						verts[tris[t]], verts[tris[t + 1]], verts[tris[t + 2]]);
+					if (d2 < min2)
+						min2 = d2;
+					// Early-out: already closer than threshold — definitely surface
+					if (min2 < 1e-6f)
+						break;
+				}
+
+				_isInterior[i] = min2 > threshold * threshold;
+			}
+		}
+
+		// Squared distance from point p to the closest point on triangle (a,b,c).
+		static float PointTriangleDist2(Vector3 p, Vector3 a, Vector3 b, Vector3 c)
+		{
+			Vector3 ab = b - a, ac = c - a, ap = p - a;
+			float d1 = Vector3.Dot(ab, ap), d2 = Vector3.Dot(ac, ap);
+			if (d1 <= 0f && d2 <= 0f)
+				return (p - a).sqrMagnitude;
+
+			Vector3 bp = p - b;
+			float d3 = Vector3.Dot(ab, bp), d4 = Vector3.Dot(ac, bp);
+			if (d3 >= 0f && d4 <= d3)
+				return (p - b).sqrMagnitude;
+
+			Vector3 cp = p - c;
+			float d5 = Vector3.Dot(ab, cp), d6 = Vector3.Dot(ac, cp);
+			if (d6 >= 0f && d5 <= d6)
+				return (p - c).sqrMagnitude;
+
+			float vc = d1 * d4 - d3 * d2;
+			if (vc <= 0f && d1 >= 0f && d3 <= 0f)
+			{
+				float v = d1 / (d1 - d3);
+				return (p - (a + v * ab)).sqrMagnitude;
+			}
+
+			float vb = d5 * d2 - d1 * d6;
+			if (vb <= 0f && d2 >= 0f && d6 <= 0f)
+			{
+				float w = d2 / (d2 - d6);
+				return (p - (a + w * ac)).sqrMagnitude;
+			}
+
+			float va = d3 * d6 - d5 * d4;
+			if (va <= 0f && (d4 - d3) >= 0f && (d5 - d6) >= 0f)
+			{
+				float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+				return (p - (b + w * (c - b))).sqrMagnitude;
+			}
+
+			float denom = 1f / (va + vb + vc);
+			float vv = vb * denom, ww = vc * denom;
+			return (p - (a + vv * ab + ww * ac)).sqrMagnitude;
+		}
+
+		void RestoreSceneVisibility()
+		{
+			if (_hiddenObjects == null || _hiddenObjects.Length == 0)
+				return;
+			var svm = SceneVisibilityManager.instance;
+			foreach (var go in _hiddenObjects)
+				if (go != null)
+					svm.Show(go, includeDescendants: true);
+			_hiddenObjects = null;
 		}
 
 		// Deep-copy the asset data for Discard
@@ -1088,7 +1338,39 @@ namespace XPBD.Editor
 
 		void OnDisable()
 		{
+			// OnDisable fires whenever this editor instance is destroyed:
+			// - user deselects the asset in the Project window
+			// - Inspector is closed / changed to another asset
+			// - script recompilation, play-mode entry, etc.
+			// Always restore the scene so no objects are left hidden.
+			RestoreSceneVisibility();
+			Selection.selectionChanged -= OnSelectionChanged;
 			SceneView.duringSceneGui -= OnSceneGUI;
+		}
+
+		// Called whenever the user changes the Editor selection.
+		// If we're still in edit mode but the asset has been deselected, exit cleanly.
+		void OnSelectionChanged()
+		{
+			if (!_editing)
+				return;
+			// Check whether our target is still the active selection
+			if (Selection.activeObject == target)
+				return;
+
+			// Asset was deselected while still in edit mode.
+			// Exit silently (no dialog — OnDisable will restore visibility).
+			// We do NOT call DoSave here: deselection mid-edit should not auto-save.
+			// The scene is restored; any unsaved particle edits are left in memory
+			// and will be present if the user re-selects the asset.
+			_editing = false;
+			RestoreSceneVisibility();
+			Selection.selectionChanged -= OnSelectionChanged;
+			SceneView.duringSceneGui -= OnSceneGUI;
+			_rectDragging = false;
+			SceneView.RepaintAll();
+			// Note: _dirty stays true so when the user re-selects, the * indicator
+			// still shows and they know there are unsaved changes.
 		}
 
 		// ── UI helper ─────────────────────────────────────────────────────────
