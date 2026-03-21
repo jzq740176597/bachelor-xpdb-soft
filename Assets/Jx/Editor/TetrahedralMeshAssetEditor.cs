@@ -25,12 +25,13 @@
 using System.Collections.Generic;
 using System.Linq;
 using UnityEditor;
+using UnityEditor.Callbacks;
 using UnityEngine;
 
-namespace XPBD
+namespace XPBD.Editor
 {
 	[CustomEditor(typeof(TetrahedralMeshAsset))]
-	public sealed class TetMeshAssetEditor : UnityEditor.Editor
+	public sealed class TetrahedralMeshAssetEditor : UnityEditor.Editor
 	{
 		// ── Edit-mode state ───────────────────────────────────────────────────
 		bool _editing;
@@ -1098,6 +1099,38 @@ namespace XPBD
 			EditorGUI.DrawRect(rect, new Color(0.18f, 0.18f, 0.18f, 1f));
 			EditorGUI.LabelField(rect, title, EditorStyles.boldLabel);
 			EditorGUILayout.Space(2);
+		}
+		// [3/21/2026 jzq]
+		[OnOpenAsset]
+		public static bool OnOpenAsset(int instanceID, int line)
+		{
+			// 1. Get the object from the ID
+			Object obj = EditorUtility.InstanceIDToObject(instanceID);
+
+			if (obj is TetrahedralMeshAsset myAsset)
+			{
+				// 1. Ensure it's selected (this forces the Inspector to load the editor)
+				Selection.activeObject = myAsset;
+
+				// 2. Find the existing Inspector window
+				var allEditors = Resources.FindObjectsOfTypeAll<UnityEditor.Editor>();
+
+				foreach (var editor in allEditors)
+				{
+					// 3. Check if this editor is the one drawing our asset
+					if (editor is TetrahedralMeshAssetEditor myEditor && editor.target == myAsset)
+					{
+						if (!myEditor._editing)
+							myEditor.SetEditing(true);
+						return true;
+					}
+				}
+
+				// Fallback: If for some reason the Inspector isn't open yet
+				//Debug.LogWarning("Inspector not found, using logic-only trigger.");
+				return true;
+			}
+			return false;
 		}
 	}
 }

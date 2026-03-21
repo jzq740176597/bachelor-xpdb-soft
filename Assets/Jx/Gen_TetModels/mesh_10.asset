@@ -24320,3 +24320,4 @@ MonoBehaviour:
   - Weights: {x: 0.51485646, y: 0.1730483, z: 0.40900686}
     TetIndex: 84
   RenderMesh: {fileID: -2432090755550338912, guid: dcf620f790ec398458f52e8eeb0cac32, type: 3}
+  Groups: []
