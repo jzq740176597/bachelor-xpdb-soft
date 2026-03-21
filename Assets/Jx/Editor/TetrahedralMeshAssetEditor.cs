@@ -37,6 +37,9 @@ namespace XPBD.Editor
 		bool _editing;
 		// Scene isolation: GameObjects hidden on edit-enter, restored on exit.
 		GameObject[] _hiddenObjects;
+		// Fixed EditorPrefs key: written when isolation begins, cleared when restored.
+		// A single global key is sufficient — only one asset can be isolated at a time.
+		const string IsolationKey = "XPBD_WasIsolating";
 
 		// Selection
 		enum SelectMode
@@ -196,8 +199,8 @@ namespace XPBD.Editor
 
 			string selInfo = selCount == 0
 				? "Drag: new.  Shift+drag: append (teal).  Ctrl+drag: subtract (red)."
-				: $"{selCount} / {visCount} visible selected  ({totCount} total)"
-				+ "Shift=append  Ctrl=subtract  (circle & rect modes)";
+				: $"{selCount} / {visCount} visible selected  ({totCount} total)\n"
+				  + "Shift=append  Ctrl=subtract  (circle & rect modes)";
 			EditorGUILayout.HelpBox(selInfo, MessageType.None);
 
 			// Mode toolbar
@@ -1089,17 +1092,11 @@ namespace XPBD.Editor
 			foreach (var go in toHide)
 				svm.Hide(go, includeDescendants: true);
 			_hiddenObjects = toHide.ToArray();
+			// Write simple sentinel so [InitializeOnLoad] restorer finds it on next launch.
+			// A plain fixed key avoids any AssetDatabase/GUID lookup at startup time.
+			EditorPrefs.SetInt(IsolationKey, 1);
 
-			// Inform the user that other objects are now hidden.
-			// This is a lightweight notification (no blocking choice) shown once per edit session.
-			//if (_hiddenObjects.Length > 0)
-			//	EditorUtility.DisplayDialog(
-			//		"Particle Editor — Isolated View",
-			//		$"{_hiddenObjects.Length} other scene object(s) are now hidden." +
-			//		"They will be restored automatically when you click Done." +
-			//		"If you deselect the asset without clicking Done, the editor will " +
-			//		"still restore visibility automatically.",
-			//		"OK");
+			// Isolation is silent — no dialog. Scene restores automatically on Done/deselect/restart.
 		}
 
 		// Recursively collect GOs to hide: hide any GO that is not an ancestor/descendant of owned ones.
@@ -1234,6 +1231,11 @@ namespace XPBD.Editor
 
 		void RestoreSceneVisibility()
 		{
+			// DO NOT delete IsolationKey here.
+			// The key must survive Unity quit so the [InitializeOnLoad] restorer
+			// can call ShowAll() on next launch if Unity was closed mid-isolation.
+			// RestoreIfNeeded() is the sole place that deletes the key.
+			// This is idempotent: ShowAll() on an already-visible scene is harmless.
 			if (_hiddenObjects == null || _hiddenObjects.Length == 0)
 				return;
 			var svm = SceneVisibilityManager.instance;
@@ -1413,6 +1415,34 @@ namespace XPBD.Editor
 				return true;
 			}
 			return false;
+		}
+	}
+
+	// [InitializeOnLoad]: static constructor runs on every Unity startup and script
+	// recompile, before any Inspector or user interaction. This is the only hook
+	// that fires unconditionally after a restart without requiring asset selection.
+	//
+	// If Unity quit while objects were isolated (user closed without Done),
+	// SceneVisibilityManager keeps them hidden on disk. The fixed EditorPrefs key
+	// "XPBD_WasIsolating" written by IsolateAssetInScene tells us to restore.
+	[InitializeOnLoad]
+	static class XpbdIsolationStartupRestorer
+	{
+		const string Key = "XPBD_WasIsolating";
+
+		static XpbdIsolationStartupRestorer()
+		{
+			// Defer one frame so SceneVisibilityManager is fully initialised.
+			EditorApplication.delayCall += RestoreIfNeeded;
+		}
+
+		static void RestoreIfNeeded()
+		{
+			if (!EditorPrefs.HasKey(Key))
+				return;
+			EditorPrefs.DeleteKey(Key);
+			SceneVisibilityManager.instance.ShowAll();
+			Debug.Log("[XPBD] Scene visibility restored on startup (previous session not closed cleanly).");
 		}
 	}
 }
