@@ -170,6 +170,13 @@ namespace XPBD
 			// Required for soft-soft: both bodies must be at the same substep
 			// position when detect runs. Also preserves the floor fix — for each
 			// body, Postsolve always completes before its collision runs.
+			// Snapshot every collider's start-of-frame position once before all substeps.
+			// This lets RefreshDescriptorAtFraction interpolate the swept position
+			// correctly at each substep fraction without drifting.
+			if (hasRigid)
+				foreach (var col in _colliders)
+					col.SnapshotStartOfFrame();
+
 			for (int s = 0; s < SubSteps; s++)
 			{
 				foreach (var body in _bodies)
@@ -181,6 +188,20 @@ namespace XPBD
 					// the current deformed shape. Used by broad-phase in Phase 2.
 					if (hasSoftSoft)
 						DispatchComputeBounds(body);
+				}
+
+				if (hasRigid)
+				{
+					// Advance each collider to its swept position at this substep fraction.
+					// t = (s+1)/SubSteps so the last substep lands exactly at the final position.
+					float t = (s + 1f) / SubSteps;
+					uint dynSlot = 0;
+					foreach (var col in _colliders)
+					{
+						uint slot = col.Type == XpbdColliderSource.ColType.Dynamic ? dynSlot++ : 0u;
+						col.RefreshDescriptorAtFraction(t, _subDT, slot);
+					}
+					UploadShapesForSubstep();
 				}
 
 				_softSoftDetectedThisStep.Clear();
@@ -416,7 +437,7 @@ namespace XPBD
 			var cs = CollisionShapesCS;
 			cs.SetInt("_ShapeCount", _shapeCount);
 			cs.SetInt("_DynSlotCount", _dynSlotCount);
-			cs.SetFloat("_ColDeltaTime", _fixedDT);
+			cs.SetFloat("_ColDeltaTime", _subDT);   // per-substep dt for correct impulse scaling
 		}
 
 		void ReleaseCollisionBuffers()
@@ -442,6 +463,34 @@ namespace XPBD
 			CollisionShapesCS.Dispatch(_kClearImpulse, Ceil(_dynSlotCount), 1, 1);
 		}
 
+		// Re-upload just the shapes and velocity buffers after per-substep interpolation.
+		// Does NOT reallocate buffers — only SetData on existing ones.
+		void UploadShapesForSubstep()
+		{
+			if (_shapesBuffer == null)
+				return;
+			int count = _colliders.Count;
+			for (int i = 0; i < count; i++)
+				_cpuShapes[i] = _colliders[i].Descriptor;
+			for (int i = 0; i < count; i++)
+				_cpuVels[i] = _colliders[i].SurfaceVelocity;
+			_shapesBuffer.SetData(_cpuShapes, 0, 0, count);
+			_shapeVelBuffer.SetData(_cpuVels, 0, 0, count);
+			// Re-upload face planes for any convex shapes that moved
+			int fpIdx = 0;
+			for (int i = 0; i < count; i++)
+			{
+				var col = _colliders[i];
+				if (col.Shape == XpbdColliderSource.ShapeType.Convex && col.FacePlanes != null)
+				{
+					Array.Copy(col.FacePlanes, 0, _cpuFacePlanes, fpIdx, col.FacePlanes.Length);
+					fpIdx += col.FacePlanes.Length;
+				}
+			}
+			if (_totalFacePlanes > 0)
+				_meshFacePlanesBuffer.SetData(_cpuFacePlanes, 0, 0, _totalFacePlanes);
+		}
+
 		void DispatchDetectShapes(SoftBodyGPUState body)
 		{
 			var cs = CollisionShapesCS;
@@ -460,7 +509,7 @@ namespace XPBD
 		void DispatchShapesSolve(SoftBodyGPUState body)
 		{
 			var cs = CollisionShapesCS;
-			cs.SetFloat("_ColDeltaTime", _fixedDT);
+			cs.SetFloat("_ColDeltaTime", _subDT);   // per-substep dt for correct impulse scaling
 			cs.SetInt("_ParticleCount", body.ParticleCount);
 			cs.SetBuffer(_kShapesSolve, "_ImpulseBytes", _impulseBuffer);
 			cs.SetBuffer(_kShapesSolve, "_Particles", body.ParticleBuffer);

@@ -99,6 +99,10 @@ namespace XPBD
 		Collider _col;
 		Vector3 _prevPos;
 		Quaternion _prevRot;
+		// Per-frame start state — captured once before the substep loop so each
+		// substep can interpolate the collider to its swept intermediate position.
+		Vector3 _frameStartPos;
+		Quaternion _frameStartRot;
 		// Local-space planes for convex mesh (computed once in Awake).
 		Vector4[] _localPlanes;
 		// Dirty-tracking for Static convex — re-transform only when moved.
@@ -186,6 +190,62 @@ namespace XPBD
 		void OnDisable() => SoftBodySimulationManager.Instance?.UnregisterCollider(this);
 
 		// ─────────────────────────────────────────────────────────────────────
+		// Called ONCE per fixed frame, BEFORE the substep loop.
+		// Captures the collider's start-of-frame world position/rotation so
+		// RefreshDescriptorAtFraction can interpolate towards the end position.
+		// ─────────────────────────────────────────────────────────────────────
+		public void SnapshotStartOfFrame()
+		{
+			_frameStartPos = _prevPos;   // _prevPos was set at the END of the last frame
+			_frameStartRot = _prevRot;
+		}
+
+		// ─────────────────────────────────────────────────────────────────────
+		// Called once per substep (t = substep index / SubSteps, range [0..1)).
+		// Interpolates sphere/capsule/OBB centre between start-of-frame and the
+		// current transform position, so the GPU sees the swept intermediate
+		// position rather than only the end-of-frame position.
+		// Surface velocity is recomputed as displacement / subDT so the GPU
+		// inherits the correct per-substep velocity from the contact correction.
+		// ─────────────────────────────────────────────────────────────────────
+		public void RefreshDescriptorAtFraction(float t, float subDT, uint dynSlot)
+		{
+			// Interpolated world position/rotation at this substep fraction
+			Vector3 lerpPos = Vector3.Lerp(_frameStartPos, transform.position, t);
+			Quaternion lerpRot = Quaternion.Slerp(_frameStartRot, transform.rotation, t);
+
+			// Surface velocity at substep granularity:
+			// displacement from previous substep position to this substep position.
+			// For kinematic bodies this correctly scales with subDT.
+			SurfaceVelocity =
+				Type == ColType.Dynamic && Body ? Body.velocity :
+				Type == ColType.Kinematic
+					? (lerpPos - _prevPos) / Mathf.Max(subDT, 1e-6f)
+					: Vector3.zero;
+
+			_prevPos = lerpPos;
+			_prevRot = lerpRot;
+
+			// Convex face planes: only re-transform if the collider actually moved.
+			if (Shape == ShapeType.Convex)
+			{
+				bool moved = (lerpPos - _cachedConvexPos).sqrMagnitude > 1e-8f
+						  || Mathf.Abs(Quaternion.Dot(lerpRot, _cachedConvexRot)) < 1f - 1e-6f;
+				if (moved || FacePlanes == null)
+				{
+					var mtx = Matrix4x4.TRS(lerpPos, lerpRot, transform.lossyScale);
+					FacePlanes = TransformPlanes(_localPlanes, mtx);
+					_cachedConvexPos = lerpPos;
+					_cachedConvexRot = lerpRot;
+				}
+			}
+
+			float rbInvMass = Type == ColType.Dynamic && Body && Body.mass > 0f
+							? 1f / Body.mass : 0f;
+			Descriptor = BuildDescriptorAtTransform(lerpPos, lerpRot, (uint) Type, dynSlot, rbInvMass);
+		}
+
+		// ─────────────────────────────────────────────────────────────────────
 		// Called by manager each fixed step. Updates surface velocity and
 		// rebuilds the ShapeDescriptorCPU from current Unity transform state.
 		// ─────────────────────────────────────────────────────────────────────
@@ -220,6 +280,52 @@ namespace XPBD
 							? 1f / Body.mass : 0f;
 
 			Descriptor = BuildDescriptor((uint) Shape, (uint) Type, dynSlot, rbInvMass);
+		}
+
+		// ─────────────────────────────────────────────────────────────────────
+		// Build descriptor using an explicit interpolated position/rotation.
+		// Used by RefreshDescriptorAtFraction for per-substep sweep.
+		ShapeDescriptorCPU BuildDescriptorAtTransform(Vector3 pos, Quaternion rot,
+											uint colType, uint dynSlot, float rbInvMass)
+		{
+			var d = new ShapeDescriptorCPU
+			{
+				shapeType = (uint) Shape,
+				colType = colType,
+				dynSlot = dynSlot,
+				rbInvMass = rbInvMass,
+			};
+			switch (_col)
+			{
+				case SphereCollider sc:
+					d.centre = pos + rot * (Vector3.Scale(sc.center, transform.lossyScale));
+					d.param0 = sc.radius * MaxScale();
+					break;
+				case BoxCollider bc:
+					{
+						var hs = Vector3.Scale(bc.size * 0.5f, transform.lossyScale);
+						d.centre = pos + rot * (Vector3.Scale(bc.center, transform.lossyScale));
+						d.axis = rot * Vector3.right;
+						d.param0 = Mathf.Abs(hs.x);
+						d.axis2 = rot * Vector3.up;
+						float hy = Mathf.Abs(hs.y);
+						d.param1 = (EnableCCD && hy < OBB_CCD_THRESHOLD) ? -hy : hy;
+						d.param2 = Mathf.Abs(hs.z);
+						break;
+					}
+				case CapsuleCollider cc:
+					{
+						var axScl = transform.lossyScale.y;
+						d.centre = pos + rot * (Vector3.Scale(cc.center, transform.lossyScale));
+						d.axis = rot * Vector3.up;
+						d.param0 = cc.radius * MaxScale();
+						d.param1 = Mathf.Max(0f, cc.height * 0.5f * axScl - d.param0);
+						break;
+					}
+				default: // Convex — centre irrelevant for GPU, AABB stored in axis/axis2
+					break;
+			}
+			return d;
 		}
 
 		// ─────────────────────────────────────────────────────────────────────

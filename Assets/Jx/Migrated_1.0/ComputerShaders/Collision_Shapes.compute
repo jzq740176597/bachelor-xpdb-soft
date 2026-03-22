@@ -133,21 +133,6 @@ void ClearImpulseAccum(uint3 id : SV_DispatchThreadID)
 	_ImpulseBytes.Store(b + 24, 0u); _ImpulseBytes.Store(b + 28, 0u);
 }
 
-// ── Analytic tests ────────────────────────────────────────────────────────────
-
-bool TestSphere(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
-{
-	cp = 0; n = float3(0,1,0);
-	float3 d  = p - s.centre;
-	float  r  = s.param0;
-	float  d2 = dot(d, d);
-	if (d2 >= r * r) return false;
-	float dist = sqrt(d2);
-	n  = dist > EPSILON ? d / dist : float3(0,1,0);
-	cp = s.centre + n * r;
-	return true;
-}
-
 // ── OBB collision — speculative signed-distance (Unity/PhysX model) ────────────
 //
 // WHY NOT SWEEP (CCD segment-vs-face):
@@ -175,6 +160,11 @@ bool TestSphere(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 //   Value 0.02 (2cm) matches Unity's default Physics.defaultContactOffset = 0.01
 //   but doubled for soft-body particles which are larger than rigid colliders.
 #define OBB_CONTACT_OFFSET 0.02
+// Speculative contact skin for sphere and capsule — mirrors OBB_CONTACT_OFFSET.
+// Particles within this distance of the surface generate a contact and are
+// corrected back to the surface, preventing tunneling at high relative speeds.
+// Sized to cover ~1 substep of a fast drag (0.05 = 5 cm/substep @ 1 m/s, 20 substeps).
+#define SPHERE_CONTACT_SKIN 0.04
 
 // TestOBB: routes between two modes encoded in param1 sign bit.
 //
@@ -192,6 +182,25 @@ bool TestSphere(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 //   Correct: only reject particles ABOVE the skin (ly >= OBB_CONTACT_OFFSET).
 //   Particles below the floor are ALWAYS in contact — push them up regardless of depth.
 //
+
+// ── Analytic tests ────────────────────────────────────────────────────────────
+bool TestSphere(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
+{
+	cp = 0; n = float3(0,1,0);
+	float3 d  = p - s.centre;
+	float  r  = s.param0;
+	float  d2 = dot(d, d);
+	// Detect within radius + skin so fast-moving spheres catch particles
+	// before full penetration (speculative contact, mirrors OBB half-space logic).
+	float rSkin = r + SPHERE_CONTACT_SKIN;
+	if (d2 >= rSkin * rSkin) return false;
+	float dist = sqrt(d2);
+	n  = dist > EPSILON ? d / dist : float3(0,1,0);
+	// Contact point is on the REAL surface (radius, not radius+skin),
+	// so SolveCollisions pushes back to the actual sphere surface.
+	cp = s.centre + n * r;
+	return true;
+}
 // ── Interior mode  (param1 >= 0, thick box) ───────────────────────────────────
 //   Standard XPBD point-in-box test; unchanged.
 bool TestOBB(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
@@ -249,10 +258,11 @@ bool TestCapsule(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 	float3 cl = a + ab * t;
 	float3 d  = p - cl;
 	float  d2 = dot(d, d);
-	if (d2 >= r * r) return false;
+	float rSkin = r + SPHERE_CONTACT_SKIN;
+	if (d2 >= rSkin * rSkin) return false;
 	float dist = sqrt(d2);
 	n  = dist > EPSILON ? d / dist : float3(0,1,0);
-	cp = cl + n * r;
+	cp = cl + n * r;   // contact on real surface, not skin
 	return true;
 }
 
@@ -337,8 +347,6 @@ void DetectShapes(uint3 id : SV_DispatchThreadID)
 }
 
 // ── Kernel: SolveCollisions ───────────────────────────────────────────────────
-// Mass-weighted position correction + velocity response.
-// Dynamic: accumulates Newton-3rd impulse into _ImpulseBytes.
 
 [numthreads(GROUP_SIZE, 1, 1)]
 void SolveCollisions(uint3 id : SV_DispatchThreadID)
@@ -373,7 +381,6 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 	if (pen >= 0.0) return;
 
 	float3 corr = -nrm * pen;
-	// Mass-weighted correction split
 	float  pInv = _Particles[c.pIdx].invMass;
 	float  cInv = c.rbInvMass;
 	float  wTot = pInv + cInv;
