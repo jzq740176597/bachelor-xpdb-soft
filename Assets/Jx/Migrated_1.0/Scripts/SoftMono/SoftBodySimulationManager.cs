@@ -64,6 +64,17 @@ namespace XPBD
 		[Range(0f, 1f)] public float EdgeCompliance = 0.01f;
 		[Range(0f, 1f)] public float VolumeCompliance = 0.0f;
 
+		[Header("Contact Skin")]
+		[Tooltip("Minimum contact skin width in metres. Default 0.005 (5 mm). " +
+				 "Auto-skin can go no smaller than this.")]
+		public float ContactSkinMin = 0.005f;
+		[Tooltip("Maximum contact skin width in metres. Default 0.10 (10 cm). " +
+				 "Auto-skin can grow no larger than this.")]
+		public float ContactSkinMax = 0.10f;
+		[Tooltip("Skin = clamp(softBodyMaxExtent * this fraction, Min, Max). " +
+				 "0.25 works well for most body sizes.")]
+		[Range(0.05f, 0.5f)] public float ContactSkinFraction = 0.25f;
+
 		// ── Inspector: Soft-Soft Collision ────────────────────────────────────
 		[Header("Soft-Soft Collision")]
 		[Tooltip("Multiplier for the auto-computed contact radius (default 1.5). " +
@@ -116,6 +127,9 @@ namespace XPBD
 		readonly int[] _boundsReadback = new int[8]; // scratch, reused every substep
 
 		float _timeAccum, _fixedDT, _subDT;
+		// Unified contact skin — set each frame from the bodies' bounding extents.
+		// GPU uniform _ContactSkin; replaces the old per-shape #define constants.
+		float _contactSkin = 0.04f;
 
 		// ─────────────────────────────────────────────────────────────────────
 		void Awake()
@@ -165,6 +179,8 @@ namespace XPBD
 				{
 					col.SnapshotStartOfFrame();
 				}
+				// Recompute adaptive contact skin from the largest registered body.
+				UpdateContactSkin();
 				RebuildCollisionBuffers(_fixedDT);
 				if (_dynSlotCount > 0)
 					DispatchClearImpulse();
@@ -439,7 +455,35 @@ namespace XPBD
 			var cs = CollisionShapesCS;
 			cs.SetInt("_ShapeCount", _shapeCount);
 			cs.SetInt("_DynSlotCount", _dynSlotCount);
-			cs.SetFloat("_ColDeltaTime", _subDT);   // per-substep dt for correct impulse scaling
+			cs.SetFloat("_ColDeltaTime", _subDT);
+			cs.SetFloat("_ContactSkin", _contactSkin);
+		}
+
+		// Recompute the adaptive contact skin each frame.
+		// Uses the largest bounding radius among all registered soft bodies,
+		// scaled by ContactSkinFraction and clamped to [ContactSkinMin, ContactSkinMax].
+		// This ensures a 1 cm soft body gets a small skin and a 1 m body gets a
+		// proportionally larger one, without manual tuning.
+		void UpdateContactSkin()
+		{
+			float maxExtent = 0f;
+			foreach (var body in _bodies)
+			{
+				if (body != null && body.State != null)
+				{
+					maxExtent = Mathf.Max(maxExtent, body.BoundingRadius);
+				}
+			}
+			if (maxExtent < 1e-4f)
+			{
+				// No bodies yet or all degenerate — use minimum.
+				_contactSkin = ContactSkinMin;
+				return;
+			}
+			_contactSkin = Mathf.Clamp(
+				maxExtent * ContactSkinFraction,
+				ContactSkinMin,
+				ContactSkinMax);
 		}
 
 		void ReleaseCollisionBuffers()
@@ -512,6 +556,7 @@ namespace XPBD
 		{
 			var cs = CollisionShapesCS;
 			cs.SetFloat("_ColDeltaTime", _subDT);   // per-substep dt for correct impulse scaling
+			cs.SetFloat("_ContactSkin",  _contactSkin);
 			cs.SetInt("_ParticleCount", body.ParticleCount);
 			cs.SetBuffer(_kShapesSolve, "_ImpulseBytes", _impulseBuffer);
 			cs.SetBuffer(_kShapesSolve, "_Particles", body.ParticleBuffer);

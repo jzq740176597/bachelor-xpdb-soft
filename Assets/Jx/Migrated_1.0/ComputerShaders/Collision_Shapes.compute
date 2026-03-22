@@ -27,8 +27,12 @@
 //             param0=asuint(faceOffset), param1=asuint(faceCount),
 //             axis=worldAABB_centre, axis2=worldAABB_halfExtents,
 //             param2 unused
-//   AABB reject runs before face-plane test to prevent "infinite plane" on
-//   degenerate meshes (flat quads, single-sided surfaces).
+//
+// Contact skin:
+//   A single _ContactSkin uniform replaces all per-shape skin constants.
+//   Set from CPU each frame as: clamp(softBodyMaxExtent * 0.25, 0.005, 0.10)
+//   This makes the skin automatically scale with the soft body size so that
+//   a 1cm body and a 1m body both get appropriate detection margins.
 //
 // _MeshFacePlanes : float4[] — world-space face planes for ALL convex meshes
 //   packed flat; plane = float4(normal.xyz, d)
@@ -92,6 +96,11 @@ uint  _ShapeCount;
 uint  _ParticleCount;
 uint  _DynSlotCount;
 
+// Unified contact skin width — set from CPU each frame.
+// Scales with soft-body size: clamp(maxExtent * 0.25, 0.005, 0.10).
+// Applied to ALL shape types (sphere, capsule, OBB) for consistent behaviour.
+float _ContactSkin;
+
 // ── Buffers ───────────────────────────────────────────────────────────────────
 
 StructuredBuffer<ShapeDescriptor> _Shapes;
@@ -111,11 +120,15 @@ void AtomicAddF(uint addr, float v)
 	uint prev = _ImpulseBytes.Load(addr);
 	uint next;
 	[allow_uav_condition]
-	do {
+	do
+	{
 		next = asuint(asfloat(prev) + v);
 		uint orig;
 		_ImpulseBytes.InterlockedCompareExchange(addr, prev, next, orig);
-		if (orig == prev) break;
+		if (orig == prev)
+		{
+			break;
+		}
 		prev = orig;
 	} while (true);
 }
@@ -131,6 +144,38 @@ void ClearImpulseAccum(uint3 id : SV_DispatchThreadID)
 	_ImpulseBytes.Store(b +  8, 0u); _ImpulseBytes.Store(b + 12, 0u);
 	_ImpulseBytes.Store(b + 16, 0u); _ImpulseBytes.Store(b + 20, 0u);
 	_ImpulseBytes.Store(b + 24, 0u); _ImpulseBytes.Store(b + 28, 0u);
+}
+
+// ── Analytic tests ────────────────────────────────────────────────────────────
+//
+// All tests expand detection by _ContactSkin:
+//   detect radius = real radius + _ContactSkin
+//   contact point = real surface (NOT skin surface)
+//
+// This means SolveCollisions receives constraints for particles that are
+// within _ContactSkin of the surface, even before full penetration.
+// SolveCollisions handles both cases:
+//   pen < 0  → full positional + velocity correction
+//   pen >= 0 → positional correction to surface + velocity correction
+//              (particle is in skin zone — push it out to surface NOW,
+//               don't wait for next-substep penetration)
+
+bool TestSphere(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
+{
+	cp = 0;
+	n  = float3(0, 1, 0);
+	float3 d    = p - s.centre;
+	float  r    = s.param0;
+	float  d2   = dot(d, d);
+	float  rDet = r + _ContactSkin;
+	if (d2 >= rDet * rDet)
+	{
+		return false;
+	}
+	float dist = sqrt(d2);
+	n  = dist > EPSILON ? d / dist : float3(0, 1, 0);
+	cp = s.centre + n * r;   // contact point on REAL surface, not skin edge
+	return true;
 }
 
 // ── OBB collision — speculative signed-distance (Unity/PhysX model) ────────────
@@ -149,63 +194,17 @@ void ClearImpulseAccum(uint3 id : SV_DispatchThreadID)
 //   This is what Unity's speculative CCD and PhysX's contact generation do:
 //   they look at WHERE the point IS, not how it got there.
 //
-// CONTACT OFFSET (skin width):
+// _ContactSkin (skin width, replaces old OBB_CONTACT_OFFSET):
 //   param1 stores hy:
 //     param1 >= 0 → interior mode, hy = param1 (thick box, normal 3D test)
 //     param1 <  0 → speculative mode, hy = -param1 (thin/flat box)
-//   In speculative mode a CONTACT_OFFSET is added to hy so that a zero-thickness
-//   floor (hy=1e-4) gets an effective half-extent of (1e-4 + CONTACT_OFFSET).
-//   Any particle within CONTACT_OFFSET of the surface generates a contact.
-//   This is exactly Unity's "contact offset" / PhysX's skin width.
-//   Value 0.02 (2cm) matches Unity's default Physics.defaultContactOffset = 0.01
-//   but doubled for soft-body particles which are larger than rigid colliders.
-#define OBB_CONTACT_OFFSET 0.02
-// Speculative contact skin for sphere and capsule — mirrors OBB_CONTACT_OFFSET.
-// Particles within this distance of the surface generate a contact and are
-// corrected back to the surface, preventing tunneling at high relative speeds.
-// Sized to cover ~1 substep of a fast drag (0.05 = 5 cm/substep @ 1 m/s, 20 substeps).
-#define SPHERE_CONTACT_SKIN 0.04
-
-// TestOBB: routes between two modes encoded in param1 sign bit.
-//
-// ── Speculative / Half-space mode  (param1 < 0, thin/flat box) ────────────────
-//   Mirrors Unity Speculative CCD and PhysX contact generation:
-//     "Test where the predicted point IS, not how it got there."
-//   The floor is modelled as a ONE-SIDED HALF-SPACE:
-//     contact iff  dot(ay, p - centre)  <  OBB_CONTACT_OFFSET
-//     AND the particle is within the lateral (X, Z) footprint of the box.
-//   Contact normal is always +ay (outward from top face).
-//
-//   TWO-SIDED reject (abs(ly) >= hy) was the previous bug:
-//     A particle at ly = -0.05 (5 cm below floor) has abs(-0.05)=0.05 > offset=0.02
-//     → old code returned no-contact → particle passed through.
-//   Correct: only reject particles ABOVE the skin (ly >= OBB_CONTACT_OFFSET).
-//   Particles below the floor are ALWAYS in contact — push them up regardless of depth.
-//
-
-// ── Analytic tests ────────────────────────────────────────────────────────────
-bool TestSphere(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
-{
-	cp = 0; n = float3(0,1,0);
-	float3 d  = p - s.centre;
-	float  r  = s.param0;
-	float  d2 = dot(d, d);
-	// Detect within radius + skin so fast-moving spheres catch particles
-	// before full penetration (speculative contact, mirrors OBB half-space logic).
-	float rSkin = r + SPHERE_CONTACT_SKIN;
-	if (d2 >= rSkin * rSkin) return false;
-	float dist = sqrt(d2);
-	n  = dist > EPSILON ? d / dist : float3(0,1,0);
-	// Contact point is on the REAL surface (radius, not radius+skin),
-	// so SolveCollisions pushes back to the actual sphere surface.
-	cp = s.centre + n * r;
-	return true;
-}
-// ── Interior mode  (param1 >= 0, thick box) ───────────────────────────────────
-//   Standard XPBD point-in-box test; unchanged.
+//   In speculative mode _ContactSkin is added to hy so that a zero-thickness
+//   floor (hy≈0) gets an effective half-extent of (hy + _ContactSkin).
+//   Any particle within _ContactSkin of the surface generates a contact.
 bool TestOBB(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 {
-	cp = 0; n = float3(0,1,0);
+	cp = 0;
+	n  = float3(0, 1, 0);
 	float3 d  = p - s.centre;
 	float3 ax = s.axis, ay = s.axis2, az = cross(ax, ay);
 	float  lx = dot(d, ax), ly = dot(d, ay), lz = dot(d, az);
@@ -214,74 +213,77 @@ bool TestOBB(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 
 	if (speculative)
 	{
-		// ── Lateral bounds: raw footprint only (no skin expansion laterally) ──
-		float hx = s.param0;
-		float hz = s.param2;
+		float hx   = s.param0;
+		float hz   = s.param2;
+		float skin = _ContactSkin;
 		if (abs(lx) >= hx) return false;
 		if (abs(lz) >= hz) return false;
+		if (ly >= skin)    return false;   // above skin → no contact
 
-		// ── One-sided half-space test along floor normal (ay) ─────────────────
-		// Only reject if particle is ABOVE the contact skin.
-		// Particles at or below the skin surface (including far below) always
-		// generate a contact — the floor is an infinite half-space downward.
-		if (ly >= OBB_CONTACT_OFFSET) return false;   // above skin → no contact
-
-		// Contact: push to the geometric top-face surface.
-		// raw_hy = abs(param1): geometric half-thickness.
-		//   For Size.y=0 floor: param1 = -0.0f, abs(-0.0f) = 0.0f → cp.y = centre.y + 0 = 0.
-		//   Particle rests exactly at the floor's visual surface. ✓
-		// We use abs() not negation so that -0.0f gives 0.0f (not -0.0f).
-		float raw_hy = abs(s.param1);   // geometric half-thickness (0 for flat floor)
+		float raw_hy = abs(s.param1);
 		cp = s.centre + ay * raw_hy + ax * lx + az * lz;
 		n  = ay;
 		return true;
 	}
 
-	// ── Interior (thick box) ───────────────────────────────────────────────────
+	// ── Interior (thick box) ──────────────────────────────────────────────────
 	float hx = s.param0, hy = s.param1, hz = s.param2;
 	if (abs(lx) >= hx || abs(ly) >= hy || abs(lz) >= hz) return false;
 	float px = hx - abs(lx), py = hy - abs(ly), pz = hz - abs(lz);
-	if      (px <= py && px <= pz) { n = ax*sign(lx); cp = s.centre + ax*(hx*sign(lx)) + ay*ly          + az*lz; }
-	else if (py <= pz)             { n = ay*sign(ly); cp = s.centre + ax*lx             + ay*(hy*sign(ly)) + az*lz; }
-	else                           { n = az*sign(lz); cp = s.centre + ax*lx             + ay*ly            + az*(hz*sign(lz)); }
+	if (px <= py && px <= pz)
+	{
+		n  = ax * sign(lx);
+		cp = s.centre + ax * (hx * sign(lx)) + ay * ly + az * lz;
+	}
+	else if (py <= pz)
+	{
+		n  = ay * sign(ly);
+		cp = s.centre + ax * lx + ay * (hy * sign(ly)) + az * lz;
+	}
+	else
+	{
+		n  = az * sign(lz);
+		cp = s.centre + ax * lx + ay * ly + az * (hz * sign(lz));
+	}
 	return true;
 }
 
 bool TestCapsule(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 {
-	cp = 0; n = float3(0,1,0);
+	cp = 0;
+	n  = float3(0, 1, 0);
 	float3 a  = s.centre - s.axis * s.param1;
 	float3 b  = s.centre + s.axis * s.param1;
 	float3 ab = b - a;
 	float  r  = s.param0;
 	float  t  = saturate(dot(p - a, ab) / max(dot(ab, ab), EPSILON));
 	float3 cl = a + ab * t;
-	float3 d  = p - cl;
-	float  d2 = dot(d, d);
-	float rSkin = r + SPHERE_CONTACT_SKIN;
-	if (d2 >= rSkin * rSkin) return false;
+	float3 dv = p - cl;
+	float  d2 = dot(dv, dv);
+	float  rDet = r + _ContactSkin;
+	if (d2 >= rDet * rDet)
+	{
+		return false;
+	}
 	float dist = sqrt(d2);
-	n  = dist > EPSILON ? d / dist : float3(0,1,0);
-	cp = cl + n * r;   // contact on real surface, not skin
+	n  = dist > EPSILON ? dv / dist : float3(0, 1, 0);
+	cp = cl + n * r;   // contact on real surface
 	return true;
 }
 
-
 // Convex mesh: point must be on the negative side of ALL face planes.
 // Contact = shallowest-penetrating face (smallest penetration depth).
+// Note: convex uses strict interior test (no skin expansion needed —
+// the face-plane test is already conservative for particle-sized objects).
 bool TestConvex(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 {
-	cp = 0; n = float3(0,1,0);
+	cp = 0;
+	n  = float3(0, 1, 0);
 
-	// ── AABB bounds reject ───────────────────────────────────────────────────
-	// axis  = world-space AABB centre, axis2 = world-space AABB half-extents.
-	// Rejects particles outside the mesh's bounding box before any face test.
-	// This fixes "infinite plane" behaviour for flat/open convex meshes that
-	// have too few face planes to constrain all lateral directions.
+	// AABB bounds reject
 	float3 bDelta = abs(p - s.axis) - s.axis2;
 	if (bDelta.x > 0.0 || bDelta.y > 0.0 || bDelta.z > 0.0) return false;
 
-	// ── Face-plane inside test ───────────────────────────────────────────────
 	uint faceOffset = asuint(s.param0);
 	uint faceCount  = asuint(s.param1);
 	if (faceCount == 0u) return false;
@@ -291,17 +293,21 @@ bool TestConvex(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 
 	for (uint fi = 0u; fi < faceCount; fi++)
 	{
-		float4 pl   = _MeshFacePlanes[faceOffset + fi]; // (normal.xyz, d)
-		float  dist = dot(pl.xyz, p) + pl.w;            // > 0 → outside this plane
-		if (dist >= 0.0) return false;                  // outside convex hull → no contact
+		float4 pl   = _MeshFacePlanes[faceOffset + fi];
+		float  dist = dot(pl.xyz, p) + pl.w;
+		if (dist >= 0.0) return false;
 		float pen = -dist;
-		if (pen < minPen) { minPen = pen; bestFace = (int)fi; }
+		if (pen < minPen)
+		{
+			minPen   = pen;
+			bestFace = (int)fi;
+		}
 	}
 
 	if (bestFace < 0) return false;
 	float4 best = _MeshFacePlanes[faceOffset + (uint)bestFace];
 	n  = best.xyz;
-	cp = p + best.xyz * minPen;  // project p onto the plane surface
+	cp = p + best.xyz * minPen;
 	return true;
 }
 
@@ -315,38 +321,65 @@ void DetectShapes(uint3 id : SV_DispatchThreadID)
 	uint si = id.x / _ParticleCount;
 	uint pi = id.x % _ParticleCount;
 
-	ShapeDescriptor s    = _Shapes[si];
-	float3 p    = _Positions[pi].predict;
-	// NOTE: `prev` (particle.position, set by Presolve) is NOT used here.
-	// TestOBB is now a speculative signed-distance test on `p` only,
-	// matching Unity/PhysX contact generation. No segment sweep needed.
+	ShapeDescriptor s = _Shapes[si];
+	float3 p = _Positions[pi].predict;
 
 	float3 cp, n;
 	bool   hit;
-	if      (s.shapeType == SHAPE_SPHERE)   hit = TestSphere  (s, p,       cp, n);
-	else if (s.shapeType == SHAPE_OBB)      hit = TestOBB     (s, p, cp, n);
-	else if (s.shapeType == SHAPE_CAPSULE)  hit = TestCapsule (s, p,       cp, n);
-	else                                    hit = TestConvex  (s, p,       cp, n);
+	if (s.shapeType == SHAPE_SPHERE)
+	{
+		hit = TestSphere(s, p, cp, n);
+	}
+	else if (s.shapeType == SHAPE_OBB)
+	{
+		hit = TestOBB(s, p, cp, n);
+	}
+	else if (s.shapeType == SHAPE_CAPSULE)
+	{
+		hit = TestCapsule(s, p, cp, n);
+	}
+	else
+	{
+		hit = TestConvex(s, p, cp, n);
+	}
+
 	if (!hit) return;
 
 	uint slot;
 	InterlockedAdd(_ColSize[0], 1u, slot);
 	if (slot >= MAX_CONSTRAINTS) return;
 
-	float3 sv      = _ShapeVelocities[si];
+	float3 sv   = _ShapeVelocities[si];
 	ColConstraint c;
-	c.contactPt    = cp;
-	c.pIdx         = pi;
-	c.normal       = n;
-	c.surfVelN     = dot(sv, n);
-	c.colType      = s.colType;
-	c.dynSlot      = s.dynSlot;
-	c.rbInvMass    = s.rbInvMass;
-	c._pad         = 0;
+	c.contactPt  = cp;
+	c.pIdx       = pi;
+	c.normal     = n;
+	c.surfVelN   = dot(sv, n);
+	c.colType    = s.colType;
+	c.dynSlot    = s.dynSlot;
+	c.rbInvMass  = s.rbInvMass;
+	c._pad       = 0;
 	_ColConstraints[slot] = c;
 }
 
 // ── Kernel: SolveCollisions ───────────────────────────────────────────────────
+//
+// planeDist = dot(contactPt, nrm) — the surface plane's signed offset.
+// pen       = dot(pos, nrm) - planeDist — signed distance of predict from surface.
+//
+// Two cases:
+//   pen < 0  → particle is INSIDE the surface.
+//              Full positional correction: push particle back to surface.
+//   pen >= 0 → particle is OUTSIDE the surface (in the skin zone, since
+//              DetectShapes only fires within _ContactSkin distance).
+//              ALSO apply positional correction pushing to surface —
+//              this is the key fix for kinematic colliders: the sphere is
+//              moving toward the particle each substep. Killing velocity
+//              alone doesn't help because the sphere keeps advancing.
+//              Pushing the particle to the surface pre-emptively keeps it
+//              on the boundary as the sphere closes in.
+//
+// In both cases: kill relative inward velocity component.
 
 [numthreads(GROUP_SIZE, 1, 1)]
 void SolveCollisions(uint3 id : SV_DispatchThreadID)
@@ -358,54 +391,20 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 	float3 pos        = _Positions[c.pIdx].predict;
 	float3 nrm        = c.normal;
 
-	// Speculative-contact depth: re-evaluate against the SURFACE PLANE, not the
-	// stale contactPt. DetectShapes runs before Stretch/Volume; by the time
-	// SolveCollisions runs, Stretch/Volume have already moved predict.
-	//
-	// Old:  pen = dot(pos - contactPt, nrm)
-	//   For CCD the contactPt lands exactly ON the surface (pen≈0 at detect time).
-	//   If Stretch nudges predict even 0.1 mm away from the surface, pen > 0 → early-out
-	//   → collision discarded every frame → zero-thickness floor pass-through.
-	//
-	// New (Speculative / plane-based):
-	//   planeDist = dot(contactPt, nrm)  — the surface's signed offset from origin.
-	//   pen       = dot(pos, nrm) - planeDist
-	//   This is the signed distance of the CURRENT predict from the surface plane.
-	//   It is independent of how Stretch/Volume moved predict:
-	//     predict above surface → pen > 0 → discard   ✓
-	//     predict below surface → pen < 0 → correct   ✓
-	//   Works identically for thick interior contacts (planeDist = top-face offset)
-	//   and for zero-thickness CCD contacts (planeDist = floor y).
-	float  planeDist  = dot(c.contactPt, nrm);
-	float  pen        = dot(pos, nrm) - planeDist;
+	float planeDist = dot(c.contactPt, nrm);
+	float pen       = dot(pos, nrm) - planeDist;
 
-	// pen < 0  → particle is INSIDE the surface → full positional correction.
-	// pen >= 0 → particle is OUTSIDE the surface.
-	//   If pen < SPHERE_CONTACT_SKIN the skin detection fired (particle is close
-	//   but not yet penetrating). Apply speculative velocity damping only —
-	//   kill the inward relative velocity so the particle decelerates before
-	//   it hits. This prevents fast-moving small spheres from tunneling by
-	//   removing the approach velocity one substep before actual penetration.
-	//   Do NOT apply a positional correction here (that would push the particle
-	//   inside the sphere prematurely).
-	float  pInv = _Particles[c.pIdx].invMass;
-	float  cInv = c.rbInvMass;
-	float  wTot = pInv + cInv;
+	float pInv = _Particles[c.pIdx].invMass;
+	float cInv = c.rbInvMass;
+	float wTot = pInv + cInv;
 
-	float3 pVel  = _Particles[c.pIdx].velocity;
-	float  vRelN = dot(pVel, nrm) - c.surfVelN;
-
-	if (pen >= 0.0)
-	{
-		// Skin zone: only damp inward velocity, no position correction.
-		if (vRelN < 0.0)
-		{
-			_Particles[c.pIdx].velocity -= nrm * vRelN;
-		}
-		return;
-	}
-
-	// Full penetration: positional correction + velocity correction.
+	// Positional correction: always push particle to the surface plane.
+	// For pen < 0 this is the standard penetration resolution.
+	// For pen >= 0 (skin zone) this pre-emptively pushes the particle onto
+	// the surface so the next substep starts from a non-penetrating state.
+	// The correction magnitude is clamped: only push outward (pen side),
+	// never pull the particle deeper. When pen >= 0, corr = -nrm * pen
+	// points OUTWARD (away from surface), which is correct.
 	float3 corr = -nrm * pen;
 	if (wTot > EPSILON)
 	{
@@ -416,14 +415,17 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 		_Positions[c.pIdx].predict = pos + corr;
 	}
 
-	// Kill relative inward velocity.
+	// Kill relative inward velocity regardless of skin vs penetration.
+	float3 pVel  = _Particles[c.pIdx].velocity;
+	float  vRelN = dot(pVel, nrm) - c.surfVelN;
 	if (vRelN < 0.0)
 	{
 		_Particles[c.pIdx].velocity -= nrm * vRelN;
 	}
 
-	// Dynamic: Newton-3rd impulse accumulation
-	if (c.colType == COL_DYNAMIC && wTot > EPSILON)
+	// Dynamic: Newton-3rd impulse accumulation (only on full penetration
+	// to avoid phantom impulses from skin-zone speculative contacts).
+	if (pen < 0.0 && c.colType == COL_DYNAMIC && wTot > EPSILON)
 	{
 		float3 rbImp = -corr * (cInv / wTot) / _ColDeltaTime;
 		uint   b     = c.dynSlot * IMPULSE_STRIDE;
