@@ -2,6 +2,24 @@
 1. small-sphere => hang attach but jittering (with damp = 1)
 2. xpbd-colliderSource => sphereBoxCld Still penetrate even tunnelling when move fast! (ref : PhysX imp ,utilise unity MovePostion()?)
 
+
+Q: 
+1. the format in Manager CS "	
+
+if (!body) continue;"  Should be 
+
+"	if (!body)
+     continue;"
+
+"if (hasSoftSoft) DispatchComputeBounds(body);" Should Be 
+
+"	if (hasSoftSoft)
+     DispatchComputeBounds(body);" OK?
+
+2. test the grip A with above code , it get better really , ensure that the position correction is take effect and push the soft back to the gripA to avoid penetrate , BUT just Not enough the speed or the power So  i move the A Further Still tunneling inside , any good method like util the SDF or sth?
+
+
+
 --3-12
 1. static cld : remove update logic
 2. kinematic cld pass through / tunnel case <See Squash case> ? CCD not working? <ref : rigidbody.MovePosition() API>
