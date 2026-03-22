@@ -181,13 +181,39 @@ namespace XPBD
 					Shape = ShapeType.Capsule;
 					break;
 			}
-
-			_prevPos = transform.position;
-			_prevRot = transform.rotation;
+			// Use Body.position for kinematic so _prevPos tracks the physics-committed
+			// target, which is what SnapshotStartOfFrame will use next frame.
+			_prevPos = GetCurPos();
+			_prevRot = GetCurRot();
+		}
+		// + [3/22/2026 jzq]
+		Vector3 GetCurPos()
+		{
+			if (Type == ColType.Kinematic && Body)
+			{
+				return Body.position;
+			}
+			return transform.position;
 		}
 
-		void OnEnable() => SoftBodySimulationManager.Instance?.RegisterCollider(this);
-		void OnDisable() => SoftBodySimulationManager.Instance?.UnregisterCollider(this);
+		Quaternion GetCurRot()
+		{
+			if (Type == ColType.Kinematic && Body)
+			{
+				return Body.rotation;
+			}
+			return transform.rotation;
+		}
+
+		void OnEnable()
+		{
+			SoftBodySimulationManager.Instance?.RegisterCollider(this);
+		}
+
+		void OnDisable()
+		{
+			SoftBodySimulationManager.Instance?.UnregisterCollider(this);
+		}
 
 		// ─────────────────────────────────────────────────────────────────────
 		// Called ONCE per fixed frame, BEFORE the substep loop.
@@ -210,18 +236,31 @@ namespace XPBD
 		// ─────────────────────────────────────────────────────────────────────
 		public void RefreshDescriptorAtFraction(float t, float subDT, uint dynSlot)
 		{
+			// For kinematic rigidbodies, Body.position reflects the target set by
+			// rb.MovePosition() — transform.position may lag by one physics step.
+			// For static/dynamic, transform.position is the correct source.
+			Vector3 targetPos = GetCurPos();
+			Quaternion targetRot = GetCurRot();
+
 			// Interpolated world position/rotation at this substep fraction
-			Vector3 lerpPos = Vector3.Lerp(_frameStartPos, transform.position, t);
-			Quaternion lerpRot = Quaternion.Slerp(_frameStartRot, transform.rotation, t);
+			Vector3 lerpPos = Vector3.Lerp(_frameStartPos, targetPos, t);
+			Quaternion lerpRot = Quaternion.Slerp(_frameStartRot, targetRot, t);
 
 			// Surface velocity at substep granularity:
 			// displacement from previous substep position to this substep position.
 			// For kinematic bodies this correctly scales with subDT.
-			SurfaceVelocity =
-				Type == ColType.Dynamic && Body ? Body.velocity :
-				Type == ColType.Kinematic
-					? (lerpPos - _prevPos) / Mathf.Max(subDT, 1e-6f)
-					: Vector3.zero;
+			if (Type == ColType.Dynamic && Body)
+			{
+				SurfaceVelocity = Body.velocity;
+			}
+			else if (Type == ColType.Kinematic)
+			{
+				SurfaceVelocity = (lerpPos - _prevPos) / Mathf.Max(subDT, 1e-6f);
+			}
+			else
+			{
+				SurfaceVelocity = Vector3.zero;
+			}
 
 			_prevPos = lerpPos;
 			_prevRot = lerpRot;
@@ -251,21 +290,30 @@ namespace XPBD
 		// ─────────────────────────────────────────────────────────────────────
 		public void RefreshDescriptor(float dt, uint dynSlot)
 		{
-			SurfaceVelocity =
-				Type == ColType.Dynamic && Body ? Body.velocity :
-				Type == ColType.Kinematic ? (transform.position - _prevPos) / Mathf.Max(dt, 1e-6f)
-												  : Vector3.zero;
+			Vector3 curPos = GetCurPos();
+			if (Type == ColType.Dynamic && Body)
+			{
+				SurfaceVelocity = Body.velocity;
+			}
+			else if (Type == ColType.Kinematic)
+			{
+				SurfaceVelocity = (curPos - _prevPos) / Mathf.Max(dt, 1e-6f);
+			}
+			else
+			{
+				SurfaceVelocity = Vector3.zero;
+			}
 
-			_prevPos = transform.position;
-			_prevRot = transform.rotation;
+			_prevPos = GetCurPos();
+			_prevRot = GetCurRot();
 
 			// Convex face planes: always re-transform when the transform changed.
 			// Static bodies are expected to stay put — we only re-bake when they actually move
 			// (fixes mismatch with BoxCollider which always reads transform live).
 			if (Shape == ShapeType.Convex)
 			{
-				var pos = transform.position;
-				var rot = transform.rotation;
+				var pos = GetCurPos();
+				var rot = GetCurRot();
 				bool moved = (pos - _cachedConvexPos).sqrMagnitude > 1e-8f
 						  || Mathf.Abs(Quaternion.Dot(rot, _cachedConvexRot)) < 1f - 1e-6f;
 				if (moved || FacePlanes == null)
@@ -315,9 +363,35 @@ namespace XPBD
 					}
 				case CapsuleCollider cc:
 					{
-						var axScl = transform.lossyScale.y;
-						d.centre = pos + rot * (Vector3.Scale(cc.center, transform.lossyScale));
-						d.axis = rot * Vector3.up;
+						// cc.direction: 0=X, 1=Y, 2=Z — must match BuildDescriptor axis logic.
+						Vector3 localAx;
+						if (cc.direction == 0)
+						{
+							localAx = Vector3.right;
+						}
+						else if (cc.direction == 2)
+						{
+							localAx = Vector3.forward;
+						}
+						else
+						{
+							localAx = Vector3.up;
+						}
+						float axScl;
+						if (cc.direction == 0)
+						{
+							axScl = Mathf.Abs(transform.lossyScale.x);
+						}
+						else if (cc.direction == 2)
+						{
+							axScl = Mathf.Abs(transform.lossyScale.z);
+						}
+						else
+						{
+							axScl = Mathf.Abs(transform.lossyScale.y);
+						}
+						d.centre = pos + rot * Vector3.Scale(cc.center, transform.lossyScale);
+						d.axis = (rot * localAx).normalized;
 						d.param0 = cc.radius * MaxScale();
 						d.param1 = Mathf.Max(0f, cc.height * 0.5f * axScl - d.param0);
 						break;
@@ -469,11 +543,11 @@ namespace XPBD
 			return result;
 		}
 
-		float MaxScale() => Mathf.Max(
-			Mathf.Abs(transform.lossyScale.x),
-			Mathf.Max(
-				Mathf.Abs(transform.lossyScale.y),
-				Mathf.Abs(transform.lossyScale.z)));
+		float MaxScale()
+		{
+			var s = transform.lossyScale;
+			return Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z)));
+		}
 	}
 
 	// ── CPU mirror of HLSL ShapeDescriptor — must match layout exactly ────────

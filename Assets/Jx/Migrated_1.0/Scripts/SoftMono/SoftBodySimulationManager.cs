@@ -156,6 +156,15 @@ namespace XPBD
 
 			if (hasRigid)
 			{
+				// Snapshot BEFORE RebuildCollisionBuffers so frameStartPos captures
+				// the position from the END of the previous frame — not the current one.
+				// RebuildCollisionBuffers calls RefreshDescriptor which updates _prevPos
+				// to the current transform.position; if we snapshot after that, both
+				// frameStartPos and the lerp target are the same and no sweep occurs.
+				foreach (var col in _colliders)
+				{
+					col.SnapshotStartOfFrame();
+				}
 				RebuildCollisionBuffers(_fixedDT);
 				if (_dynSlotCount > 0)
 					DispatchClearImpulse();
@@ -170,13 +179,6 @@ namespace XPBD
 			// Required for soft-soft: both bodies must be at the same substep
 			// position when detect runs. Also preserves the floor fix — for each
 			// body, Postsolve always completes before its collision runs.
-			// Snapshot every collider's start-of-frame position once before all substeps.
-			// This lets RefreshDescriptorAtFraction interpolate the swept position
-			// correctly at each substep fraction without drifting.
-			if (hasRigid)
-				foreach (var col in _colliders)
-					col.SnapshotStartOfFrame();
-
 			for (int s = 0; s < SubSteps; s++)
 			{
 				foreach (var body in _bodies)
