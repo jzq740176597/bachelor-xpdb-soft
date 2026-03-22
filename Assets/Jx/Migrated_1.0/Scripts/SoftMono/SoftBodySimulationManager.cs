@@ -109,6 +109,10 @@ namespace XPBD
 		// Allocated once per body in AddBody, freed in RemoveBody.
 		// ComputeBounds writes to this; manager reads it to get live circumsphere.
 		readonly Dictionary<int, ComputeBuffer> _bodyBoundsBuffers = new();
+		// Per-body _Delta StructuredBuffer<float3> (particleCount × 12 bytes).
+		// Written by Presolve (zero), StretchConstraint, VolumeConstraint;
+		// read by Postsolve. Replaces the old RWByteAddressBuffer DeltaBytesBuffer.
+		readonly Dictionary<int, ComputeBuffer> _bodyDeltaBuffers = new();
 		readonly int[] _boundsReadback = new int[8]; // scratch, reused every substep
 
 		float _timeAccum, _fixedDT, _subDT;
@@ -147,7 +151,7 @@ namespace XPBD
 				return;
 			_timeAccum -= _fixedDT;
 
-			bool hasRigid    = _colliders.Count > 0 && CollisionShapesCS;
+			bool hasRigid = _colliders.Count > 0 && CollisionShapesCS;
 			bool hasSoftSoft = _softSoftPairs.Count > 0 && SoftSoftCollisionCS && SoftSoftApplyCS;
 
 			if (hasRigid)
@@ -170,17 +174,20 @@ namespace XPBD
 			{
 				foreach (var body in _bodies)
 				{
-					if (!body) continue;
-					DispatchIntegrate(body.State);
+					if (!body)
+						continue;
+					DispatchIntegrate(body);
 					// Recompute live circumsphere after Postsolve so it reflects
 					// the current deformed shape. Used by broad-phase in Phase 2.
-					if (hasSoftSoft) DispatchComputeBounds(body);
+					if (hasSoftSoft)
+						DispatchComputeBounds(body);
 				}
 
 				_softSoftDetectedThisStep.Clear();
 				foreach (var body in _bodies)
 				{
-					if (!body) continue;
+					if (!body)
+						continue;
 					if (hasRigid)
 					{
 						ResetColSize(body.State);
@@ -194,7 +201,8 @@ namespace XPBD
 
 			foreach (var body in _bodies)
 			{
-				if (!body) continue;
+				if (!body)
+					continue;
 				DispatchDeform(body);
 			}
 
@@ -218,6 +226,14 @@ namespace XPBD
 				buf.SetData(new uint[8]);
 				_bodyBoundsBuffers[body.GetInstanceID()] = buf;
 			}
+			// Allocate _Delta buffer: StructuredBuffer<float3>, one entry per particle.
+			// stride = 3 × sizeof(float) = 12 bytes, type Default (not Raw).
+			if (body.State != null && body.State.ParticleCount > 0)
+			{
+				var delta = new ComputeBuffer(body.State.ParticleCount, 3 * sizeof(float));
+				delta.SetData(new float[body.State.ParticleCount * 3]);
+				_bodyDeltaBuffers[body.GetInstanceID()] = delta;
+			}
 		}
 
 		public void RemoveBody(SoftBodyComponent body)
@@ -229,6 +245,11 @@ namespace XPBD
 				buf?.Release();
 				_bodyBoundsBuffers.Remove(id);
 			}
+			if (_bodyDeltaBuffers.TryGetValue(id, out var delta))
+			{
+				delta?.Release();
+				_bodyDeltaBuffers.Remove(id);
+			}
 		}
 
 		// One-time GPU readback at spawn to get rest-pose circumsphere radius.
@@ -236,7 +257,8 @@ namespace XPBD
 		void ComputeRestBoundingRadius(SoftBodyComponent body)
 		{
 			var state = body.State;
-			if (state == null || state.ParticleCount == 0) return;
+			if (state == null || state.ParticleCount == 0)
+				return;
 
 			int floatsPerParticle = 8; // float3 pos + float pad + float3 vel + float invMass = 32 bytes
 			var raw = new float[state.ParticleCount * floatsPerParticle];
@@ -522,7 +544,8 @@ namespace XPBD
 		void DispatchComputeBounds(SoftBodyComponent body)
 		{
 			int id = body.GetInstanceID();
-			if (!_bodyBoundsBuffers.TryGetValue(id, out var buf) || buf == null) return;
+			if (!_bodyBoundsBuffers.TryGetValue(id, out var buf) || buf == null)
+				return;
 
 			// Zero the accumulator
 			buf.SetData(new uint[8]);
@@ -530,7 +553,7 @@ namespace XPBD
 			var cs = SoftSoftCollisionCS;
 			cs.SetInt("_CountA", body.State.ParticleCount);
 			cs.SetBuffer(_kComputeBounds, "_PositionsA", body.State.PositionsBuffer);
-			cs.SetBuffer(_kComputeBounds, "_BoundsBuf",  buf);
+			cs.SetBuffer(_kComputeBounds, "_BoundsBuf", buf);
 			cs.Dispatch(_kComputeBounds, Ceil(body.State.ParticleCount), 1, 1);
 		}
 
@@ -540,7 +563,7 @@ namespace XPBD
 		bool ReadLiveBounds(SoftBodyComponent body, out Vector3 centroid, out float radius)
 		{
 			centroid = Vector3.zero;
-			radius   = body.BoundingRadius; // fallback to rest-pose
+			radius = body.BoundingRadius; // fallback to rest-pose
 
 			int id = body.GetInstanceID();
 			if (!_bodyBoundsBuffers.TryGetValue(id, out var buf) || buf == null)
@@ -549,7 +572,8 @@ namespace XPBD
 			buf.GetData(_boundsReadback);
 
 			int count = _boundsReadback[3];
-			if (count == 0) return false;
+			if (count == 0)
+				return false;
 
 			const float FP_SCALE = 1000f;
 			centroid = new Vector3(
@@ -598,7 +622,7 @@ namespace XPBD
 				// For unit sphere (R=1, N=313): ~0.30m. Manual override via SoftSoftParticleRadius > 0.
 				float AutoRadius(SoftBodyComponent body) =>
 					AutoRadiusMul * Mathf.Sqrt(4f * Mathf.PI * body.BoundingRadius * body.BoundingRadius
-					                           / Mathf.Max(body.State.ParticleCount, 1));
+											   / Mathf.Max(body.State.ParticleCount, 1));
 				float rA = a.SoftSoftParticleRadius > 0 ? a.SoftSoftParticleRadius : AutoRadius(a);
 				float rB = b.SoftSoftParticleRadius > 0 ? b.SoftSoftParticleRadius : AutoRadius(b);
 				float radius = Mathf.Max(rA, rB);
@@ -609,7 +633,7 @@ namespace XPBD
 				// If (centreA-centreB distance) > (radA + radB + colRadius), bodies
 				// can't possibly have any particle pairs within colRadius → skip N×M.
 				if (ReadLiveBounds(a, out var centA, out var radA) &&
-				    ReadLiveBounds(b, out var centB, out var radB))
+					ReadLiveBounds(b, out var centB, out var radB))
 				{
 					if (Vector3.Distance(centA, centB) > radA + radB + radius)
 						continue;
@@ -646,21 +670,22 @@ namespace XPBD
 				applyCs.SetInt("_CountA", nA);
 				applyCs.SetBuffer(_kApplySoftSoftDelta, "_ParticlesA", a.State.ParticleBuffer);
 				applyCs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", a.State.PositionsBuffer);
-				applyCs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA",  bufs.DeltaA);
+				applyCs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA", bufs.DeltaA);
 				applyCs.Dispatch(_kApplySoftSoftDelta, Ceil(nA), 1, 1);
 
 				applyCs.SetInt("_CountA", nB);
 				applyCs.SetBuffer(_kApplySoftSoftDelta, "_ParticlesA", b.State.ParticleBuffer);
 				applyCs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", b.State.PositionsBuffer);
-				applyCs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA",  bufs.DeltaB);
+				applyCs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA", bufs.DeltaB);
 				applyCs.Dispatch(_kApplySoftSoftDelta, Ceil(nB), 1, 1);
 			}
 		}
 
 		// ── Elastic integration (Presolve + Stretch + Volume + Postsolve) ─────
 		// Collision is NOT here — it runs after ALL bodies integrate (see Update).
-		void DispatchIntegrate(SoftBodyGPUState body)
+		void DispatchIntegrate(SoftBodyComponent bodyCmp)
 		{
+			var body = bodyCmp.State;
 			var cs = SoftBodySimCS;
 			cs.SetFloat("_DeltaTime", _subDT);
 			cs.SetFloat("_DistanceCompliance", EdgeCompliance);
@@ -669,26 +694,34 @@ namespace XPBD
 			cs.SetInt("_EdgeCount", body.EdgeCount);
 			cs.SetInt("_TetCount", body.TetCount);
 
-			BindSimBuffers(cs, _kPresolve, body);
+			BindSimBuffers(cs, _kPresolve, bodyCmp);
 			cs.Dispatch(_kPresolve, Ceil(body.ParticleCount), 1, 1);
 
-			BindSimBuffers(cs, _kStretch, body);
+			BindSimBuffers(cs, _kStretch, bodyCmp);
 			cs.Dispatch(_kStretch, Ceil(body.EdgeCount), 1, 1);
 
-			BindSimBuffers(cs, _kVolume, body);
+			BindSimBuffers(cs, _kVolume, bodyCmp);
 			cs.Dispatch(_kVolume, Ceil(body.TetCount), 1, 1);
 
-			BindSimBuffers(cs, _kPostsolve, body);
+			BindSimBuffers(cs, _kPostsolve, bodyCmp);
 			cs.Dispatch(_kPostsolve, Ceil(body.ParticleCount), 1, 1);
 		}
 
-		void BindSimBuffers(ComputeShader cs, int kernel, SoftBodyGPUState body)
+		void BindSimBuffers(ComputeShader cs, int kernel, SoftBodyComponent bodyCmp)
 		{
+			var body = bodyCmp.State;
 			cs.SetBuffer(kernel, "_Particles", body.ParticleBuffer);
 			cs.SetBuffer(kernel, "_Positions", body.PositionsBuffer);
 			cs.SetBuffer(kernel, "_Edges", body.EdgeBuffer);
 			cs.SetBuffer(kernel, "_Tetrahedrals", body.TetBuffer);
-			cs.SetBuffer(kernel, "_DeltaBytes", body.DeltaBytesBuffer);
+			// Bind _Delta and _DeltaRaw: both point to the same ComputeBuffer.
+			// _Delta (StructuredBuffer<float3>) used by Presolve/Postsolve for clear/read.
+			// _DeltaRaw (RWByteAddressBuffer) used by constraint kernels for CAS atomic adds.
+			if (_bodyDeltaBuffers.TryGetValue(bodyCmp.GetInstanceID(), out var deltaBuffer))
+			{
+				cs.SetBuffer(kernel, "_Delta", deltaBuffer);
+				cs.SetBuffer(kernel, "_DeltaRaw", deltaBuffer);
+			}
 		}
 
 		// ── Mesh deformation ──────────────────────────────────────────────────
@@ -771,9 +804,9 @@ namespace XPBD
 
 			if (SoftSoftCollisionCS)
 			{
-				_kComputeBounds      = SoftSoftCollisionCS.FindKernel("ComputeBounds");
+				_kComputeBounds = SoftSoftCollisionCS.FindKernel("ComputeBounds");
 				_kClearSoftSoftDelta = SoftSoftCollisionCS.FindKernel("ClearSoftSoftDelta");
-				_kDetectSoftSoft     = SoftSoftCollisionCS.FindKernel("DetectSoftSoft");
+				_kDetectSoftSoft = SoftSoftCollisionCS.FindKernel("DetectSoftSoft");
 			}
 			// ApplySoftSoftDelta lives in its own file (SoftSoftApply.compute).
 			// See SoftSoftCollision.compute header: split-file rule prevents Unity

@@ -31,6 +31,7 @@ public class DragDropByMouseNewEvent : MonoBehaviour, IBeginDragHandler, IDragHa
 	#endregion
 
 	#region Fields
+	Rigidbody rb;
 	bool dragging;
 	Vector3 screenPoint;
 	Vector3 offset;
@@ -87,7 +88,8 @@ public class DragDropByMouseNewEvent : MonoBehaviour, IBeginDragHandler, IDragHa
 			basePt += off;
 		}
 		// [9/9/2024 jzq]
-		onDraging?.Invoke(transform);
+		if (dragingLegalFilter == null || dragingLegalFilter.Invoke())
+			onDraging?.Invoke(transform);
 		//else
 		//	Debug.Log($"[Note] onDraging : BEEN skipped AS dragingLegalFilter() return false".WrapLogColor());
 		//
@@ -107,6 +109,7 @@ public class DragDropByMouseNewEvent : MonoBehaviour, IBeginDragHandler, IDragHa
 	{
 		if (!specCam)
 			specCam = Camera.main;
+		rb = GetComponent<Rigidbody>();
 	}
 	//false for cancel
 	public virtual bool OnStartDrag(PointerEventData eventData)
@@ -119,11 +122,14 @@ public class DragDropByMouseNewEvent : MonoBehaviour, IBeginDragHandler, IDragHa
 	{
 		get
 		{
-			return transform.position;
+			return rb ? rb.position : transform.position;
 		}
 		set
 		{
-			transform.position = value;
+			if (rb)
+				rb.MovePosition(value);
+			else
+				transform.position = value;
 		}
 	}
 

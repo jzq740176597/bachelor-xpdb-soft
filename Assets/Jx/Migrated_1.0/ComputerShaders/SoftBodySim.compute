@@ -1,85 +1,69 @@
-#include "Commons.hlsl"
 // SoftBodySim.compute
-// XPBD physics kernels — FIXED for DX12 SM6.0+
-//
-// ROOT CAUSE OF NaN:
-//   Original used RWBuffer<int> _DeltaInt with AtomicAddDelta:
-//     InterlockedAdd(_DeltaInt[base], asint(v.x))
-//   This is BROKEN. asint() just reinterprets float bits as int.
-//   Adding those bit patterns as integers ≠ adding the floats:
-//     asint(0.3) + asint(0.3) → asfloat result = 1.49e37   (correct: 0.6)
-//     asint(+1.5) + asint(-0.5) → asfloat result = -1.28e38 (correct: 1.0)
-//   Every tet-mesh particle is shared by multiple edges → immediate NaN.
-//
-// FIX: RWByteAddressBuffer + InterlockedAddFloat = true float atomics.
-//   Same semantic as GL_EXT_shader_atomic_float from the original Vulkan GLSL.
-//   Available on DX12, SM6.0+ (already required by this project for wave intrinsics).
-//
-// ALSO FIXED: Presolve now zeroes DeltaBytes in-shader per particle.
-//   No more C# ClearIntBuffer() CPU→GPU upload each substep.
-//--------------------------
-
 // XPBD soft body simulation kernels
-// Ported from GLSL Vulkan compute shaders
-// Target: Unity 2022.3 | Built-in RP | Windows DX11/DX12 | SM 6.5
+// Target: Unity 2022.3+ | Built-in RP | Windows DX12
 //
-// SM 6.5 wave intrinsics (WaveActiveSum) replace GL_EXT_shader_atomic_float.
-// Each thread computes its correction vector. Lanes in the same wave that
-// share a particle index are reduced via WaveActiveSum before a single
-// InterlockedAdd (integer bit-cast) writes to the delta buffer — this
-// eliminates almost all atomic contention on the delta accumulation.
+// Delta accumulation strategy — CAS atomic float add on RWStructuredBuffer<float3>:
 //
-// Kernels in this file:
-//   Presolve              — integrate velocity, store predicted positions
-//   Postsolve             — commit deltas, update velocity
-//   StretchConstraint     — distance / edge constraint (XPBD)
-//   VolumeConstraint      — tetrahedral volume constraint (XPBD)
+//   Each constraint thread computes a positional correction float3 per particle
+//   it touches and atomically adds it to _Delta[particleIdx] via a
+//   compare-exchange spin loop on each float component.
+//
+//   This is the standard robust approach: no wave-size assumptions, no sorting,
+//   correct for any mesh topology on any GPU.
+//
+//   _Delta is RWStructuredBuffer<float3> (stride 12, ComputeBufferType.Default).
+//   Presolve zeroes it each substep. Postsolve reads and applies it.
+//
+// Kernels:
+//   Presolve          — integrate velocity, predict position, clear delta
+//   Postsolve         — apply accumulated delta, recompute velocity
+//   StretchConstraint — XPBD distance / edge constraint
+//   VolumeConstraint  — XPBD tetrahedral volume constraint
 
 #pragma kernel Presolve
 #pragma kernel Postsolve
 #pragma kernel StretchConstraint
 #pragma kernel VolumeConstraint
 
-//#pragma target 5.0   // minimum for structured buffers
-// SM 6.5 wave intrinsics are enabled automatically by Unity on DX12 when
-// the hardware reports support; no extra pragma needed beyond target 5.0.
+#pragma use_dxc
+#pragma target 5.0
 
-// ─── Shared constants ────────────────────────────────────────────────────────
-#define GRAVITY     -9.82
-#define GROUP_SIZE  32
+// ─── Shared constants ─────────────────────────────────────────────────────────
+#define GRAVITY    -9.82
+#define GROUP_SIZE  64
 
-// ─── Structs (must match C# StructLayout exactly) ────────────────────────────
+// ─── Structs (must match C# StructLayout exactly) ─────────────────────────────
 struct Particle
 {
-    float3 position;   // 12 bytes
-    float  _pad0;      // 4  bytes → 16-byte aligned (matches std140 alignas(16))
-    float3 velocity;   // 12 bytes
-    float  invMass;    // 4  bytes → 16 bytes total per component row
+    float3 position;  // 12 bytes
+    float  _pad0;     //  4 bytes
+    float3 velocity;  // 12 bytes
+    float  invMass;   //  4 bytes → 32 bytes total
 };
 
 struct PbdPositions
 {
-    float3 predict;    // 12 bytes
-    float  _pad0;      // 4  bytes
-    float3 delta;      // 12 bytes // struct compat only — accumulation uses DeltaBytes
-    float  _pad1;      // 4  bytes
+    float3 predict;   // 12 bytes
+    float  _pad0;     //  4 bytes
+    float3 delta;     // 12 bytes  (unused field, kept for layout compat)
+    float  _pad1;     //  4 bytes → 32 bytes total
 };
 
 struct Edge
 {
-    uint2  indices;    // 8  bytes
-    float  restLen;    // 4  bytes
-    float  _pad;       // 4  bytes → 16 bytes
+    uint2  indices;   //  8 bytes
+    float  restLen;   //  4 bytes
+    float  _pad;      //  4 bytes → 16 bytes
 };
 
 struct Tetrahedral
 {
-    uint4  indices;    // 16 bytes
-    float  restVolume; // 4  bytes
-    float3 _pad;       // 12 bytes → 32 bytes
+    uint4  indices;   // 16 bytes
+    float  restVolume;//  4 bytes
+    float3 _pad;      // 12 bytes → 32 bytes
 };
 
-// ─── Constants (set by cs.SetFloat / cs.SetInt each dispatch) ────────────────
+// ─── Uniforms (set via cs.SetFloat / cs.SetInt) ───────────────────────────────
 float _DeltaTime;
 float _DistanceCompliance;
 float _VolumeCompliance;
@@ -87,47 +71,62 @@ uint  _ParticleCount;
 uint  _EdgeCount;
 uint  _TetCount;
 
-// ─── Per-body SSBOs (set 1) ───────────────────────────────────────────────────
-RWStructuredBuffer<Particle>    _Particles;
+// ─── Buffers ──────────────────────────────────────────────────────────────────
+RWStructuredBuffer<Particle>     _Particles;
 RWStructuredBuffer<PbdPositions> _Positions;
-StructuredBuffer<Edge>        _Edges;
-StructuredBuffer<Tetrahedral> _Tetrahedrals;
+RWStructuredBuffer<Edge>         _Edges;
+RWStructuredBuffer<Tetrahedral>  _Tetrahedrals;
 
-// FIX: RWByteAddressBuffer → InterlockedAddFloat (true float atomic, DX12/SM6.0+)
-// Layout: [x0 y0 z0  x1 y1 z1  ...]  each element = 1 float = 4 bytes
-// Byte offset for particle i, component c = (i*3 + c) * 4
-RWByteAddressBuffer _DeltaBytes;
+// Delta accumulation: RWStructuredBuffer<float3>, one entry per particle.
+// Each float3 holds the sum of all positional corrections this substep.
+// Written atomically by constraint kernels; read and applied by Postsolve.
+RWStructuredBuffer<float3> _Delta;
 
-void AddDelta(uint idx, float3 v)
+// ─── Atomic float add (CAS loop) ──────────────────────────────────────────────
+// Atomically adds 'v' to the float at byte offset 'byteOff' in a raw view of
+// _Delta. We reinterpret _Delta as a RWByteAddressBuffer via a helper macro
+// — but since Unity doesn't allow two bindings of the same buffer, we use the
+// standard CAS trick on the structured buffer itself via InterlockedCompareExchange
+// on a separate RWByteAddressBuffer alias.
+//
+// Simpler: declare a separate RWByteAddressBuffer _DeltaRaw bound to the same
+// ComputeBuffer from C#. Unity allows binding the same ComputeBuffer to two
+// different shader variables as long as only one is written atomically per
+// dispatch. However, the cleanest and most portable approach is to declare
+// _Delta as RWByteAddressBuffer directly and do the CAS there.
+//
+// We keep _Delta as RWStructuredBuffer<float3> for Presolve/Postsolve readability
+// and add _DeltaRaw as RWByteAddressBuffer bound to the SAME ComputeBuffer for
+// atomic writes in constraint kernels.
+//
+// C# side: bind the same ComputeBuffer to both "_Delta" and "_DeltaRaw".
+
+RWByteAddressBuffer _DeltaRaw;  // same ComputeBuffer as _Delta, raw view for atomics
+
+void AtomicAddFloat(uint byteOffset, float value)
 {
-    uint b = idx * 12u;
-    /*_DeltaBytes.InterlockedAddFloat(b,      v.x);
-    _DeltaBytes.InterlockedAddFloat(b + 4u, v.y);
-    _DeltaBytes.InterlockedAddFloat(b + 8u, v.z);*/
-    CustomInterlockedAddFloat(_DeltaBytes, b, v.x);
-    CustomInterlockedAddFloat(_DeltaBytes, b + 4u, v.y);
-    CustomInterlockedAddFloat(_DeltaBytes, b + 8u, v.z);
+    uint prev = _DeltaRaw.Load(byteOffset);
+    uint next;
+    [allow_uav_condition]
+    do {
+        next = asuint(asfloat(prev) + value);
+        uint orig;
+        _DeltaRaw.InterlockedCompareExchange(byteOffset, prev, next, orig);
+        if (orig == prev) break;
+        prev = orig;
+    } while (true);
 }
 
-float3 ReadDelta(uint idx)
+void AtomicAddDelta(uint particleIdx, float3 v)
 {
-    uint b = idx * 12u;
-    return float3(
-        asfloat(_DeltaBytes.Load(b)),
-        asfloat(_DeltaBytes.Load(b + 4u)),
-        asfloat(_DeltaBytes.Load(b + 8u)));
+    uint base = particleIdx * 12u;  // float3 = 12 bytes
+    AtomicAddFloat(base + 0u, v.x);
+    AtomicAddFloat(base + 4u, v.y);
+    AtomicAddFloat(base + 8u, v.z);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Kernel: Presolve
-// Equivalent of presolve.comp
-// • Clears delta (written into _DeltaInt, zeroed in C# before dispatch)
-// • Applies gravity to velocity
-// • Saves current position
-// • Computes predicted position
-
-// One thread per particle — each thread owns exactly its 12 delta bytes → no race.
-// Zeroes delta here instead of C# ClearIntBuffer (saves a CPU→GPU roundtrip).
 // ─────────────────────────────────────────────────────────────────────────────
 [numthreads(GROUP_SIZE, 1, 1)]
 void Presolve(uint3 id : SV_DispatchThreadID)
@@ -135,26 +134,20 @@ void Presolve(uint3 id : SV_DispatchThreadID)
     uint i = id.x;
     if (i >= _ParticleCount) return;
 
-    // Zero this particle's delta — safe, one thread per particle
-    uint b = i * 12u;
-    _DeltaBytes.Store(b,      asuint(0.0f));
-    _DeltaBytes.Store(b + 4u, asuint(0.0f));
-    _DeltaBytes.Store(b + 8u, asuint(0.0f));
+    _Delta[i] = float3(0.0, 0.0, 0.0);
+
+    // Save current predict as position (for velocity recompute in Postsolve)
+    _Particles[i].position = _Positions[i].predict;
+
+    // Pinned particles: skip gravity and integration
+    if (_Particles[i].invMass < 1e-7) return;
 
     _Particles[i].velocity += float3(0.0, _DeltaTime * GRAVITY, 0.0);
-
-    // Save current position, advance prediction
-    _Particles[i].position  = _Positions[i].predict;
     _Positions[i].predict  += _Particles[i].velocity * _DeltaTime;
-    _Positions[i].delta     = float3(0.0, 0.0, 0.0); // redundant — C# zeroes _DeltaInt
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Kernel: Postsolve
-// Equivalent of postsolve.comp
-// Reads correctly accumulated float3 delta, applies damped correction.
-// • Applies damped delta (factor 0.2 as in original)
-// • Recomputes velocity from position change
 // ─────────────────────────────────────────────────────────────────────────────
 [numthreads(GROUP_SIZE, 1, 1)]
 void Postsolve(uint3 id : SV_DispatchThreadID)
@@ -162,23 +155,14 @@ void Postsolve(uint3 id : SV_DispatchThreadID)
     uint i = id.x;
     if (i >= _ParticleCount) return;
 
-    // Reconstruct float3 delta from int bit-casts
-    float3 delta = ReadDelta(i);
+    if (_Particles[i].invMass < 1e-7) return;
 
-    // Apply damped correction (original: positions[i].predict += delta * 0.2)
-    _Positions[i].predict += delta * 0.2;
-
-    // Velocity update
-    _Particles[i].velocity = (_Positions[i].predict - _Particles[i].position) / _DeltaTime;
+    _Positions[i].predict  += _Delta[i];
+    _Particles[i].velocity  = (_Positions[i].predict - _Particles[i].position) / _DeltaTime;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Kernel: StretchConstraint — XPBD edge constraint, one thread per edge
-
-// Equivalent of stretch_constraint.comp (XPBD distance / edge constraint)
-// One thread per edge.
-// SM 6.5: WaveActiveSum used to reduce contributions from threads in the
-// same wave that share particle indices, before a single InterlockedAdd.
+// Kernel: StretchConstraint  (XPBD distance / edge constraint)
 // ─────────────────────────────────────────────────────────────────────────────
 [numthreads(GROUP_SIZE, 1, 1)]
 void StretchConstraint(uint3 id : SV_DispatchThreadID)
@@ -186,28 +170,25 @@ void StretchConstraint(uint3 id : SV_DispatchThreadID)
     uint i = id.x;
     if (i >= _EdgeCount) return;
 
+    float alpha = _DistanceCompliance / (_DeltaTime * _DeltaTime);
     uint  i0 = _Edges[i].indices.x;
     uint  i1 = _Edges[i].indices.y;
     float w  = _Particles[i0].invMass + _Particles[i1].invMass;
-    if (w <= 0.0) return;
+    if (w < 1e-10) return;
 
     float3 diff = _Positions[i0].predict - _Positions[i1].predict;
     float  len  = length(diff);
     if (len < 1e-7) return;
 
     diff /= len;
-    float alpha      = _DistanceCompliance / (_DeltaTime * _DeltaTime);
-    float correction = -(len - _Edges[i].restLen) / (w + alpha);
+    float  correction = -(len - _Edges[i].restLen) / (w + alpha);
 
-    AddDelta(i0,  correction * diff * _Particles[i0].invMass);
-    AddDelta(i1, -correction * diff * _Particles[i1].invMass);
+    AtomicAddDelta(i0,  correction * diff * _Particles[i0].invMass);
+    AtomicAddDelta(i1, -correction * diff * _Particles[i1].invMass);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Kernel: VolumeConstraint — XPBD tet volume constraint, one thread per tet
-
-// Equivalent of volume_constraint.comp (XPBD tetrahedral volume constraint)
-// One thread per tetrahedron.
+// Kernel: VolumeConstraint  (XPBD tetrahedral volume constraint)
 // ─────────────────────────────────────────────────────────────────────────────
 [numthreads(GROUP_SIZE, 1, 1)]
 void VolumeConstraint(uint3 id : SV_DispatchThreadID)
@@ -215,7 +196,6 @@ void VolumeConstraint(uint3 id : SV_DispatchThreadID)
     uint i = id.x;
     if (i >= _TetCount) return;
 
-    // Face opposite-vertex index patterns (same as GLSL original)
     const uint3 faceIndices[4] = {
         uint3(1, 3, 2),
         uint3(0, 2, 3),
@@ -245,13 +225,10 @@ void VolumeConstraint(uint3 id : SV_DispatchThreadID)
     float3 p01 = _Positions[ids[1]].predict - _Positions[ids[0]].predict;
     float3 p02 = _Positions[ids[2]].predict - _Positions[ids[0]].predict;
     float3 p03 = _Positions[ids[3]].predict - _Positions[ids[0]].predict;
+    float  volume     = dot(cross(p01, p02), p03) / 6.0;
+    float  correction = -(volume - _Tetrahedrals[i].restVolume) / (w + alpha);
 
-    float volume    = dot(cross(p01, p02), p03) / 6.0;
-    float gradient  = volume - _Tetrahedrals[i].restVolume;
-    float c = -gradient / (w + alpha);
-    
-    AddDelta(ids[0], normals[0] * c * _Particles[ids[0]].invMass);
-    AddDelta(ids[1], normals[1] * c * _Particles[ids[1]].invMass);
-    AddDelta(ids[2], normals[2] * c * _Particles[ids[2]].invMass);
-    AddDelta(ids[3], normals[3] * c * _Particles[ids[3]].invMass);
+    [unroll]
+    for (int v = 0; v < 4; v++)
+        AtomicAddDelta(ids[v], normals[v] * correction * _Particles[ids[v]].invMass);
 }

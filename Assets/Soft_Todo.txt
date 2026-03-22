@@ -1,3 +1,7 @@
+--3-22
+1. small-sphere => hang attach but jittering (with damp = 1)
+2. xpbd-colliderSource => sphereBoxCld Still penetrate even tunnelling when move fast! (ref : PhysX imp ,utilise unity MovePostion()?)
+
 --3-12
 1. static cld : remove update logic
 2. kinematic cld pass through / tunnel case <See Squash case> ? CCD not working? <ref : rigidbody.MovePosition() API>
