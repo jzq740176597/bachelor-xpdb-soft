@@ -378,19 +378,49 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 	//   and for zero-thickness CCD contacts (planeDist = floor y).
 	float  planeDist  = dot(c.contactPt, nrm);
 	float  pen        = dot(pos, nrm) - planeDist;
-	if (pen >= 0.0) return;
 
-	float3 corr = -nrm * pen;
+	// pen < 0  → particle is INSIDE the surface → full positional correction.
+	// pen >= 0 → particle is OUTSIDE the surface.
+	//   If pen < SPHERE_CONTACT_SKIN the skin detection fired (particle is close
+	//   but not yet penetrating). Apply speculative velocity damping only —
+	//   kill the inward relative velocity so the particle decelerates before
+	//   it hits. This prevents fast-moving small spheres from tunneling by
+	//   removing the approach velocity one substep before actual penetration.
+	//   Do NOT apply a positional correction here (that would push the particle
+	//   inside the sphere prematurely).
 	float  pInv = _Particles[c.pIdx].invMass;
 	float  cInv = c.rbInvMass;
 	float  wTot = pInv + cInv;
-	_Positions[c.pIdx].predict = pos + ((wTot > EPSILON) ? corr * (pInv / wTot) : corr);
 
-	// Velocity: kill relative inward component, inherit surface velocity
 	float3 pVel  = _Particles[c.pIdx].velocity;
 	float  vRelN = dot(pVel, nrm) - c.surfVelN;
+
+	if (pen >= 0.0)
+	{
+		// Skin zone: only damp inward velocity, no position correction.
+		if (vRelN < 0.0)
+		{
+			_Particles[c.pIdx].velocity -= nrm * vRelN;
+		}
+		return;
+	}
+
+	// Full penetration: positional correction + velocity correction.
+	float3 corr = -nrm * pen;
+	if (wTot > EPSILON)
+	{
+		_Positions[c.pIdx].predict = pos + corr * (pInv / wTot);
+	}
+	else
+	{
+		_Positions[c.pIdx].predict = pos + corr;
+	}
+
+	// Kill relative inward velocity.
 	if (vRelN < 0.0)
+	{
 		_Particles[c.pIdx].velocity -= nrm * vRelN;
+	}
 
 	// Dynamic: Newton-3rd impulse accumulation
 	if (c.colType == COL_DYNAMIC && wTot > EPSILON)
