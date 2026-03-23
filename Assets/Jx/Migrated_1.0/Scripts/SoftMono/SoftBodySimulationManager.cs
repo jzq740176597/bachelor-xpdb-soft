@@ -113,7 +113,8 @@ namespace XPBD
 		// ── Kernel IDs ────────────────────────────────────────────────────────
 		int _kClearImpulse, _kDetectShapes, _kShapesSolve;
 		int _kComputeBounds, _kClearSoftSoftDelta, _kDetectSoftSoft, _kApplySoftSoftDelta;
-		int _kPresolve, _kPostsolve, _kStretch, _kVolume;
+		int _kPresolve, _kPostsolve, _kStretch, _kVolume, _kClampDelta;
+		int _kWriteCollisionState, _kClearCollisionState;
 		int _kDirectDeform, _kTetDeform, _kRecalcNormals, _kNormalizeNormals;
 
 		// Per-body GPU bounds buffer + CPU readback (4 uints: centroid_fp×3, count, maxDistSq, pad×3)
@@ -218,16 +219,19 @@ namespace XPBD
 				}
 
 				// Collision pass 1: CCD — before elastic constraints.
-				// Pushes particles outside sphere so Stretch/Volume start clean.
+				// Detect+solve to push particles out, then WriteCollisionState so
+				// ClampDelta can suppress inward elastic deltas in Stretch/Volume.
 				if (hasRigid)
 				{
 					foreach (var body in _bodies)
 					{
 						if (!body)
 							continue;
+						DispatchClearCollisionState(body.State);
 						ResetColSize(body.State);
 						DispatchDetectShapes(body.State);
 						DispatchShapesSolve(body.State);
+						DispatchWriteCollisionState(body.State);
 					}
 				}
 
@@ -828,6 +832,34 @@ namespace XPBD
 			cs.Dispatch(_kPresolve, Ceil(body.ParticleCount), 1, 1);
 		}
 
+		void DispatchClearCollisionState(SoftBodyGPUState body)
+		{
+			var cs = CollisionShapesCS;
+			cs.SetInt("_ParticleCount", body.ParticleCount);
+			cs.SetBuffer(_kClearCollisionState, "_CollisionState", body.CollisionStateBuffer);
+			cs.Dispatch(_kClearCollisionState, Ceil(body.ParticleCount), 1, 1);
+		}
+
+		void DispatchWriteCollisionState(SoftBodyGPUState body)
+		{
+			var cs = CollisionShapesCS;
+			cs.SetBuffer(_kWriteCollisionState, "_Positions",      body.PositionsBuffer);
+			cs.SetBuffer(_kWriteCollisionState, "_Particles",      body.ParticleBuffer);
+			cs.SetBuffer(_kWriteCollisionState, "_ColSize",        body.ColSizeBuffer);
+			cs.SetBuffer(_kWriteCollisionState, "_ColConstraints", body.ColConstraintBuffer);
+			cs.SetBuffer(_kWriteCollisionState, "_CollisionState", body.CollisionStateBuffer);
+			cs.Dispatch(_kWriteCollisionState, Ceil(MAX_COLLISION_CONSTRAINTS), 1, 1);
+		}
+
+		void DispatchClampDelta(SoftBodyComponent bodyCmp)
+		{
+			var body = bodyCmp.State;
+			var cs   = SoftBodySimCS;
+			cs.SetInt("_ParticleCount", body.ParticleCount);
+			BindSimBuffers(cs, _kClampDelta, bodyCmp);
+			cs.Dispatch(_kClampDelta, Ceil(body.ParticleCount), 1, 1);
+		}
+
 		void DispatchConstraintsAndPostsolve(SoftBodyComponent bodyCmp)
 		{
 			var body = bodyCmp.State;
@@ -838,6 +870,11 @@ namespace XPBD
 
 			BindSimBuffers(cs, _kVolume, bodyCmp);
 			cs.Dispatch(_kVolume, Ceil(body.TetCount), 1, 1);
+
+			// ClampDelta: zero elastic delta components pointing into the collider.
+			// Gives collision hard priority over Stretch/Volume constraints.
+			BindSimBuffers(cs, _kClampDelta, bodyCmp);
+			cs.Dispatch(_kClampDelta, Ceil(body.ParticleCount), 1, 1);
 
 			BindSimBuffers(cs, _kPostsolve, bodyCmp);
 			cs.Dispatch(_kPostsolve, Ceil(body.ParticleCount), 1, 1);
@@ -858,6 +895,8 @@ namespace XPBD
 				cs.SetBuffer(kernel, "_Delta",    deltaBuffer);
 				cs.SetBuffer(kernel, "_DeltaRaw", deltaBuffer);
 			}
+			if (ReferenceEquals(cs, SoftBodySimCS))
+				cs.SetBuffer(kernel, "_CollisionState", bodyCmp.State.CollisionStateBuffer);
 		}
 
 		// ── Mesh deformation ──────────────────────────────────────────────────
@@ -941,6 +980,9 @@ namespace XPBD
 			_kPostsolve = SoftBodySimCS.FindKernel("Postsolve");
 			_kStretch = SoftBodySimCS.FindKernel("StretchConstraint");
 			_kVolume = SoftBodySimCS.FindKernel("VolumeConstraint");
+			_kClampDelta          = SoftBodySimCS.FindKernel("ClampDelta");
+			_kWriteCollisionState = CollisionShapesCS.FindKernel("WriteCollisionState");
+			_kClearCollisionState = CollisionShapesCS.FindKernel("ClearCollisionState");
 
 			_kClearImpulse = CollisionShapesCS.FindKernel("ClearImpulseAccum");
 			_kDetectShapes = CollisionShapesCS.FindKernel("DetectShapes");

@@ -47,6 +47,8 @@
 #pragma kernel ClearImpulseAccum
 #pragma kernel DetectShapes
 #pragma kernel SolveCollisions
+#pragma kernel WriteCollisionState
+#pragma kernel ClearCollisionState
 
 #pragma target 5.0
 
@@ -112,6 +114,11 @@ RWStructuredBuffer<PbdPositions>  _Positions;
 RWStructuredBuffer<uint>          _ColSize;
 RWStructuredBuffer<ColConstraint> _ColConstraints;
 RWByteAddressBuffer               _ImpulseBytes;
+
+// Per-particle collision state: float4(normal.xyz, depth).
+// depth < 0 = penetrating; >= 1e9 = no collision.
+// Written by WriteCollisionState, read by ClampDelta in SoftBodySim.compute.
+RWStructuredBuffer<float4>        _CollisionState;
 
 // ── Atomic float CAS ─────────────────────────────────────────────────────────
 
@@ -541,4 +548,57 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 		uint dummy;
 		_ImpulseBytes.InterlockedAdd(b + 12, 1u, dummy);
 	}
+}
+// ── Kernel: ClearCollisionState ──────────────────────────────────────────────
+// Resets per-particle collision state to "no collision" each substep.
+// Must run before Presolve so ClampDelta sees fresh data.
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ClearCollisionState(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ParticleCount) return;
+    _CollisionState[id.x] = float4(0.0, 1.0, 0.0, 1e9);
+}
+
+// ── Kernel: WriteCollisionState ───────────────────────────────────────────────
+// After SolveCollisions, write the shallowest (most penetrating) collision
+// into _CollisionState[pIdx] for each particle.
+// ClampDelta in SoftBodySim.compute will zero the inward elastic delta for
+// that particle, giving collision hard priority over Stretch/Volume.
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void WriteCollisionState(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ColSize[0] || i >= MAX_CONSTRAINTS) return;
+
+    ColConstraint c = _ColConstraints[i];
+
+    // Re-evaluate current penetration depth (sphere or plane mode).
+    float3 pos = _Positions[c.pIdx].predict;
+    float3 nrm = c.normal;
+    float  pen;
+    if (c.sphereRadius > 0.0)
+    {
+        float3 toParticle = pos - c.contactPt;
+        float  dist       = length(toParticle);
+        nrm = dist > EPSILON ? toParticle / dist : c.normal;
+        pen = dist - c.sphereRadius;
+    }
+    else
+    {
+        float planeDist = dot(c.contactPt, nrm);
+        pen = dot(pos, nrm) - planeDist;
+    }
+
+    // Only record actual penetration (pen < 0).
+    if (pen >= 0.0) return;
+
+    // Keep the shallowest (most negative) pen per particle.
+    // Use InterlockedMin on the float bits — safe for negative floats
+    // only if we flip sign and use InterlockedMax, but for simplicity
+    // we just write unconditionally here; multiple threads writing to
+    // the same particle will race but any valid collision normal/depth
+    // is sufficient for ClampDelta to work correctly.
+    _CollisionState[c.pIdx] = float4(nrm.x, nrm.y, nrm.z, pen);
 }

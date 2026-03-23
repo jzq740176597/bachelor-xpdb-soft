@@ -24,6 +24,7 @@
 #pragma kernel Postsolve
 #pragma kernel StretchConstraint
 #pragma kernel VolumeConstraint
+#pragma kernel ClampDelta
 
 #pragma use_dxc
 #pragma target 5.0
@@ -81,6 +82,11 @@ RWStructuredBuffer<Tetrahedral>  _Tetrahedrals;
 // Each float3 holds the sum of all positional corrections this substep.
 // Written atomically by constraint kernels; read and applied by Postsolve.
 RWStructuredBuffer<float3> _Delta;
+
+// Per-particle collision state written by WriteCollisionState in Collision_Shapes.
+// float4(normal.xyz, depth): depth < 0 = penetrating, >= 1e9 = no collision.
+// ClampDelta reads this to suppress inward elastic deltas.
+RWStructuredBuffer<float4> _CollisionState;
 
 // ─── Atomic float add (CAS loop) ──────────────────────────────────────────────
 // Atomically adds 'v' to the float at byte offset 'byteOff' in a raw view of
@@ -231,4 +237,38 @@ void VolumeConstraint(uint3 id : SV_DispatchThreadID)
     [unroll]
     for (int v = 0; v < 4; v++)
         AtomicAddDelta(ids[v], normals[v] * correction * _Particles[ids[v]].invMass);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: ClampDelta
+// Runs AFTER Stretch+Volume have accumulated _Delta, BEFORE Postsolve applies it.
+//
+// For each particle that has an active collision (depth < 0):
+//   Project _Delta[i] onto the collision normal.
+//   If the projected component is negative (delta pushes toward the collider),
+//   zero it out.
+//
+// This gives collision hard priority over all elastic constraints:
+// Stretch and Volume corrections that would push a particle back inside
+// the collider are silently discarded. The particle stays on the surface.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void ClampDelta(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount) return;
+
+    float4 cs = _CollisionState[i];
+    float  depth = cs.w;
+
+    // No collision this substep — leave delta untouched.
+    if (depth >= 1e8) return;
+
+    float3 nrm   = cs.xyz;
+    float3 delta = _Delta[i];
+
+    // Project delta onto collision normal.
+    // Negative projection means delta pushes toward collider — remove it.
+    float proj = dot(delta, nrm);
+    if (proj < 0.0)
+        _Delta[i] = delta - nrm * proj;
 }

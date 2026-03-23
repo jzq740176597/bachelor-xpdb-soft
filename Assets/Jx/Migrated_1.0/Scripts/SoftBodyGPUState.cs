@@ -60,8 +60,12 @@ namespace XPBD
 		public readonly ComputeBuffer NormalBytesBuffer;
 
 		// ── Collision buffers ────────────────────────────────────────────────
-		public readonly ComputeBuffer ColSizeBuffer;       // uint[1]  — atomic counter
-		public readonly ComputeBuffer ColConstraintBuffer; // GPUColConstraint[MAX_CONSTRAINTS]
+		public readonly ComputeBuffer ColSizeBuffer;          // uint[1]  — atomic counter
+		public readonly ComputeBuffer ColConstraintBuffer;    // GPUColConstraint[MAX_CONSTRAINTS]
+		// Per-particle collision state written by WriteCollisionState kernel.
+		// float4(normal.xyz, depth): depth < 0 = penetrating, >= 1e9 = no collision.
+		// Read by ClampDelta in SoftBodySim.compute to suppress inward elastic deltas.
+		public readonly ComputeBuffer CollisionStateBuffer;   // float4[ParticleCount]
 
 		// ── Counts ───────────────────────────────────────────────────────────
 		public readonly int ParticleCount;
@@ -243,6 +247,16 @@ namespace XPBD
 			ColConstraintBuffer = new ComputeBuffer(
 				SoftBodySimulationManager.MAX_COLLISION_CONSTRAINTS,
 				GPUStrides.ColConstraint);
+			// float4 per particle: xyz = collision normal, w = penetration depth.
+			// Initialised to (0,1,0, 1e9) = no collision this substep.
+			CollisionStateBuffer = new ComputeBuffer(ParticleCount, 4 * sizeof(float));
+			var noCollision = new float[ParticleCount * 4];
+			for (int i = 0; i < ParticleCount; i++)
+			{
+				noCollision[i * 4 + 1] = 1f;     // normal.y = 1 (up)
+				noCollision[i * 4 + 3] = 1e9f;   // depth = +inf = no collision
+			}
+			CollisionStateBuffer.SetData(noCollision);
 			// FIX 2: allocate readback arrays once
 			ReadbackPos = new Vector3[VertexCount];
 			ReadbackNrm = new Vector3[VertexCount];
@@ -279,6 +293,7 @@ namespace XPBD
 			SafeRelease(NormalBytesBuffer);
 			SafeRelease(ColSizeBuffer);
 			SafeRelease(ColConstraintBuffer);
+			SafeRelease(CollisionStateBuffer);
 		}
 
 		static void SafeRelease(ComputeBuffer buf)
