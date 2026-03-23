@@ -24,6 +24,7 @@
 #pragma kernel Postsolve
 #pragma kernel StretchConstraint
 #pragma kernel VolumeConstraint
+#pragma kernel ClearDelta
 #pragma kernel ClampDelta
 #pragma kernel StretchConstraintWithExclusion
 #pragma kernel VolumeConstraintWithExclusion
@@ -292,6 +293,19 @@ void VolumeConstraintWithExclusion(uint3 id : SV_DispatchThreadID)
     [unroll]
     for (int v = 0; v < 4; v++)
         AtomicAddDelta(ids[v], normals[v] * correction * eff[v]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: ClearDelta
+// Zeroes _Delta for all particles. Used between ExclusionIteration passes
+// so each pass accumulates fresh corrections rather than doubling.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void ClearDelta(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount) return;
+    _Delta[i] = float3(0.0, 0.0, 0.0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

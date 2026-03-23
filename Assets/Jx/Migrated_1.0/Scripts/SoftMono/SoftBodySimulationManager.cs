@@ -70,9 +70,11 @@ namespace XPBD
 		[Tooltip("How many times to re-run detect+solve per substep after elastic constraints. " +
 				 "Higher values prevent penetration at the cost of GPU time. 2-3 is usually enough.")]
 		public int CollisionIterations = 3;
-		[Tooltip("Project elastic constraint endpoints outside colliders before computing stretch. " +
-			"Prevents elastic forces from generating restoring forces toward the collider interior.")]
+		[Tooltip("Project elastic constraint endpoints outside colliders before computing stretch.")]
 		public bool UseExclusionStretch = true;
+		[Range(1, 4)]
+		[Tooltip("Stretch+Volume exclusion iterations per substep. More = stronger contact resistance.")]
+		public int ExclusionIterations = 1;
 
 		[Tooltip("Scale for auto-computed particle radius. 1.0 = exact gap coverage. " +
 				"Lower = less visible margin but may allow very small colliders to slip through.")]
@@ -127,7 +129,7 @@ namespace XPBD
 		// ── Kernel IDs ────────────────────────────────────────────────────────
 		int _kClearImpulse, _kDetectShapes, _kShapesSolve;
 		int _kComputeBounds, _kClearSoftSoftDelta, _kDetectSoftSoft, _kApplySoftSoftDelta;
-		int _kPresolve, _kPostsolve, _kStretch, _kVolume, _kClampDelta;
+		int _kPresolve, _kPostsolve, _kStretch, _kVolume, _kClampDelta, _kClearDelta;
 		int _kHardProject, _kStretchExclusion, _kVolumeExclusion;
 		int _kWriteCollisionState, _kClearCollisionState;
 		int _kDirectDeform, _kTetDeform, _kRecalcNormals, _kNormalizeNormals;
@@ -567,10 +569,20 @@ namespace XPBD
 				_particleRadius = ContactSkinMin;
 				return;
 			}
-			// _particleRadius: covers inter-particle gaps. Independent of contact skin.
-			_particleRadius = Mathf.Max(maxPR, ContactSkinMin);
-			// _contactSkin: velocity-kill detection zone. Small — just enough for
-			// speculative contact. NOT inflated by particle radius.
+			// _particleRadius: must be >= smallest grip radius so even tiny colliders
+			// pin enough particles to form a rigid contact patch.
+			// Physics: contact stiffness scales with patch area ~4π(R_grip+r_p)².
+			// If r_p < R_grip, patch is too small and elastic forces overpower it.
+			float minGripR = float.MaxValue;
+			foreach (var col in _colliders)
+			{
+				if (col.Shape == XpbdColliderSource.ShapeType.Sphere)
+					minGripR = Mathf.Min(minGripR, col.Descriptor.param0);
+			}
+			if (minGripR == float.MaxValue)
+				minGripR = 0f;
+			_particleRadius = Mathf.Max(maxPR, Mathf.Max(minGripR, ContactSkinMin));
+			// _contactSkin: speculative detection. NOT inflated by particle radius.
 			_contactSkin = Mathf.Clamp(
 				maxExtent * ContactSkinFraction, ContactSkinMin, ContactSkinMax);
 		}
@@ -958,12 +970,26 @@ namespace XPBD
 			var cs   = SoftBodySimCS;
 
 			int stretchKernel = UseExclusionStretch ? _kStretchExclusion : _kStretch;
-			BindSimBuffers(cs, stretchKernel, bodyCmp);
-			cs.Dispatch(stretchKernel, Ceil(body.EdgeCount), 1, 1);
+			int volumeKernel  = UseExclusionStretch ? _kVolumeExclusion  : _kVolume;
+			int excIter = UseExclusionStretch ? ExclusionIterations : 1;
+			for (int ei = 0; ei < excIter; ei++)
+			{
+				// Clear delta before each extra iteration — Presolve already cleared
+				// it for the first pass. Without this, corrections double each pass.
+				if (ei > 0)
+				{
+					BindSimBuffers(cs, _kClearDelta, bodyCmp);
+					cs.Dispatch(_kClearDelta, Ceil(body.ParticleCount), 1, 1);
+				}
+				BindSimBuffers(cs, stretchKernel, bodyCmp);
+				cs.Dispatch(stretchKernel, Ceil(body.EdgeCount), 1, 1);
 
-			int volumeKernel = UseExclusionStretch ? _kVolumeExclusion : _kVolume;
-			BindSimBuffers(cs, volumeKernel, bodyCmp);
-			cs.Dispatch(volumeKernel, Ceil(body.TetCount), 1, 1);
+				BindSimBuffers(cs, volumeKernel, bodyCmp);
+				cs.Dispatch(volumeKernel, Ceil(body.TetCount), 1, 1);
+
+				// Apply this iteration via Postsolve, then restore predict for next pass.
+				// Only the last iteration feeds into the final Postsolve below.
+			}
 
 			// ClampDelta: zero elastic delta components pointing into the collider.
 			// Gives collision hard priority over Stretch/Volume constraints.
@@ -1075,6 +1101,7 @@ namespace XPBD
 			_kPostsolve = SoftBodySimCS.FindKernel("Postsolve");
 			_kStretch   = SoftBodySimCS.FindKernel("StretchConstraint");
 			_kVolume    = SoftBodySimCS.FindKernel("VolumeConstraint");
+			_kClearDelta             = SoftBodySimCS.FindKernel("ClearDelta");
 			_kClampDelta             = SoftBodySimCS.FindKernel("ClampDelta");
 			_kStretchExclusion        = SoftBodySimCS.FindKernel("StretchConstraintWithExclusion");
 			_kVolumeExclusion         = SoftBodySimCS.FindKernel("VolumeConstraintWithExclusion");
