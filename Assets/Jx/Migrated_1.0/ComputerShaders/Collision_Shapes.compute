@@ -561,10 +561,17 @@ void ClearCollisionState(uint3 id : SV_DispatchThreadID)
 }
 
 // ── Kernel: WriteCollisionState ───────────────────────────────────────────────
-// After SolveCollisions, write the shallowest (most penetrating) collision
-// into _CollisionState[pIdx] for each particle.
-// ClampDelta in SoftBodySim.compute will zero the inward elastic delta for
-// that particle, giving collision hard priority over Stretch/Volume.
+// Marks each particle that had a collision contact this substep so ClampDelta
+// can suppress inward elastic deltas.
+//
+// KEY: evaluate depth from raw sphere geometry, NOT from the corrected predict.
+// SolveCollisions already pushed predict to the surface (pen ≈ 0), so
+// evaluating pen from predict returns >= 0 and nothing would get written.
+// Instead use the stored sphere centre + radius directly.
+//
+// Write state for particles within _ContactSkin of the surface (pen < _ContactSkin).
+// A just-corrected particle has pen ≈ 0 — still within skin — so it gets marked
+// and ClampDelta blocks Stretch/Volume from pulling it back inside.
 
 [numthreads(GROUP_SIZE, 1, 1)]
 void WriteCollisionState(uint3 id : SV_DispatchThreadID)
@@ -573,32 +580,28 @@ void WriteCollisionState(uint3 id : SV_DispatchThreadID)
     if (i >= _ColSize[0] || i >= MAX_CONSTRAINTS) return;
 
     ColConstraint c = _ColConstraints[i];
-
-    // Re-evaluate current penetration depth (sphere or plane mode).
     float3 pos = _Positions[c.pIdx].predict;
-    float3 nrm = c.normal;
+    float3 nrm;
     float  pen;
+
     if (c.sphereRadius > 0.0)
     {
-        float3 toParticle = pos - c.contactPt;
+        float3 toParticle = pos - c.contactPt;   // contactPt = sphere end-centre
         float  dist       = length(toParticle);
         nrm = dist > EPSILON ? toParticle / dist : c.normal;
         pen = dist - c.sphereRadius;
     }
     else
     {
+        nrm = c.normal;
         float planeDist = dot(c.contactPt, nrm);
         pen = dot(pos, nrm) - planeDist;
     }
 
-    // Only record actual penetration (pen < 0).
-    if (pen >= 0.0) return;
+    // Write for any particle at or near the surface (pen < _ContactSkin).
+    // This covers: just-corrected (pen ≈ 0), still-penetrating (pen < 0),
+    // and approaching particles in the skin zone.
+    if (pen >= _ContactSkin) return;
 
-    // Keep the shallowest (most negative) pen per particle.
-    // Use InterlockedMin on the float bits — safe for negative floats
-    // only if we flip sign and use InterlockedMax, but for simplicity
-    // we just write unconditionally here; multiple threads writing to
-    // the same particle will race but any valid collision normal/depth
-    // is sufficient for ClampDelta to work correctly.
     _CollisionState[c.pIdx] = float4(nrm.x, nrm.y, nrm.z, pen);
 }
