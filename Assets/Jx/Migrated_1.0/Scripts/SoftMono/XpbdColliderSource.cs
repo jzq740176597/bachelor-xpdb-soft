@@ -68,33 +68,40 @@ namespace XPBD
 		{
 			get; private set;
 		}
+
 		public ShapeType Shape
 		{
 			get; private set;
 		}
+
 		public Rigidbody Body
 		{
 			get; private set;
 		}
+
 		public ShapeDescriptorCPU Descriptor
 		{
 			get; private set;
 		}
+
 		public Vector3 SurfaceVelocity
 		{
 			get; private set;
 		}
+
 
 		// World-space face planes for SHAPE_CONVEX (null for other types).
 		public Vector4[] FacePlanes
 		{
 			get; private set;
 		}
+
 		// Set by manager before RefreshDescriptor for convex shapes.
 		public uint FacePlanesOffset
 		{
 			get; set;
 		}
+
 
 		Collider _col;
 		Vector3 _prevPos;
@@ -193,18 +200,16 @@ namespace XPBD
 		Vector3 GetCurPos()
 		{
 			if (Type == ColType.Kinematic && Body)
-			{
 				return Body.position;
-			}
+
 			return transform.position;
 		}
 
 		Quaternion GetCurRot()
 		{
 			if (Type == ColType.Kinematic && Body)
-			{
 				return Body.rotation;
-			}
+
 			return transform.rotation;
 		}
 
@@ -213,10 +218,12 @@ namespace XPBD
 			SoftBodySimulationManager.Instance?.RegisterCollider(this);
 		}
 
+
 		void OnDisable()
 		{
 			SoftBodySimulationManager.Instance?.UnregisterCollider(this);
 		}
+
 
 		// ─────────────────────────────────────────────────────────────────────
 		// Called ONCE per fixed frame, BEFORE the substep loop.
@@ -255,17 +262,14 @@ namespace XPBD
 			// displacement from previous substep position to this substep position.
 			// For kinematic bodies this correctly scales with subDT.
 			if (Type == ColType.Dynamic && Body)
-			{
 				SurfaceVelocity = Body.velocity;
-			}
+
 			else if (Type == ColType.Kinematic)
-			{
 				SurfaceVelocity = (lerpPos - _prevPos) / Mathf.Max(subDT, 1e-6f);
-			}
+
 			else
-			{
 				SurfaceVelocity = Vector3.zero;
-			}
+
 
 			// Record centre at START of this substep before advancing _prevPos.
 			_prevSubstepCentre = _prevPos;
@@ -299,17 +303,14 @@ namespace XPBD
 		{
 			Vector3 curPos = GetCurPos();
 			if (Type == ColType.Dynamic && Body)
-			{
 				SurfaceVelocity = Body.velocity;
-			}
+
 			else if (Type == ColType.Kinematic)
-			{
 				SurfaceVelocity = (curPos - _prevPos) / Mathf.Max(dt, 1e-6f);
-			}
+
 			else
-			{
 				SurfaceVelocity = Vector3.zero;
-			}
+
 
 			_prevPos = GetCurPos();
 			_prevRot = GetCurRot();
@@ -377,30 +378,24 @@ namespace XPBD
 						// cc.direction: 0=X, 1=Y, 2=Z — must match BuildDescriptor axis logic.
 						Vector3 localAx;
 						if (cc.direction == 0)
-						{
 							localAx = Vector3.right;
-						}
+
 						else if (cc.direction == 2)
-						{
 							localAx = Vector3.forward;
-						}
+
 						else
-						{
 							localAx = Vector3.up;
-						}
+
 						float axScl;
 						if (cc.direction == 0)
-						{
 							axScl = Mathf.Abs(transform.lossyScale.x);
-						}
+
 						else if (cc.direction == 2)
-						{
 							axScl = Mathf.Abs(transform.lossyScale.z);
-						}
+
 						else
-						{
 							axScl = Mathf.Abs(transform.lossyScale.y);
-						}
+
 						d.centre = pos + rot * Vector3.Scale(cc.center, transform.lossyScale);
 						d.axis   = (rot * localAx).normalized;
 						d.param0 = cc.radius * MaxScale();

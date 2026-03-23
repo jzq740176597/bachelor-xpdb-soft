@@ -44,6 +44,7 @@ namespace XPBD
 			get; private set;
 		}
 
+
 		// ── Constants ─────────────────────────────────────────────────────────
 		public const int MAX_COLLISION_CONSTRAINTS = 10000;
 		const int GROUP_SIZE = 32;
@@ -63,6 +64,19 @@ namespace XPBD
 		[Range(1, 25)] public int SubSteps = 20;
 		[Range(0f, 1f)] public float EdgeCompliance = 0.01f;
 		[Range(0f, 1f)] public float VolumeCompliance = 0.0f;
+
+		[Header("Collision")]
+		[Range(1, 8)]
+		[Tooltip("How many times to re-run detect+solve per substep after elastic constraints. " +
+				 "Higher values prevent penetration at the cost of GPU time. 2-3 is usually enough.")]
+		public int CollisionIterations = 3;
+		[Tooltip("Project elastic constraint endpoints outside colliders before computing stretch. " +
+			"Prevents elastic forces from generating restoring forces toward the collider interior.")]
+		public bool UseExclusionStretch = true;
+
+		[Tooltip("Scale for auto-computed particle radius. 1.0 = exact gap coverage. " +
+				"Lower = less visible margin but may allow very small colliders to slip through.")]
+		[Range(0.1f, 2f)] public float ParticleRadiusScale = 0.8f;
 
 		[Header("Contact Skin")]
 		[Tooltip("Minimum contact skin width in metres. Default 0.005 (5 mm). " +
@@ -114,6 +128,7 @@ namespace XPBD
 		int _kClearImpulse, _kDetectShapes, _kShapesSolve;
 		int _kComputeBounds, _kClearSoftSoftDelta, _kDetectSoftSoft, _kApplySoftSoftDelta;
 		int _kPresolve, _kPostsolve, _kStretch, _kVolume, _kClampDelta;
+		int _kHardProject, _kStretchExclusion, _kVolumeExclusion;
 		int _kWriteCollisionState, _kClearCollisionState;
 		int _kDirectDeform, _kTetDeform, _kRecalcNormals, _kNormalizeNormals;
 
@@ -131,6 +146,7 @@ namespace XPBD
 		// Unified contact skin — set each frame from the bodies' bounding extents.
 		// GPU uniform _ContactSkin; replaces the old per-shape #define constants.
 		float _contactSkin = 0.04f;
+		float _particleRadius = 0.05f;
 
 		// ─────────────────────────────────────────────────────────────────────
 		void Awake()
@@ -149,11 +165,13 @@ namespace XPBD
 		{
 			foreach (var b in _bodies)
 				Destroy(b);
+
 			ReleaseCollisionBuffers();
 			ReleaseSoftSoftBuffers();
 			SoftBodyGPUState.ClearAssetCache_S();
 			if (Instance == this)
 				Instance = null;
+
 		}
 
 		// ─────────────────────────────────────────────────────────────────────
@@ -164,9 +182,10 @@ namespace XPBD
 			_timeAccum += Time.deltaTime;
 			if (_timeAccum < _fixedDT)
 				return;
+
 			_timeAccum -= _fixedDT;
 
-			bool hasRigid = _colliders.Count > 0 && CollisionShapesCS;
+			bool hasRigid    = _colliders.Count > 0 && CollisionShapesCS;
 			bool hasSoftSoft = _softSoftPairs.Count > 0 && SoftSoftCollisionCS && SoftSoftApplyCS;
 
 			if (hasRigid)
@@ -177,18 +196,19 @@ namespace XPBD
 				// to the current transform.position; if we snapshot after that, both
 				// frameStartPos and the lerp target are the same and no sweep occurs.
 				foreach (var col in _colliders)
-				{
 					col.SnapshotStartOfFrame();
-				}
+
 				// Recompute adaptive contact skin from the largest registered body.
 				UpdateContactSkin();
 				RebuildCollisionBuffers(_fixedDT);
 				if (_dynSlotCount > 0)
 					DispatchClearImpulse();
+
 			}
 
 			if (hasSoftSoft)
 				EnsureSoftSoftPairBuffers();
+
 
 			// Substep-outer / bodies-inner with two phases:
 			//   Phase 1: ALL bodies integrate (Presolve→Stretch→Volume→Postsolve)
@@ -230,7 +250,7 @@ namespace XPBD
 						DispatchClearCollisionState(body.State);
 						ResetColSize(body.State);
 						DispatchDetectShapes(body.State);
-						DispatchShapesSolve(body.State);
+						DispatchShapesSolve(body);
 						DispatchWriteCollisionState(body.State);
 					}
 				}
@@ -243,25 +263,41 @@ namespace XPBD
 						continue;
 					DispatchConstraintsAndPostsolve(body);
 					if (hasSoftSoft)
-					{
 						DispatchComputeBounds(body);
+
+				}
+
+				// Collision post-elastic iterations: re-run detect+solve N times.
+				// Each iteration catches particles that elastic constraints pushed
+				// back inside. CollisionIterations=3 is usually sufficient.
+				for (int ci = 0; ci < CollisionIterations; ci++)
+				{
+					foreach (var body in _bodies)
+					{
+						if (!body)
+							continue;
+						if (hasRigid)
+						{
+							ResetColSize(body.State);
+							DispatchDetectShapes(body.State);
+							DispatchShapesSolve(body);
+						}
+						if (hasSoftSoft && ci == CollisionIterations - 1)
+							DispatchSoftSoftPairs(body.State);
 					}
 				}
 
-				// Collision pass 2: post-elastic — catches anything Stretch/Volume
-				// pushed back inside the collider. Uses sphere re-evaluation mode.
-				foreach (var body in _bodies)
+				// HardProject: absolute final guarantee — analytic projection of every
+				// particle outside every shape. Runs after all elastic constraints.
+				// Nothing runs after this in the substep so it cannot be undone.
+				if (hasRigid)
 				{
-					if (!body)
-						continue;
-					if (hasRigid)
+					foreach (var body in _bodies)
 					{
-						ResetColSize(body.State);
-						DispatchDetectShapes(body.State);
-						DispatchShapesSolve(body.State);
+						if (!body)
+							continue;
+						DispatchHardProject(body.State);
 					}
-					if (hasSoftSoft)
-						DispatchSoftSoftPairs(body.State);
 				}
 			}
 
@@ -274,6 +310,7 @@ namespace XPBD
 
 			if (hasRigid && _dynSlotCount > 0)
 				ApplyDynamicImpulses();
+
 		}
 
 		// ── Public API ────────────────────────────────────────────────────────
@@ -326,6 +363,7 @@ namespace XPBD
 			if (state == null || state.ParticleCount == 0)
 				return;
 
+
 			int floatsPerParticle = 8; // float3 pos + float pad + float3 vel + float invMass = 32 bytes
 			var raw = new float[state.ParticleCount * floatsPerParticle];
 			state.ParticleBuffer.GetData(raw);
@@ -346,18 +384,22 @@ namespace XPBD
 					Vector3.Distance(new Vector3(raw[o], raw[o + 1], raw[o + 2]), centroid));
 			}
 			body.BoundingRadius = Mathf.Max(maxDist, 0.01f);
+			float sa = 4f * Mathf.PI * body.BoundingRadius * body.BoundingRadius;
+			body.ParticleRadius = Mathf.Sqrt(sa / state.ParticleCount / Mathf.PI) * ParticleRadiusScale;
 		}
 
 		public void RegisterCollider(XpbdColliderSource src)
 		{
 			if (!_colliders.Contains(src))
 				_colliders.Add(src);
+
 		}
 
 		public void UnregisterCollider(XpbdColliderSource src)
 		{
 			_colliders.Remove(src);
 		}
+
 
 		// ── Soft-Soft pair API ────────────────────────────────────────────────
 
@@ -369,7 +411,9 @@ namespace XPBD
 		{
 			var key = MakePairKey(a, b);
 			if (!_softSoftPairs.ContainsKey(key))
+{
 				_softSoftPairs[key] = null; // buffers allocated lazily
+}
 		}
 
 		/// <summary>Remove a previously registered explicit pair.</summary>
@@ -397,17 +441,21 @@ namespace XPBD
 				var a = _bodies[i];
 				if (!a || a.SoftCollisionMask == 0)
 					continue;
+
 				for (int j = i + 1; j < _bodies.Count; j++)
 				{
 					var b = _bodies[j];
 					if (!b || b.SoftCollisionMask == 0)
 						continue;
+
 					bool aSeesB = (a.SoftCollisionMask & (1 << b.SoftCollisionLayer)) != 0;
 					bool bSeesA = (b.SoftCollisionMask & (1 << a.SoftCollisionLayer)) != 0;
 					if (aSeesB && bSeesA)
 						AddSoftSoftPair(a, b);
+
 					else
 						RemoveSoftSoftPair(a, b);
+
 				}
 			}
 		}
@@ -430,22 +478,28 @@ namespace XPBD
 				if (col.Type == XpbdColliderSource.ColType.Dynamic)
 					_dynSlotCount++;
 
+
 				if (col.Shape == XpbdColliderSource.ShapeType.Convex)
 					col.FacePlanesOffset = facePlaneOff;
+
 
 				col.RefreshDescriptor(dt, slot);
 
 				if (col.Shape == XpbdColliderSource.ShapeType.Convex && col.FacePlanes != null)
 					facePlaneOff += (uint) col.FacePlanes.Length;
+
 			}
 			_totalFacePlanes = (int) facePlaneOff;
 
 			if (_cpuShapes.Length < count)
 				_cpuShapes = new ShapeDescriptorCPU[count];
+
 			if (_cpuVels.Length < count)
 				_cpuVels = new Vector3[count];
+
 			if (_cpuFacePlanes.Length < _totalFacePlanes)
 				_cpuFacePlanes = new Vector4[Mathf.Max(_totalFacePlanes, 1)];
+
 
 			int fpIdx = 0;
 			for (int i = 0; i < count; i++)
@@ -481,11 +535,13 @@ namespace XPBD
 			if (_totalFacePlanes > 0)
 				_meshFacePlanesBuffer.SetData(_cpuFacePlanes, 0, 0, _totalFacePlanes);
 
+
 			var cs = CollisionShapesCS;
-			cs.SetInt("_ShapeCount", _shapeCount);
-			cs.SetInt("_DynSlotCount", _dynSlotCount);
-			cs.SetFloat("_ColDeltaTime", _subDT);
-			cs.SetFloat("_ContactSkin", _contactSkin);
+			cs.SetInt("_ShapeCount",    _shapeCount);
+			cs.SetInt("_DynSlotCount",  _dynSlotCount);
+			cs.SetFloat("_ColDeltaTime",   _subDT);
+			cs.SetFloat("_ContactSkin",    _contactSkin);
+			cs.SetFloat("_ParticleRadius", _particleRadius);
 		}
 
 		// Recompute the adaptive contact skin each frame.
@@ -496,23 +552,27 @@ namespace XPBD
 		void UpdateContactSkin()
 		{
 			float maxExtent = 0f;
+			float maxPR = 0f;
 			foreach (var body in _bodies)
 			{
 				if (body != null && body.State != null)
 				{
 					maxExtent = Mathf.Max(maxExtent, body.BoundingRadius);
+					maxPR     = Mathf.Max(maxPR,     body.ParticleRadius);
 				}
 			}
 			if (maxExtent < 1e-4f)
 			{
-				// No bodies yet or all degenerate — use minimum.
-				_contactSkin = ContactSkinMin;
+				_contactSkin    = ContactSkinMin;
+				_particleRadius = ContactSkinMin;
 				return;
 			}
+			// _particleRadius: covers inter-particle gaps. Independent of contact skin.
+			_particleRadius = Mathf.Max(maxPR, ContactSkinMin);
+			// _contactSkin: velocity-kill detection zone. Small — just enough for
+			// speculative contact. NOT inflated by particle radius.
 			_contactSkin = Mathf.Clamp(
-				maxExtent * ContactSkinFraction,
-				ContactSkinMin,
-				ContactSkinMax);
+				maxExtent * ContactSkinFraction, ContactSkinMin, ContactSkinMax);
 		}
 
 		void ReleaseCollisionBuffers()
@@ -530,7 +590,9 @@ namespace XPBD
 		// ── Rigid-collision dispatches ────────────────────────────────────────
 
 		void ResetColSize(SoftBodyGPUState body)
-			=> body.ColSizeBuffer.SetData(new uint[] { 0 });
+		{
+			body.ColSizeBuffer.SetData(new uint[] { 0 });
+		}
 
 		void DispatchClearImpulse()
 		{
@@ -543,18 +605,15 @@ namespace XPBD
 		void UploadShapesForSubstep()
 		{
 			if (_shapesBuffer == null)
-			{
 				return;
-			}
+
 			int count = _colliders.Count;
 			for (int i = 0; i < count; i++)
-			{
 				_cpuShapes[i] = _colliders[i].Descriptor;
-			}
+
 			for (int i = 0; i < count; i++)
-			{
 				_cpuVels[i] = _colliders[i].SurfaceVelocity;
-			}
+
 			_shapesBuffer.SetData(_cpuShapes, 0, 0, count);
 			_shapeVelBuffer.SetData(_cpuVels, 0, 0, count);
 			// Re-upload face planes for any convex shapes that moved
@@ -570,6 +629,7 @@ namespace XPBD
 			}
 			if (_totalFacePlanes > 0)
 				_meshFacePlanesBuffer.SetData(_cpuFacePlanes, 0, 0, _totalFacePlanes);
+
 		}
 
 		void DispatchDetectShapes(SoftBodyGPUState body)
@@ -587,18 +647,38 @@ namespace XPBD
 			cs.Dispatch(_kDetectShapes, Ceil(_shapeCount * body.ParticleCount), 1, 1);
 		}
 
-		void DispatchShapesSolve(SoftBodyGPUState body)
+		void DispatchShapesSolve(SoftBodyComponent bodyCmp)
 		{
-			var cs = CollisionShapesCS;
-			cs.SetFloat("_ColDeltaTime", _subDT);
-			cs.SetFloat("_ContactSkin",  _contactSkin);
+			var body = bodyCmp.State;
+			var cs   = CollisionShapesCS;
+			cs.SetFloat("_ColDeltaTime",          _subDT);
+			cs.SetFloat("_ContactSkin",           _contactSkin);
+			cs.SetFloat("_ParticleRadius",         _particleRadius);
+			cs.SetFloat("_CollisionDeltaWeight",  (float)SubSteps);
 			cs.SetInt("_ParticleCount", body.ParticleCount);
-			cs.SetBuffer(_kShapesSolve, "_ImpulseBytes", _impulseBuffer);
-			cs.SetBuffer(_kShapesSolve, "_Particles", body.ParticleBuffer);
-			cs.SetBuffer(_kShapesSolve, "_Positions", body.PositionsBuffer);
-			cs.SetBuffer(_kShapesSolve, "_ColSize", body.ColSizeBuffer);
+			cs.SetBuffer(_kShapesSolve, "_ImpulseBytes",   _impulseBuffer);
+			cs.SetBuffer(_kShapesSolve, "_Particles",      body.ParticleBuffer);
+			cs.SetBuffer(_kShapesSolve, "_Positions",      body.PositionsBuffer);
+			cs.SetBuffer(_kShapesSolve, "_ColSize",        body.ColSizeBuffer);
 			cs.SetBuffer(_kShapesSolve, "_ColConstraints", body.ColConstraintBuffer);
+			cs.SetBuffer(_kShapesSolve, "_CollisionState", body.CollisionStateBuffer);
+			if (_bodyDeltaBuffers.TryGetValue(bodyCmp.GetInstanceID(), out var deltaBuffer))
+				cs.SetBuffer(_kShapesSolve, "_DeltaRaw", deltaBuffer);
 			cs.Dispatch(_kShapesSolve, Ceil(MAX_COLLISION_CONSTRAINTS), 1, 1);
+		}
+
+		void DispatchHardProject(SoftBodyGPUState body)
+		{
+			if (_shapesBuffer == null) return;
+			var cs = CollisionShapesCS;
+			cs.SetInt("_ParticleCount",     body.ParticleCount);
+			cs.SetFloat("_ContactSkin",      _contactSkin);
+			cs.SetFloat("_ParticleRadius",    _particleRadius);
+			cs.SetBuffer(_kHardProject, "_Particles",       body.ParticleBuffer);
+			cs.SetBuffer(_kHardProject, "_Positions",       body.PositionsBuffer);
+			cs.SetBuffer(_kHardProject, "_Shapes",          _shapesBuffer);
+			cs.SetBuffer(_kHardProject, "_ShapeVelocities", _shapeVelBuffer);
+			cs.Dispatch(_kHardProject, Ceil(body.ParticleCount), 1, 1);
 		}
 
 		void ApplyDynamicImpulses()
@@ -611,6 +691,7 @@ namespace XPBD
 			{
 				if (col.Type != XpbdColliderSource.ColType.Dynamic)
 					continue;
+
 				if (!col.Body)
 				{
 					slot++;
@@ -649,6 +730,7 @@ namespace XPBD
 				if (a == null || b == null)
 					continue;
 
+
 				var bufs = _softSoftPairs[key];
 				int nA = a.State.ParticleCount;
 				int nB = b.State.ParticleCount;
@@ -665,6 +747,7 @@ namespace XPBD
 		{
 			foreach (var bufs in _softSoftPairs.Values)
 				bufs?.Release();
+
 			_softSoftPairs.Clear();
 		}
 
@@ -677,6 +760,7 @@ namespace XPBD
 			int id = body.GetInstanceID();
 			if (!_bodyBoundsBuffers.TryGetValue(id, out var buf) || buf == null)
 				return;
+
 
 			// Zero the accumulator
 			buf.SetData(new uint[8]);
@@ -700,11 +784,13 @@ namespace XPBD
 			if (!_bodyBoundsBuffers.TryGetValue(id, out var buf) || buf == null)
 				return false;
 
+
 			buf.GetData(_boundsReadback);
 
 			int count = _boundsReadback[3];
 			if (count == 0)
 				return false;
+
 
 			const float FP_SCALE = 1000f;
 			centroid = new Vector3(
@@ -736,17 +822,21 @@ namespace XPBD
 				if (bufs == null)
 					continue;
 
+
 				var a = FindBody(kvp.Key.Item1);
 				var b = FindBody(kvp.Key.Item2);
 				if (a == null || b == null)
 					continue;
 
+
 				if (a.State != bodyState && b.State != bodyState)
 					continue;
+
 
 				var pairKey = kvp.Key;
 				if (_softSoftDetectedThisStep.Contains(pairKey))
 					continue;
+
 				_softSoftDetectedThisStep.Add(pairKey);
 
 				// ColRadius auto-formula: AutoRadiusMul * sqrt(4π * R² / N)
@@ -771,6 +861,7 @@ namespace XPBD
 				{
 					if (Vector3.Distance(centA, centB) > radA + radB + radius)
 						continue;
+
 				}
 
 				int nA = a.State.ParticleCount;
@@ -824,6 +915,7 @@ namespace XPBD
 			cs.SetFloat("_DeltaTime",          _subDT);
 			cs.SetFloat("_DistanceCompliance", EdgeCompliance);
 			cs.SetFloat("_VolumeCompliance",   VolumeCompliance);
+			cs.SetFloat("_ContactSkin",        _contactSkin);
 			cs.SetInt("_ParticleCount", body.ParticleCount);
 			cs.SetInt("_EdgeCount",     body.EdgeCount);
 			cs.SetInt("_TetCount",      body.TetCount);
@@ -865,11 +957,13 @@ namespace XPBD
 			var body = bodyCmp.State;
 			var cs   = SoftBodySimCS;
 
-			BindSimBuffers(cs, _kStretch, bodyCmp);
-			cs.Dispatch(_kStretch, Ceil(body.EdgeCount), 1, 1);
+			int stretchKernel = UseExclusionStretch ? _kStretchExclusion : _kStretch;
+			BindSimBuffers(cs, stretchKernel, bodyCmp);
+			cs.Dispatch(stretchKernel, Ceil(body.EdgeCount), 1, 1);
 
-			BindSimBuffers(cs, _kVolume, bodyCmp);
-			cs.Dispatch(_kVolume, Ceil(body.TetCount), 1, 1);
+			int volumeKernel = UseExclusionStretch ? _kVolumeExclusion : _kVolume;
+			BindSimBuffers(cs, volumeKernel, bodyCmp);
+			cs.Dispatch(volumeKernel, Ceil(body.TetCount), 1, 1);
 
 			// ClampDelta: zero elastic delta components pointing into the collider.
 			// Gives collision hard priority over Stretch/Volume constraints.
@@ -921,9 +1015,8 @@ namespace XPBD
 				cs.SetBuffer(deformKernel, "_Tetrahedrals", body.TetBuffer);
 			}
 			else
-			{
 				cs.SetBuffer(deformKernel, "_OrigIndices", body.OrigIndicesBuffer);
-			}
+
 			cs.Dispatch(deformKernel, Ceil(body.VertexCount), 1, 1);
 
 			cs.SetBuffer(_kRecalcNormals, "_VertexPositions", body.VertexPositionsBuffer);
@@ -967,22 +1060,27 @@ namespace XPBD
 		{
 			return (n + GROUP_SIZE - 1) / GROUP_SIZE;
 		}
+
 		static int CeilN(int n, int g)
 		{
 			return (n + g - 1) / g;
 		}
 
+
 		// ── Kernel ID cache ───────────────────────────────────────────────────
 
 		void CacheKernelIDs()
 		{
-			_kPresolve = SoftBodySimCS.FindKernel("Presolve");
+			_kPresolve  = SoftBodySimCS.FindKernel("Presolve");
 			_kPostsolve = SoftBodySimCS.FindKernel("Postsolve");
-			_kStretch = SoftBodySimCS.FindKernel("StretchConstraint");
-			_kVolume = SoftBodySimCS.FindKernel("VolumeConstraint");
-			_kClampDelta          = SoftBodySimCS.FindKernel("ClampDelta");
+			_kStretch   = SoftBodySimCS.FindKernel("StretchConstraint");
+			_kVolume    = SoftBodySimCS.FindKernel("VolumeConstraint");
+			_kClampDelta             = SoftBodySimCS.FindKernel("ClampDelta");
+			_kStretchExclusion        = SoftBodySimCS.FindKernel("StretchConstraintWithExclusion");
+			_kVolumeExclusion         = SoftBodySimCS.FindKernel("VolumeConstraintWithExclusion");
 			_kWriteCollisionState = CollisionShapesCS.FindKernel("WriteCollisionState");
 			_kClearCollisionState = CollisionShapesCS.FindKernel("ClearCollisionState");
+			_kHardProject         = CollisionShapesCS.FindKernel("HardProjectParticles");
 
 			_kClearImpulse = CollisionShapesCS.FindKernel("ClearImpulseAccum");
 			_kDetectShapes = CollisionShapesCS.FindKernel("DetectShapes");
@@ -999,6 +1097,7 @@ namespace XPBD
 			// from demanding _ParticlesA/B be bound for kernels that don't use them.
 			if (SoftSoftApplyCS)
 				_kApplySoftSoftDelta = SoftSoftApplyCS.FindKernel("ApplySoftSoftDelta");
+
 
 			_kDirectDeform = DeformCS.FindKernel("DirectDeform");
 			_kTetDeform = DeformCS.FindKernel("TetDeform");

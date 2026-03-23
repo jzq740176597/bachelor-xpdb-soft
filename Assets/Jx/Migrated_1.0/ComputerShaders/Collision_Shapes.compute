@@ -49,6 +49,7 @@
 #pragma kernel SolveCollisions
 #pragma kernel WriteCollisionState
 #pragma kernel ClearCollisionState
+#pragma kernel HardProjectParticles
 
 #pragma target 5.0
 
@@ -103,6 +104,15 @@ uint  _DynSlotCount;
 // Applied to ALL shape types (sphere, capsule, OBB) for consistent behaviour.
 float _ContactSkin;
 
+// Effective radius per soft-body particle — fills inter-particle surface gaps.
+// Collision detection expands by this so small colliders cannot slip between particles.
+float _ParticleRadius;
+
+// Weight multiplier for collision delta contribution.
+// Higher = collision correction dominates over elastic Stretch/Volume corrections.
+// Set from CPU as SubSteps (e.g. 20) so collision always wins.
+float _CollisionDeltaWeight;
+
 // ── Buffers ───────────────────────────────────────────────────────────────────
 
 StructuredBuffer<ShapeDescriptor> _Shapes;
@@ -119,6 +129,11 @@ RWByteAddressBuffer               _ImpulseBytes;
 // depth < 0 = penetrating; >= 1e9 = no collision.
 // Written by WriteCollisionState, read by ClampDelta in SoftBodySim.compute.
 RWStructuredBuffer<float4>        _CollisionState;
+
+// Delta accumulation buffer — same ComputeBuffer as _Delta in SoftBodySim.compute.
+// SolveCollisions writes collision corrections here so Postsolve velocity
+// reflects the outward push. Bound from C# as the body's delta buffer.
+RWByteAddressBuffer               _DeltaRaw;
 
 // ── Atomic float CAS ─────────────────────────────────────────────────────────
 
@@ -138,6 +153,31 @@ void AtomicAddF(uint addr, float v)
 		}
 		prev = orig;
 	} while (true);
+}
+
+// Atomically add float to _DeltaRaw (same CAS pattern, different buffer).
+void AtomicAddDeltaF(uint byteOffset, float value)
+{
+	uint prev = _DeltaRaw.Load(byteOffset);
+	uint next;
+	[allow_uav_condition]
+	do
+	{
+		next = asuint(asfloat(prev) + value);
+		uint orig;
+		_DeltaRaw.InterlockedCompareExchange(byteOffset, prev, next, orig);
+		if (orig == prev)
+			break;
+		prev = orig;
+	} while (true);
+}
+
+void AtomicAddToDelta(uint pIdx, float3 v)
+{
+	uint base = pIdx * 12u;  // float3 = 12 bytes
+	AtomicAddDeltaF(base + 0u, v.x);
+	AtomicAddDeltaF(base + 4u, v.y);
+	AtomicAddDeltaF(base + 8u, v.z);
 }
 
 // ── Kernel: ClearImpulseAccum ─────────────────────────────────────────────────
@@ -240,7 +280,9 @@ bool TestSphere(ShapeDescriptor s, float3 pEnd, float3 pStart, out float3 cp, ou
 	// Fallback: static skin test for slow/grazing contacts missed by sweep.
 	float3 dEnd = pEnd - sEnd;
 	float  d2   = dot(dEnd, dEnd);
-	float  rSkin = r + _ContactSkin;
+	// Expand detection by _ParticleRadius: each particle is effectively
+	// a sphere of this radius, covering inter-particle surface gaps.
+	float  rSkin = r + _ContactSkin + _ParticleRadius;
 	if (d2 >= rSkin * rSkin)
 	{
 		return false;
@@ -333,7 +375,10 @@ bool TestCapsule(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 	float3 cl = a + ab * t;
 	float3 dv = p - cl;
 	float  d2 = dot(dv, dv);
-	float  rDet = r + _ContactSkin;
+	// Expand detection by particle radius: each soft particle is a sphere of
+	// radius _ParticleRadius. Small colliders smaller than inter-particle spacing
+	// are caught because they enter the particle's effective sphere before the gap.
+	float  rDet = r + _ContactSkin + _ParticleRadius;
 	if (d2 >= rDet * rDet)
 	{
 		return false;
@@ -511,17 +556,11 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 			newPredict = pos + corr;
 
 		_Positions[c.pIdx].predict = newPredict;
-
-		// Also update particle.position to the corrected position.
-		// Postsolve already ran and wrote velocity = (predict - position)/dt.
-		// That velocity pointed inward (elastic forces dominated).
-		// If we leave position unchanged, next Presolve does:
-		//   position = newPredict   (saves corrected predict — OK)
-		//   predict  = newPredict + velocity * dt  → back inside sphere!
-		// By updating position = newPredict now, next Presolve velocity becomes:
-		//   velocity = (newPredict - newPredict) / dt = 0 on that axis,
-		//   which we then further clamp below. This breaks the stable equilibrium.
 		_Particles[c.pIdx].position = newPredict;
+
+		// Note: no delta injection here. HardProjectParticles runs last and
+		// provides the hard positional guarantee. Delta injection caused
+		// explosions when correction distance * weight was large.
 	}
 
 	// Kill relative inward velocity — applies in both skin zone and penetration.
@@ -589,7 +628,9 @@ void WriteCollisionState(uint3 id : SV_DispatchThreadID)
         float3 toParticle = pos - c.contactPt;   // contactPt = sphere end-centre
         float  dist       = length(toParticle);
         nrm = dist > EPSILON ? toParticle / dist : c.normal;
-        pen = dist - c.sphereRadius;
+        // Use rExclude = sphereRadius + _ParticleRadius so particles in the
+        // particle-radius zone are also marked for elastic exclusion.
+        pen = dist - (c.sphereRadius + _ParticleRadius);
     }
     else
     {
@@ -604,4 +645,126 @@ void WriteCollisionState(uint3 id : SV_DispatchThreadID)
     if (pen >= _ContactSkin) return;
 
     _CollisionState[c.pIdx] = float4(nrm.x, nrm.y, nrm.z, pen);
+}
+// ── Kernel: HardProjectParticles ─────────────────────────────────────────────
+// Runs as the ABSOLUTE LAST step of the substep, after Postsolve and all
+// collision passes. Directly checks every particle against every shape using
+// the analytic formula — no constraint buffer, no delta, no indirection.
+//
+// For spheres: pen = length(predict - centre) - radius
+// If pen < 0: project predict to surface, kill inward velocity.
+//
+// This is a hard positional guarantee: nothing runs after this, so elastic
+// constraints cannot undo it. No matter how stiff Stretch/Volume are, the
+// particle ends the substep outside the collider.
+//
+// Thread = one particle. Inner loop over all shapes (typically 1-3 shapes).
+// Cost = O(particles × shapes) with no atomics — each thread owns its particle.
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void HardProjectParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint pi = id.x;
+    if (pi >= _ParticleCount) return;
+
+    float3 pos = _Positions[pi].predict;
+    float3 vel = _Particles[pi].velocity;
+
+    for (uint si = 0u; si < _ShapeCount; si++)
+    {
+        ShapeDescriptor s = _Shapes[si];
+        float3 surfVel    = _ShapeVelocities[si];
+
+        if (s.shapeType == SHAPE_SPHERE)
+        {
+            float3 toP      = pos - s.centre;
+            float  dist     = length(toP);
+            float  r        = s.param0;
+            // Exclusion zone = grip radius + particle radius.
+            // Particle centre must stay outside this combined radius.
+            float  rExclude = r + _ParticleRadius;
+            float  pen      = dist - rExclude;
+            if (pen >= 0.0) continue;
+
+            // Project particle CENTRE to rExclude from grip centre.
+            // (rExclude = grip_r + particle_r, so particle sphere just touches grip sphere)
+            // Only correct if actually inside rExclude — never pull inward from outside.
+            float3 nrm = dist > EPSILON ? toP / dist : float3(0, 1, 0);
+            pos = s.centre + nrm * rExclude;
+
+            // Kill inward relative velocity.
+            float vRelN = dot(vel - surfVel, nrm);
+            if (vRelN < 0.0)
+                vel -= nrm * vRelN;
+        }
+        else if (s.shapeType == SHAPE_CAPSULE)
+        {
+            float3 a  = s.centre - s.axis * s.param1;
+            float3 b  = s.centre + s.axis * s.param1;
+            float3 ab = b - a;
+            float  r  = s.param0;
+            float  t  = saturate(dot(pos - a, ab) / max(dot(ab, ab), EPSILON));
+            float3 cl = a + ab * t;
+            float3 dv = pos - cl;
+            float  dist = length(dv);
+            float  pen  = dist - r;
+            if (pen >= 0.0) continue;
+
+            float3 nrm = dist > EPSILON ? dv / dist : float3(0, 1, 0);
+            pos = cl + nrm * r;
+            float vRelN = dot(vel - surfVel, nrm);
+            if (vRelN < 0.0)
+                vel -= nrm * vRelN;
+        }
+        else if (s.shapeType == SHAPE_OBB)
+        {
+            // Reuse TestOBB logic inline for the speculative floor case.
+            float3 d  = pos - s.centre;
+            float3 ax = s.axis, ay = s.axis2, az = cross(ax, ay);
+            float  lx = dot(d, ax), ly = dot(d, ay), lz = dot(d, az);
+            bool   speculative = (asuint(s.param1) & 0x80000000u) != 0u;
+            if (speculative)
+            {
+                float hx = s.param0, hz = s.param2;
+                if (abs(lx) >= hx || abs(lz) >= hz || ly >= 0.0) continue;
+                float3 nrm = ay;
+                pos = s.centre + ay * abs(s.param1) + ax * lx + az * lz;
+                float vRelN = dot(vel - surfVel, nrm);
+                if (vRelN < 0.0)
+                    vel -= nrm * vRelN;
+            }
+            else
+            {
+                float hx = s.param0, hy = s.param1, hz = s.param2;
+                if (abs(lx) >= hx || abs(ly) >= hy || abs(lz) >= hz) continue;
+                float px = hx - abs(lx), py = hy - abs(ly), pz = hz - abs(lz);
+                float3 nrm;
+                float3 cp;
+                if (px <= py && px <= pz)
+                {
+                    nrm = ax * sign(lx);
+                    cp  = s.centre + ax * (hx * sign(lx)) + ay * ly + az * lz;
+                }
+                else if (py <= pz)
+                {
+                    nrm = ay * sign(ly);
+                    cp  = s.centre + ax * lx + ay * (hy * sign(ly)) + az * lz;
+                }
+                else
+                {
+                    nrm = az * sign(lz);
+                    cp  = s.centre + ax * lx + ay * ly + az * (hz * sign(lz));
+                }
+                pos = cp;
+                float vRelN = dot(vel - surfVel, nrm);
+                if (vRelN < 0.0)
+                    vel -= nrm * vRelN;
+            }
+        }
+    }
+
+    _Positions[pi].predict    = pos;
+    _Particles[pi].velocity   = vel;
+    // Keep position in sync so next Presolve starts from outside.
+    _Particles[pi].position   = pos;
 }

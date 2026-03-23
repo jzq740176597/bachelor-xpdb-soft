@@ -25,6 +25,8 @@
 #pragma kernel StretchConstraint
 #pragma kernel VolumeConstraint
 #pragma kernel ClampDelta
+#pragma kernel StretchConstraintWithExclusion
+#pragma kernel VolumeConstraintWithExclusion
 
 #pragma use_dxc
 #pragma target 5.0
@@ -68,6 +70,7 @@ struct Tetrahedral
 float _DeltaTime;
 float _DistanceCompliance;
 float _VolumeCompliance;
+float _ContactSkin;   // set from CPU — same value as Collision_Shapes.compute
 uint  _ParticleCount;
 uint  _EdgeCount;
 uint  _TetCount;
@@ -238,6 +241,59 @@ void VolumeConstraint(uint3 id : SV_DispatchThreadID)
     for (int v = 0; v < 4; v++)
         AtomicAddDelta(ids[v], normals[v] * correction * _Particles[ids[v]].invMass);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: VolumeConstraintWithExclusion
+// Same as VolumeConstraint but contact particles have effective invMass = 0.
+// Volume pressure cannot push a tet vertex through a rigid collider.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void VolumeConstraintWithExclusion(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _TetCount) return;
+
+    const uint3 faceIndices[4] = {
+        uint3(1, 3, 2), uint3(0, 2, 3), uint3(0, 3, 1), uint3(0, 1, 2)
+    };
+
+    float alpha = _VolumeCompliance / (_DeltaTime * _DeltaTime);
+    uint4 ids   = _Tetrahedrals[i].indices;
+
+    // Effective invMass per vertex: zero only when actually penetrating (depth < 0).
+    // Skin-zone vertices must remain free to deform — pinning them concentrates
+    // all volume correction on remaining free vertices, causing explosions.
+    float eff[4];
+    [unroll]
+    for (int v2 = 0; v2 < 4; v2++)
+        eff[v2] = (_CollisionState[ids[v2]].w < 0.0)
+                  ? 0.0 : _Particles[ids[v2]].invMass;
+
+    float  w = 0.0;
+    float3 normals[4];
+    [unroll]
+    for (int f = 0; f < 4; f++)
+    {
+        float3 e1 = _Positions[ids[faceIndices[f][1]]].predict
+                  - _Positions[ids[faceIndices[f][0]]].predict;
+        float3 e2 = _Positions[ids[faceIndices[f][2]]].predict
+                  - _Positions[ids[faceIndices[f][0]]].predict;
+        normals[f] = cross(e1, e2);
+        w += dot(normals[f], normals[f]) * eff[f];
+    }
+    if (w < 1e-10) return;
+
+    float3 p01 = _Positions[ids[1]].predict - _Positions[ids[0]].predict;
+    float3 p02 = _Positions[ids[2]].predict - _Positions[ids[0]].predict;
+    float3 p03 = _Positions[ids[3]].predict - _Positions[ids[0]].predict;
+    float  volume     = dot(cross(p01, p02), p03) / 6.0;
+    float  correction = -(volume - _Tetrahedrals[i].restVolume) / (w + alpha);
+
+    [unroll]
+    for (int v = 0; v < 4; v++)
+        AtomicAddDelta(ids[v], normals[v] * correction * eff[v]);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Kernel: ClampDelta
 // Runs AFTER Stretch+Volume have accumulated _Delta, BEFORE Postsolve applies it.
@@ -271,4 +327,63 @@ void ClampDelta(uint3 id : SV_DispatchThreadID)
     float proj = dot(delta, nrm);
     if (proj < 0.0)
         _Delta[i] = delta - nrm * proj;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: StretchConstraintWithExclusion
+//
+// Core idea: a particle in contact with a rigid collider has INFINITE effective
+// mass in the contact normal direction — it cannot be moved inward by elastic
+// forces, just as a particle resting on a floor cannot be pushed through it.
+//
+// Implementation: if a particle has _CollisionState.w < _ContactSkin (in
+// contact), its effective invMass for this edge correction is zero.
+// The correction that would have moved it is fully redirected to its neighbor.
+// Neither position is projected — only the weight is zeroed. This correctly
+// models the contact constraint as a one-sided infinite-mass boundary.
+//
+// Additional: also project the contact particle's predict to the surface
+// before computing edge length, so the rest-length comparison is from the
+// correct surface-constrained position.
+// ─────────────────────────────────────────────────────────────────────────────
+[numthreads(GROUP_SIZE, 1, 1)]
+void StretchConstraintWithExclusion(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _EdgeCount) return;
+
+    float alpha = _DistanceCompliance / (_DeltaTime * _DeltaTime);
+    uint  i0 = _Edges[i].indices.x;
+    uint  i1 = _Edges[i].indices.y;
+
+    float4 cs0 = _CollisionState[i0];
+    float4 cs1 = _CollisionState[i1];
+
+    // Effective invMass: zero only when particle is ACTUALLY penetrating (depth < 0).
+    // Do NOT zero for skin-zone particles (depth in [0, ContactSkin]) — they are
+    // still outside the collider and must deform freely. Zeroing the whole skin zone
+    // pins a large shell of particles, concentrating all volume correction on the
+    // remaining free particles and causing explosions.
+    float eff0 = (cs0.w < 0.0) ? 0.0 : _Particles[i0].invMass;
+    float eff1 = (cs1.w < 0.0) ? 0.0 : _Particles[i1].invMass;
+    float w    = eff0 + eff1;
+    if (w < 1e-10) return;   // both penetrating — neither can move, skip
+
+    // Project contact particle positions to sphere surface for length comparison.
+    float3 p0 = _Positions[i0].predict;
+    float3 p1 = _Positions[i1].predict;
+    if (cs0.w < 0.0)
+        p0 -= cs0.xyz * cs0.w;
+    if (cs1.w < 0.0)
+        p1 -= cs1.xyz * cs1.w;
+
+    float3 diff = p0 - p1;
+    float  len  = length(diff);
+    if (len < 1e-7) return;
+
+    diff /= len;
+    float  correction = -(len - _Edges[i].restLen) / (w + alpha);
+
+    // Apply correction only to non-contact particles (eff > 0).
+    AtomicAddDelta(i0,  correction * diff * eff0);
+    AtomicAddDelta(i1, -correction * diff * eff1);
 }
