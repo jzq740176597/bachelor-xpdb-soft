@@ -79,14 +79,14 @@ struct PbdPositions { float3 predict;  float _p0; float3 delta;    float _p1;   
 
 struct ColConstraint
 {
-	float3 contactPt;
+	float3 contactPt; // plane contacts: point on surface; sphere CCD: sphere end-centre
 	uint   pIdx;
 	float3 normal;
 	float  surfVelN;
 	uint   colType;
 	uint   dynSlot;
 	float  rbInvMass;
-	float  _pad;
+	float  sphereRadius; // > 0 → sphere CCD mode (re-evaluate at solve time); 0 → plane mode
 };
 
 // ── Uniforms ──────────────────────────────────────────────────────────────────
@@ -104,8 +104,8 @@ float _ContactSkin;
 // ── Buffers ───────────────────────────────────────────────────────────────────
 
 StructuredBuffer<ShapeDescriptor> _Shapes;
-StructuredBuffer<float3>          _ShapeVelocities;  // one per shape
-StructuredBuffer<float4>          _MeshFacePlanes;   // all convex meshes packed
+StructuredBuffer<float3>          _ShapeVelocities;
+StructuredBuffer<float4>          _MeshFacePlanes;
 
 RWStructuredBuffer<Particle>      _Particles;
 RWStructuredBuffer<PbdPositions>  _Positions;
@@ -148,33 +148,84 @@ void ClearImpulseAccum(uint3 id : SV_DispatchThreadID)
 
 // ── Analytic tests ────────────────────────────────────────────────────────────
 //
-// All tests expand detection by _ContactSkin:
-//   detect radius = real radius + _ContactSkin
-//   contact point = real surface (NOT skin surface)
+// TestSphere uses swept CCD (segment-vs-moving-sphere):
+//   Particle travels from _Particles[pi].position → predict in one substep.
+//   Sphere centre travels from s.axis (start) → s.centre (end) in the same substep.
+//   We solve for the earliest t ∈ [0,1] where |particleLerp(t) - sphereLerp(t)| = r.
+//   This is a quadratic in t; the smallest positive real root is the contact time.
+//   Contact point and normal are computed at that t.
+//   Fallback: if no swept contact, test static position with skin (catches slow cases).
 //
-// This means SolveCollisions receives constraints for particles that are
-// within _ContactSkin of the surface, even before full penetration.
-// SolveCollisions handles both cases:
-//   pen < 0  → full positional + velocity correction
-//   pen >= 0 → positional correction to surface + velocity correction
-//              (particle is in skin zone — push it out to surface NOW,
-//               don't wait for next-substep penetration)
+// Other shapes (OBB, capsule, convex) use static skin detection:
+//   detect radius = real radius + _ContactSkin
+//   contact point = real surface
+//   SolveCollisions applies positional correction even in the skin zone.
 
-bool TestSphere(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
+bool TestSphere(ShapeDescriptor s, float3 pEnd, float3 pStart, out float3 cp, out float3 n)
 {
-	cp = 0;
+	cp = float3(0, 0, 0);
 	n  = float3(0, 1, 0);
-	float3 d    = p - s.centre;
-	float  r    = s.param0;
-	float  d2   = dot(d, d);
-	float  rDet = r + _ContactSkin;
-	if (d2 >= rDet * rDet)
+	float r = s.param0;
+
+	// Relative motion: particle relative to sphere over the substep.
+	// rel(t) = (pStart + t*(pEnd-pStart)) - (sStart + t*(sEnd-sStart))
+	//        = rel0 + t * relV
+	float3 sStart = s.axis;    // sphere centre at substep START (encoded by CPU)
+	float3 sEnd   = s.centre;  // sphere centre at substep END
+	float3 rel0   = pStart - sStart;
+	float3 relV   = (pEnd - pStart) - (sEnd - sStart);
+
+	// Quadratic: |rel0 + t*relV|² = r²
+	// a*t² + b*t + c = 0
+	float a = dot(relV, relV);
+	float b = 2.0 * dot(rel0, relV);
+	float c = dot(rel0, rel0) - r * r;
+
+	bool foundSwept = false;
+	float tHit = 1.0;
+
+	if (a > EPSILON)
+	{
+		float disc = b * b - 4.0 * a * c;
+		if (disc >= 0.0)
+		{
+			float sqrtDisc = sqrt(disc);
+			float t0 = (-b - sqrtDisc) / (2.0 * a);
+			float t1 = (-b + sqrtDisc) / (2.0 * a);
+
+			// Earliest contact time within the substep [0, 1]
+			float tCand = (t0 >= 0.0) ? t0 : t1;
+			if (tCand >= 0.0 && tCand <= 1.0)
+			{
+				tHit       = tCand;
+				foundSwept = true;
+			}
+		}
+	}
+
+	if (foundSwept)
+	{
+		// Compute contact position and normal at tHit
+		float3 particleAtT = pStart + tHit * (pEnd - pStart);
+		float3 sphereAtT   = sStart + tHit * (sEnd   - sStart);
+		float3 d           = particleAtT - sphereAtT;
+		float  dist        = length(d);
+		n  = dist > EPSILON ? d / dist : float3(0, 1, 0);
+		cp = sphereAtT + n * r;
+		return true;
+	}
+
+	// Fallback: static skin test for slow/grazing contacts missed by sweep.
+	float3 dEnd = pEnd - sEnd;
+	float  d2   = dot(dEnd, dEnd);
+	float  rSkin = r + _ContactSkin;
+	if (d2 >= rSkin * rSkin)
 	{
 		return false;
 	}
 	float dist = sqrt(d2);
-	n  = dist > EPSILON ? d / dist : float3(0, 1, 0);
-	cp = s.centre + n * r;   // contact point on REAL surface, not skin edge
+	n  = dist > EPSILON ? dEnd / dist : float3(0, 1, 0);
+	cp = sEnd + n * r;
 	return true;
 }
 
@@ -313,6 +364,10 @@ bool TestConvex(ShapeDescriptor s, float3 p, out float3 cp, out float3 n)
 
 // ── Kernel: DetectShapes ──────────────────────────────────────────────────────
 // One thread per (shape × particle). Index = si * _ParticleCount + pi.
+//
+// For sphere: passes both particle.position (substep start) and predict (substep end)
+// so TestSphere can do a true swept CCD test.
+// For other shapes: passes predict only (static skin detection).
 
 [numthreads(GROUP_SIZE, 1, 1)]
 void DetectShapes(uint3 id : SV_DispatchThreadID)
@@ -321,26 +376,27 @@ void DetectShapes(uint3 id : SV_DispatchThreadID)
 	uint si = id.x / _ParticleCount;
 	uint pi = id.x % _ParticleCount;
 
-	ShapeDescriptor s = _Shapes[si];
-	float3 p = _Positions[pi].predict;
+	ShapeDescriptor s    = _Shapes[si];
+	float3 pEnd          = _Positions[pi].predict;
+	float3 pStart        = _Particles[pi].position;  // set by Presolve each substep
 
 	float3 cp, n;
 	bool   hit;
 	if (s.shapeType == SHAPE_SPHERE)
 	{
-		hit = TestSphere(s, p, cp, n);
+		hit = TestSphere(s, pEnd, pStart, cp, n);
 	}
 	else if (s.shapeType == SHAPE_OBB)
 	{
-		hit = TestOBB(s, p, cp, n);
+		hit = TestOBB(s, pEnd, cp, n);
 	}
 	else if (s.shapeType == SHAPE_CAPSULE)
 	{
-		hit = TestCapsule(s, p, cp, n);
+		hit = TestCapsule(s, pEnd, cp, n);
 	}
 	else
 	{
-		hit = TestConvex(s, p, cp, n);
+		hit = TestConvex(s, pEnd, cp, n);
 	}
 
 	if (!hit) return;
@@ -351,14 +407,26 @@ void DetectShapes(uint3 id : SV_DispatchThreadID)
 
 	float3 sv   = _ShapeVelocities[si];
 	ColConstraint c;
-	c.contactPt  = cp;
+	// For sphere CCD contacts: store sphere end-centre in contactPt and
+	// radius in sphereRadius so SolveCollisions can re-evaluate penetration
+	// using actual sphere geometry (not a stale tangent plane).
+	// For all other contacts: store surface point in contactPt, sphereRadius=0.
+	if (s.shapeType == SHAPE_SPHERE)
+	{
+		c.contactPt    = s.centre;    // sphere end-centre
+		c.sphereRadius = s.param0;    // sphere radius
+	}
+	else
+	{
+		c.contactPt    = cp;
+		c.sphereRadius = 0.0;
+	}
 	c.pIdx       = pi;
 	c.normal     = n;
 	c.surfVelN   = dot(sv, n);
 	c.colType    = s.colType;
 	c.dynSlot    = s.dynSlot;
 	c.rbInvMass  = s.rbInvMass;
-	c._pad       = 0;
 	_ColConstraints[slot] = c;
 }
 
@@ -391,50 +459,61 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 	float3 pos        = _Positions[c.pIdx].predict;
 	float3 nrm        = c.normal;
 
-	float planeDist = dot(c.contactPt, nrm);
-	float pen       = dot(pos, nrm) - planeDist;
-
 	float pInv = _Particles[c.pIdx].invMass;
 	float cInv = c.rbInvMass;
 	float wTot = pInv + cInv;
 
-	// Positional correction: always push particle to the surface plane.
-	// For pen < 0 this is the standard penetration resolution.
-	// For pen >= 0 (skin zone) this pre-emptively pushes the particle onto
-	// the surface so the next substep starts from a non-penetrating state.
-	// The correction magnitude is clamped: only push outward (pen side),
-	// never pull the particle deeper. When pen >= 0, corr = -nrm * pen
-	// points OUTWARD (away from surface), which is correct.
-	float3 corr = -nrm * pen;
-	if (wTot > EPSILON)
+	// Re-evaluate penetration from current predict position.
+	// Sphere mode: use actual distance from sphere centre (exact, survives Stretch/Volume).
+	// Plane mode:  use signed distance from contact surface plane.
+	float pen;
+	if (c.sphereRadius > 0.0)
 	{
-		_Positions[c.pIdx].predict = pos + corr * (pInv / wTot);
+		float3 toParticle = pos - c.contactPt;   // contactPt = sphere end-centre
+		float  dist       = length(toParticle);
+		nrm = dist > EPSILON ? toParticle / dist : c.normal;
+		pen = dist - c.sphereRadius;              // < 0 inside, >= 0 outside
 	}
 	else
 	{
-		_Positions[c.pIdx].predict = pos + corr;
+		float planeDist = dot(c.contactPt, nrm);
+		pen = dot(pos, nrm) - planeDist;          // < 0 penetrating, >= 0 outside
 	}
 
-	// Kill relative inward velocity regardless of skin vs penetration.
+	// Positional correction only when actually penetrating (pen < 0).
+	// When pen >= 0 the particle is in the skin zone but still outside —
+	// applying inward correction here would create a magnet/glue effect.
+	if (pen < 0.0)
+	{
+		float3 corr = -nrm * pen;   // points outward (away from surface)
+		if (wTot > EPSILON)
+			_Positions[c.pIdx].predict = pos + corr * (pInv / wTot);
+		else
+			_Positions[c.pIdx].predict = pos + corr;
+	}
+
+	// Kill relative inward velocity in both skin zone and penetration.
+	// This decelerates particles approaching the surface without attracting them.
 	float3 pVel  = _Particles[c.pIdx].velocity;
 	float  vRelN = dot(pVel, nrm) - c.surfVelN;
 	if (vRelN < 0.0)
-	{
 		_Particles[c.pIdx].velocity -= nrm * vRelN;
-	}
 
-	// Dynamic: Newton-3rd impulse accumulation (only on full penetration
-	// to avoid phantom impulses from skin-zone speculative contacts).
+	// Dynamic: Newton-3rd impulse (only on full penetration).
 	if (pen < 0.0 && c.colType == COL_DYNAMIC && wTot > EPSILON)
 	{
+		float3 corr = -nrm * pen;
 		float3 rbImp = -corr * (cInv / wTot) / _ColDeltaTime;
 		uint   b     = c.dynSlot * IMPULSE_STRIDE;
+		float3 contactForImpulse = (c.sphereRadius > 0.0)
+			? (c.contactPt + nrm * c.sphereRadius)
+			: c.contactPt;
 		AtomicAddF(b +  0, rbImp.x);
 		AtomicAddF(b +  4, rbImp.y);
 		AtomicAddF(b +  8, rbImp.z);
-		AtomicAddF(b + 16, c.contactPt.x);
-		AtomicAddF(b + 20, c.contactPt.y);
-		AtomicAddF(b + 24, c.contactPt.z);
+		AtomicAddF(b + 16, contactForImpulse.x);
+		AtomicAddF(b + 20, contactForImpulse.y);
+		AtomicAddF(b + 24, contactForImpulse.z);
 		uint dummy;
 		_ImpulseBytes.InterlockedAdd(b + 12, 1u, dummy);
 	}

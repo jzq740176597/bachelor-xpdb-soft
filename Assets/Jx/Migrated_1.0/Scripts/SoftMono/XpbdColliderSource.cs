@@ -103,6 +103,9 @@ namespace XPBD
 		// substep can interpolate the collider to its swept intermediate position.
 		Vector3 _frameStartPos;
 		Quaternion _frameStartRot;
+		// Centre of the shape at the START of the current substep.
+		// Encoded into the descriptor so the GPU can do swept-sphere CCD.
+		Vector3 _prevSubstepCentre;
 		// Local-space planes for convex mesh (computed once in Awake).
 		Vector4[] _localPlanes;
 		// Dirty-tracking for Static convex — re-transform only when moved.
@@ -222,8 +225,10 @@ namespace XPBD
 		// ─────────────────────────────────────────────────────────────────────
 		public void SnapshotStartOfFrame()
 		{
-			_frameStartPos = _prevPos;   // _prevPos was set at the END of the last frame
+			_frameStartPos = _prevPos;    // _prevPos was set at the END of the last frame
 			_frameStartRot = _prevRot;
+			// First substep starts from last-frame end position.
+			_prevSubstepCentre = _prevPos;
 		}
 
 		// ─────────────────────────────────────────────────────────────────────
@@ -262,6 +267,8 @@ namespace XPBD
 				SurfaceVelocity = Vector3.zero;
 			}
 
+			// Record centre at START of this substep before advancing _prevPos.
+			_prevSubstepCentre = _prevPos;
 			_prevPos = lerpPos;
 			_prevRot = lerpRot;
 
@@ -348,6 +355,10 @@ namespace XPBD
 				case SphereCollider sc:
 					d.centre = pos + rot * (Vector3.Scale(sc.center, transform.lossyScale));
 					d.param0 = sc.radius * MaxScale();
+					// axis = sphere centre at START of this substep (for GPU swept CCD).
+					// rot is re-used here because sc.center offset rotates with the object;
+					// _prevSubstepCentre already tracks the transform-origin sweep.
+					d.axis = _prevSubstepCentre + rot * Vector3.Scale(sc.center, transform.lossyScale);
 					break;
 				case BoxCollider bc:
 					{
@@ -391,7 +402,7 @@ namespace XPBD
 							axScl = Mathf.Abs(transform.lossyScale.y);
 						}
 						d.centre = pos + rot * Vector3.Scale(cc.center, transform.lossyScale);
-						d.axis = (rot * localAx).normalized;
+						d.axis   = (rot * localAx).normalized;
 						d.param0 = cc.radius * MaxScale();
 						d.param1 = Mathf.Max(0f, cc.height * 0.5f * axScl - d.param0);
 						break;
@@ -419,6 +430,8 @@ namespace XPBD
 				case SphereCollider sc:
 					d.centre = transform.TransformPoint(sc.center);
 					d.param0 = sc.radius * MaxScale();
+					// axis = sphere centre at START of this substep (for GPU swept CCD).
+					d.axis = _prevSubstepCentre + transform.rotation * Vector3.Scale(sc.center, transform.lossyScale);
 					break;
 
 				case BoxCollider bc:

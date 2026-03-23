@@ -19735,3 +19735,4 @@ MonoBehaviour:
   - Weights: {x: 0.84850335, y: 0.06751497, z: 0.076374754}
     TetIndex: 379
   RenderMesh: {fileID: 4300000, guid: a1f28eba73a844047a28ef41e32e0e69, type: 2}
+  Groups: []
