@@ -184,20 +184,35 @@ bool TestSphere(ShapeDescriptor s, float3 pEnd, float3 pStart, out float3 cp, ou
 	bool foundSwept = false;
 	float tHit = 1.0;
 
+	// c < 0 means particle is ALREADY inside the sphere at t=0.
+	// In this case the quadratic has one negative root (entry, already past)
+	// and one positive root (exit). We want t=0 — the particle is inside right now.
+	// Flag it so SolveCollisions gets a constraint at t=0 and the re-evaluation
+	// from sphere centre will find pen < 0 and correct it immediately.
+	if (c < 0.0)
+	{
+		// Already penetrating at substep start. Return contact at current position.
+		float3 d   = pStart - sStart;
+		float  len = length(d);
+		n  = len > EPSILON ? d / len : float3(0, 1, 0);
+		cp = sStart;   // sphere centre stored — SolveCollisions uses sphereRadius mode
+		return true;
+	}
+
 	if (a > EPSILON)
 	{
 		float disc = b * b - 4.0 * a * c;
 		if (disc >= 0.0)
 		{
 			float sqrtDisc = sqrt(disc);
-			float t0 = (-b - sqrtDisc) / (2.0 * a);
-			float t1 = (-b + sqrtDisc) / (2.0 * a);
+			float t0 = (-b - sqrtDisc) / (2.0 * a);   // entry (smaller root)
+			float t1 = (-b + sqrtDisc) / (2.0 * a);   // exit  (larger root)
 
-			// Earliest contact time within the substep [0, 1]
-			float tCand = (t0 >= 0.0) ? t0 : t1;
-			if (tCand >= 0.0 && tCand <= 1.0)
+			// Pick t0 (entry). If t0 < 0 the entry already passed but t1 > 0
+			// means we are currently inside — handled above via c < 0 check.
+			if (t0 >= 0.0 && t0 <= 1.0)
 			{
-				tHit       = tCand;
+				tHit       = t0;
 				foundSwept = true;
 			}
 		}
@@ -432,22 +447,23 @@ void DetectShapes(uint3 id : SV_DispatchThreadID)
 
 // ── Kernel: SolveCollisions ───────────────────────────────────────────────────
 //
-// planeDist = dot(contactPt, nrm) — the surface plane's signed offset.
-// pen       = dot(pos, nrm) - planeDist — signed distance of predict from surface.
+// Sphere mode (sphereRadius > 0):
+//   Re-evaluate penetration as actual distance from sphere centre.
+//   This is exact even after Stretch/Volume moved predict.
 //
-// Two cases:
-//   pen < 0  → particle is INSIDE the surface.
-//              Full positional correction: push particle back to surface.
-//   pen >= 0 → particle is OUTSIDE the surface (in the skin zone, since
-//              DetectShapes only fires within _ContactSkin distance).
-//              ALSO apply positional correction pushing to surface —
-//              this is the key fix for kinematic colliders: the sphere is
-//              moving toward the particle each substep. Killing velocity
-//              alone doesn't help because the sphere keeps advancing.
-//              Pushing the particle to the surface pre-emptively keeps it
-//              on the boundary as the sphere closes in.
+// Plane mode (sphereRadius == 0):
+//   Signed distance from the stored surface plane.
 //
-// In both cases: kill relative inward velocity component.
+// On penetration (pen < 0):
+//   1. Push predict to surface (positional correction).
+//   2. Also update particle.position to match — this prevents the velocity
+//      that Postsolve wrote (which pointed inward due to elastic forces) from
+//      re-integrating the particle back inside next substep. Without this,
+//      the stable penetrating equilibrium forms: elastic forces > collision
+//      correction force, and the particle settles inside the sphere.
+//   3. Kill relative inward velocity component.
+//
+// On skin zone (pen >= 0): kill inward velocity only, no position change.
 
 [numthreads(GROUP_SIZE, 1, 1)]
 void SolveCollisions(uint3 id : SV_DispatchThreadID)
@@ -463,37 +479,45 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 	float cInv = c.rbInvMass;
 	float wTot = pInv + cInv;
 
-	// Re-evaluate penetration from current predict position.
-	// Sphere mode: use actual distance from sphere centre (exact, survives Stretch/Volume).
-	// Plane mode:  use signed distance from contact surface plane.
+	// Re-evaluate penetration from current predict.
 	float pen;
 	if (c.sphereRadius > 0.0)
 	{
-		float3 toParticle = pos - c.contactPt;   // contactPt = sphere end-centre
+		float3 toParticle = pos - c.contactPt;
 		float  dist       = length(toParticle);
 		nrm = dist > EPSILON ? toParticle / dist : c.normal;
-		pen = dist - c.sphereRadius;              // < 0 inside, >= 0 outside
+		pen = dist - c.sphereRadius;
 	}
 	else
 	{
 		float planeDist = dot(c.contactPt, nrm);
-		pen = dot(pos, nrm) - planeDist;          // < 0 penetrating, >= 0 outside
+		pen = dot(pos, nrm) - planeDist;
 	}
 
-	// Positional correction only when actually penetrating (pen < 0).
-	// When pen >= 0 the particle is in the skin zone but still outside —
-	// applying inward correction here would create a magnet/glue effect.
 	if (pen < 0.0)
 	{
-		float3 corr = -nrm * pen;   // points outward (away from surface)
+		float3 corr = -nrm * pen;
+		float3 newPredict;
 		if (wTot > EPSILON)
-			_Positions[c.pIdx].predict = pos + corr * (pInv / wTot);
+			newPredict = pos + corr * (pInv / wTot);
 		else
-			_Positions[c.pIdx].predict = pos + corr;
+			newPredict = pos + corr;
+
+		_Positions[c.pIdx].predict = newPredict;
+
+		// Also update particle.position to the corrected position.
+		// Postsolve already ran and wrote velocity = (predict - position)/dt.
+		// That velocity pointed inward (elastic forces dominated).
+		// If we leave position unchanged, next Presolve does:
+		//   position = newPredict   (saves corrected predict — OK)
+		//   predict  = newPredict + velocity * dt  → back inside sphere!
+		// By updating position = newPredict now, next Presolve velocity becomes:
+		//   velocity = (newPredict - newPredict) / dt = 0 on that axis,
+		//   which we then further clamp below. This breaks the stable equilibrium.
+		_Particles[c.pIdx].position = newPredict;
 	}
 
-	// Kill relative inward velocity in both skin zone and penetration.
-	// This decelerates particles approaching the surface without attracting them.
+	// Kill relative inward velocity — applies in both skin zone and penetration.
 	float3 pVel  = _Particles[c.pIdx].velocity;
 	float  vRelN = dot(pVel, nrm) - c.surfVelN;
 	if (vRelN < 0.0)
@@ -502,7 +526,7 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 	// Dynamic: Newton-3rd impulse (only on full penetration).
 	if (pen < 0.0 && c.colType == COL_DYNAMIC && wTot > EPSILON)
 	{
-		float3 corr = -nrm * pen;
+		float3 corr  = -nrm * pen;
 		float3 rbImp = -corr * (cInv / wTot) / _ColDeltaTime;
 		uint   b     = c.dynSlot * IMPULSE_STRIDE;
 		float3 contactForImpulse = (c.sphereRadius > 0.0)
