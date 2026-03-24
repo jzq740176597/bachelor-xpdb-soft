@@ -18,7 +18,7 @@
 // ARCHITECTURE NOTES:
 //   - The editor uses SceneView.duringSceneGui to intercept mouse events.
 //   - Particle world positions = asset rest positions (no runtime transform).
-//   - All edits call EditorUtility.SetDirty + AssetDatabase.SaveAssets.
+//   - Edits are kept in-memory only; SetDirty+SaveAssets only on explicit Save confirm.
 //   - The editor holds transient selection state (HashSet<int>) — not serialised.
 
 #if UNITY_EDITOR
@@ -1330,7 +1330,11 @@ namespace XPBD.Editor
 		// Mark asset dirty and set _dirty flag
 		void MarkDirty(TetrahedralMeshAsset asset)
 		{
-			EditorUtility.SetDirty(asset);
+			// Do NOT call EditorUtility.SetDirty here — that would allow Unity to
+			// auto-save the asset when the editor instance is destroyed on deselect.
+			// Changes live only in the in-memory asset object until the user
+			// explicitly confirms Save (or discards via DoDiscard).
+			// SetDirty + SaveAssets is called only in DoSave.
 			if (!_dirty)
 			{
 				_dirty = true;
@@ -1340,39 +1344,200 @@ namespace XPBD.Editor
 
 		void OnDisable()
 		{
-			// OnDisable fires whenever this editor instance is destroyed:
-			// - user deselects the asset in the Project window
-			// - Inspector is closed / changed to another asset
-			// - script recompilation, play-mode entry, etc.
-			// Always restore the scene so no objects are left hidden.
-			RestoreSceneVisibility();
+			// OnDisable fires when the editor instance is destroyed:
+			// deselect in Project window, Inspector change, recompile, play-mode, etc.
+			// Always unhook callbacks and restore scene.
 			Selection.selectionChanged -= OnSelectionChanged;
 			SceneView.duringSceneGui -= OnSceneGUI;
+			RestoreSceneVisibility();
+
+			if (!_editing || !_dirty)
+				return;
+
+			// We were editing with unsaved changes and the editor is being destroyed
+			// (user clicked away without pressing Done). OnSelectionChanged may have
+			// already fired and handled it — but if the editor was destroyed directly
+			// (e.g. Inspector locked, recompile) we must handle it here.
+			// Capture asset ref now before `target` becomes invalid post-destroy.
+			var pendingAsset = target as TetrahedralMeshAsset;
+			if (pendingAsset == null)
+				return;
+
+			// Defer dialog to next editor tick — cannot show modal during OnDisable.
+			EditorApplication.delayCall += () =>
+			{
+				if (pendingAsset == null)
+					return;
+				//int choice = EditorUtility.DisplayDialogComplex(
+				//	"Unsaved changes",
+				//	"You have unsaved changes to '" + pendingAsset.name + "'.\n" +
+				//	"Save them before leaving?",
+				//	"Save",    // 0
+				//	"Discard", // 1
+				//	"Cancel"   // 2
+				//);
+				//if (choice == 0)
+				//{
+				//	EditorUtility.SetDirty(pendingAsset);
+				//	AssetDatabase.SaveAssets();
+				//	Debug.Log("[XPBD] Changes saved to '" + pendingAsset.name + "'.");
+				//}
+				//else if (choice == 1)
+				//{
+				//	// Discard: restore snapshot. The snapshot was taken at edit-enter.
+				//	// We must re-load snapshot data here since _snapshot fields are
+				//	// instance fields that survive until the delayCall fires.
+				//	if (_snapshotParticles != null)
+				//		pendingAsset.Particles = (ParticleData[]) _snapshotParticles.Clone();
+				//	if (_snapshotGroups != null)
+				//		pendingAsset.Groups = System.Array.ConvertAll(_snapshotGroups,
+				//			g => new ParticleGroup
+				//			{
+				//				Name = g.Name,
+				//				ParticleIndices = g.ParticleIndices == null ? null
+				//					: (int[]) g.ParticleIndices.Clone()
+				//			});
+				//	EditorUtility.SetDirty(pendingAsset);
+				//	AssetDatabase.SaveAssets();
+				//	Debug.Log("[XPBD] Changes discarded for '" + pendingAsset.name + "'.");
+				//}
+				//else
+				//{
+				//	// Cancel: re-select the asset so user can continue editing.
+				//	Selection.activeObject = pendingAsset;
+				//}
+				// [3/24/2026 jzq]
+				bool isSave = EditorUtility.DisplayDialog("Unsaved changes",
+					"You have unsaved changes to '" + pendingAsset.name + "'.\n" +
+					"Save them before leaving?",
+					"Save",    // 0
+					"Discard"); // 1
+				if (isSave)
+				{
+					EditorUtility.SetDirty(pendingAsset);
+					AssetDatabase.SaveAssets();
+					Debug.Log("[XPBD] Changes saved to '" + pendingAsset.name + "'.");
+				}
+				else
+				{
+					// Discard: restore snapshot. The snapshot was taken at edit-enter.
+					// We must re-load snapshot data here since _snapshot fields are
+					// instance fields that survive until the delayCall fires.
+					if (_snapshotParticles != null)
+						pendingAsset.Particles = (ParticleData[]) _snapshotParticles.Clone();
+					if (_snapshotGroups != null)
+						pendingAsset.Groups = System.Array.ConvertAll(_snapshotGroups,
+							g => new ParticleGroup
+							{
+								Name = g.Name,
+								ParticleIndices = g.ParticleIndices == null ? null
+									: (int[]) g.ParticleIndices.Clone()
+							});
+					EditorUtility.SetDirty(pendingAsset);
+					AssetDatabase.SaveAssets();
+					Debug.Log("[XPBD] Changes discarded for '" + pendingAsset.name + "'.");
+				}
+			};
 		}
 
 		// Called whenever the user changes the Editor selection.
-		// If we're still in edit mode but the asset has been deselected, exit cleanly.
+		// If we're still in edit mode with unsaved changes, show the same
+		// Save / Discard / Cancel dialog as the Done button.
 		void OnSelectionChanged()
 		{
 			if (!_editing)
 				return;
-			// Check whether our target is still the active selection
 			if (Selection.activeObject == target)
 				return;
 
-			// Asset was deselected while still in edit mode.
-			// Exit silently (no dialog — OnDisable will restore visibility).
-			// We do NOT call DoSave here: deselection mid-edit should not auto-save.
-			// The scene is restored; any unsaved particle edits are left in memory
-			// and will be present if the user re-selects the asset.
-			_editing = false;
-			RestoreSceneVisibility();
-			Selection.selectionChanged -= OnSelectionChanged;
-			SceneView.duringSceneGui -= OnSceneGUI;
-			_rectDragging = false;
-			SceneView.RepaintAll();
-			// Note: _dirty stays true so when the user re-selects, the * indicator
-			// still shows and they know there are unsaved changes.
+			// No changes → exit silently.
+			if (!_dirty)
+			{
+				_editing = false;
+				RestoreSceneVisibility();
+				Selection.selectionChanged -= OnSelectionChanged;
+				SceneView.duringSceneGui -= OnSceneGUI;
+				_rectDragging = false;
+				SceneView.RepaintAll();
+				return;
+			}
+
+			// Unsaved changes — ask what to do, same dialog as Done button.
+			// We snapshot what was just selected so we can restore if user cancels.
+			var newSelection = Selection.objects;
+			var asset = (TetrahedralMeshAsset) target;
+
+			//int choice = EditorUtility.DisplayDialogComplex(
+			//	"Exit edit mode",
+			//	"You have unsaved changes to '" + asset.name + "'.",
+			//	"Save",      // 0
+			//	//"Cancel",    // 1
+			//	"Discard"    // 2
+			//);
+
+			//if (choice == 0)
+			//{
+			//	// Save and exit.
+			//	DoSave(asset);
+			//	_editing = false;
+			//	RestoreSceneVisibility();
+			//	Selection.selectionChanged -= OnSelectionChanged;
+			//	SceneView.duringSceneGui   -= OnSceneGUI;
+			//	_rectDragging = false;
+			//	SceneView.RepaintAll();
+			//}
+			//else if (choice == 2)
+			//{
+			//	// Discard and exit.
+			//	DoDiscard(asset);
+			//	_editing = false;
+			//	RestoreSceneVisibility();
+			//	Selection.selectionChanged -= OnSelectionChanged;
+			//	SceneView.duringSceneGui   -= OnSceneGUI;
+			//	_rectDragging = false;
+			//	SceneView.RepaintAll();
+			//}
+			//else
+			//{
+			//	// Cancel — re-select the asset so the user stays in edit mode.
+			//	// Must use delayCall because we cannot change selection inside
+			//	// the selectionChanged callback synchronously.
+			//	EditorApplication.delayCall += () =>
+			//	{
+			//		if (target != null)
+			//		{
+			//			Selection.activeObject = target;
+			//			SceneView.RepaintAll();
+			//		}
+			//	};
+			//}
+			// [3/24/2026 jzq]
+			bool isSave = EditorUtility.DisplayDialog("Exit edit mode",
+			  "You have unsaved changes to '" + asset.name + "'.",
+			  "Save",      // 0
+			  "Discard");  // 1
+			if (isSave)
+			{
+				// Save and exit.
+				DoSave(asset);
+				_editing = false;
+				RestoreSceneVisibility();
+				Selection.selectionChanged -= OnSelectionChanged;
+				SceneView.duringSceneGui -= OnSceneGUI;
+				_rectDragging = false;
+				SceneView.RepaintAll();
+			}
+			else
+			{
+				// Discard and exit.
+				DoDiscard(asset);
+				_editing = false;
+				RestoreSceneVisibility();
+				Selection.selectionChanged -= OnSelectionChanged;
+				SceneView.duringSceneGui -= OnSceneGUI;
+				_rectDragging = false;
+				SceneView.RepaintAll();
+			}
 		}
 
 		// ── UI helper ─────────────────────────────────────────────────────────
