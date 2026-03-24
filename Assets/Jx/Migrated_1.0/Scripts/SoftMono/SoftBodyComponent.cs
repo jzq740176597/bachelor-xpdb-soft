@@ -22,6 +22,7 @@ namespace XPBD
 		#region Inspector
 		[SerializeField]
 		TetrahedralMeshAsset tetMeshAsset;
+		public TetrahedralMeshAsset TetMeshAsset => tetMeshAsset;
 		//for soft-collision [3/12/2026 jzq]
 		[Header("Soft-Soft-Collision")]
 		public int   SoftCollisionLayer = 0;
@@ -64,7 +65,6 @@ namespace XPBD
 		#endregion
 
 		#region Pub
-		public TetrahedralMeshAsset TetMeshAsset => tetMeshAsset;
 		public SoftBodyGPUState State => _state;
 		public void Init(TetrahedralMeshAsset tetMeshAsset)
 		{

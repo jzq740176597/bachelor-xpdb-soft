@@ -357,16 +357,27 @@ namespace XPBD
 			}
 		}
 
-		// One-time GPU readback at spawn to get rest-pose circumsphere radius.
-		// Used only for the ColRadius auto-formula (not live collision detection).
+		// Compute bounding radius and particle radius from the tetrahedral mesh asset.
+		//
+		// ParticleRadius is derived from actual mesh edge lengths — not from a
+		// spherical approximation. For each particle we compute the mean of all
+		// connected edge rest lengths (its Voronoi cell radius in the mesh).
+		// We then take the median across all particles — this gives the typical
+		// local inter-particle gap size, which is exactly what a collider must
+		// be larger than to avoid slipping between particles.
+		//
+		// This fully utilises the tetrahedral mesh topology and adapts
+		// automatically to non-uniform meshes (dense regions, coarse regions).
 		void ComputeRestBoundingRadius(SoftBodyComponent body)
 		{
 			var state = body.State;
 			if (state == null || state.ParticleCount == 0)
 				return;
 
+			var asset = body.TetMeshAsset;
 
-			int floatsPerParticle = 8; // float3 pos + float pad + float3 vel + float invMass = 32 bytes
+			// ── Bounding radius from GPU readback (still needed for soft-soft) ──
+			int floatsPerParticle = 8;
 			var raw = new float[state.ParticleCount * floatsPerParticle];
 			state.ParticleBuffer.GetData(raw);
 
@@ -386,8 +397,46 @@ namespace XPBD
 					Vector3.Distance(new Vector3(raw[o], raw[o + 1], raw[o + 2]), centroid));
 			}
 			body.BoundingRadius = Mathf.Max(maxDist, 0.01f);
-			float sa = 4f * Mathf.PI * body.BoundingRadius * body.BoundingRadius;
-			body.ParticleRadius = Mathf.Sqrt(sa / state.ParticleCount / Mathf.PI) * ParticleRadiusScale;
+
+			// ── Particle radius from mesh edge topology ───────────────────────
+			if (asset != null && asset.Edges != null && asset.Edges.Length > 0)
+			{
+				// Accumulate sum of connected edge rest lengths per particle.
+				var edgeLenSum   = new float[state.ParticleCount];
+				var edgeCount    = new int  [state.ParticleCount];
+				foreach (var e in asset.Edges)
+				{
+					edgeLenSum[e.IndexA] += e.RestLen;
+					edgeLenSum[e.IndexB] += e.RestLen;
+					edgeCount [e.IndexA]++;
+					edgeCount [e.IndexB]++;
+				}
+
+				// Per-particle mean edge length = local Voronoi cell radius.
+				// Half of this is the radius of the sphere centred at the particle
+				// that just touches its nearest neighbor.
+				var perParticleR = new float[state.ParticleCount];
+				int validCount = 0;
+				for (int i = 0; i < state.ParticleCount; i++)
+				{
+					if (edgeCount[i] == 0)
+						continue;
+					// Half mean edge length = particle sphere radius so spheres just touch
+					perParticleR[validCount++] = (edgeLenSum[i] / edgeCount[i]) * 0.5f;
+				}
+
+				// Median gives the typical gap — robust against outlier long boundary edges.
+				System.Array.Sort(perParticleR, 0, validCount);
+				float medianR = perParticleR[validCount / 2];
+
+				body.ParticleRadius = medianR * ParticleRadiusScale;
+			}
+			else
+			{
+				// Fallback: spherical approximation if no edge data.
+				float sa = 4f * Mathf.PI * body.BoundingRadius * body.BoundingRadius;
+				body.ParticleRadius = Mathf.Sqrt(sa / state.ParticleCount / Mathf.PI) * ParticleRadiusScale;
+			}
 		}
 
 		public void RegisterCollider(XpbdColliderSource src)
