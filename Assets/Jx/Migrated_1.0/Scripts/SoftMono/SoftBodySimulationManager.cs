@@ -194,7 +194,7 @@ namespace XPBD
 
 			_timeAccum -= _fixedDT;
 
-			bool hasRigid    = _colliders.Count > 0 && CollisionShapesCS;
+			bool hasRigid = _colliders.Count > 0 && CollisionShapesCS;
 			bool hasSoftSoft = _softSoftPairs.Count > 0 && SoftSoftCollisionCS && SoftSoftApplyCS;
 
 			if (hasRigid)
@@ -445,14 +445,14 @@ namespace XPBD
 			if (asset != null && asset.Edges != null && asset.Edges.Length > 0)
 			{
 				// Accumulate sum of connected edge rest lengths per particle.
-				var edgeLenSum   = new float[state.ParticleCount];
-				var edgeCount    = new int  [state.ParticleCount];
+				var edgeLenSum = new float[state.ParticleCount];
+				var edgeCount = new int[state.ParticleCount];
 				foreach (var e in asset.Edges)
 				{
 					edgeLenSum[e.IndexA] += e.RestLen;
 					edgeLenSum[e.IndexB] += e.RestLen;
-					edgeCount [e.IndexA]++;
-					edgeCount [e.IndexB]++;
+					edgeCount[e.IndexA]++;
+					edgeCount[e.IndexB]++;
 				}
 
 				// Per-particle mean edge length = local Voronoi cell radius.
@@ -505,9 +505,9 @@ namespace XPBD
 		{
 			var key = MakePairKey(a, b);
 			if (!_softSoftPairs.ContainsKey(key))
-{
+			{
 				_softSoftPairs[key] = null; // buffers allocated lazily
-}
+			}
 		}
 
 		/// <summary>Remove a previously registered explicit pair.</summary>
@@ -631,10 +631,10 @@ namespace XPBD
 
 
 			var cs = CollisionShapesCS;
-			cs.SetInt("_ShapeCount",    _shapeCount);
-			cs.SetInt("_DynSlotCount",  _dynSlotCount);
-			cs.SetFloat("_ColDeltaTime",   _subDT);
-			cs.SetFloat("_ContactSkin",    _contactSkin);
+			cs.SetInt("_ShapeCount", _shapeCount);
+			cs.SetInt("_DynSlotCount", _dynSlotCount);
+			cs.SetFloat("_ColDeltaTime", _subDT);
+			cs.SetFloat("_ContactSkin", _contactSkin);
 			cs.SetFloat("_ParticleRadius", _particleRadius);
 		}
 
@@ -652,12 +652,12 @@ namespace XPBD
 				if (body != null && body.State != null)
 				{
 					maxExtent = Mathf.Max(maxExtent, body.BoundingRadius);
-					maxPR     = Mathf.Max(maxPR,     body.ParticleRadius);
+					maxPR = Mathf.Max(maxPR, body.ParticleRadius);
 				}
 			}
 			if (maxExtent < 1e-4f)
 			{
-				_contactSkin    = ContactSkinMin;
+				_contactSkin = ContactSkinMin;
 				_particleRadius = ContactSkinMin;
 				return;
 			}
@@ -754,16 +754,16 @@ namespace XPBD
 		void DispatchShapesSolve(SoftBodyComponent bodyCmp)
 		{
 			var body = bodyCmp.State;
-			var cs   = CollisionShapesCS;
-			cs.SetFloat("_ColDeltaTime",          _subDT);
-			cs.SetFloat("_ContactSkin",           _contactSkin);
-			cs.SetFloat("_ParticleRadius",         _particleRadius);
-			cs.SetFloat("_CollisionDeltaWeight",  (float)SubSteps);
+			var cs = CollisionShapesCS;
+			cs.SetFloat("_ColDeltaTime", _subDT);
+			cs.SetFloat("_ContactSkin", _contactSkin);
+			cs.SetFloat("_ParticleRadius", _particleRadius);
+			cs.SetFloat("_CollisionDeltaWeight", (float) SubSteps);
 			cs.SetInt("_ParticleCount", body.ParticleCount);
-			cs.SetBuffer(_kShapesSolve, "_ImpulseBytes",   _impulseBuffer);
-			cs.SetBuffer(_kShapesSolve, "_Particles",      body.ParticleBuffer);
-			cs.SetBuffer(_kShapesSolve, "_Positions",      body.PositionsBuffer);
-			cs.SetBuffer(_kShapesSolve, "_ColSize",        body.ColSizeBuffer);
+			cs.SetBuffer(_kShapesSolve, "_ImpulseBytes", _impulseBuffer);
+			cs.SetBuffer(_kShapesSolve, "_Particles", body.ParticleBuffer);
+			cs.SetBuffer(_kShapesSolve, "_Positions", body.PositionsBuffer);
+			cs.SetBuffer(_kShapesSolve, "_ColSize", body.ColSizeBuffer);
 			cs.SetBuffer(_kShapesSolve, "_ColConstraints", body.ColConstraintBuffer);
 			cs.SetBuffer(_kShapesSolve, "_CollisionState", body.CollisionStateBuffer);
 			if (_bodyDeltaBuffers.TryGetValue(bodyCmp.GetInstanceID(), out var deltaBuffer))
@@ -773,15 +773,18 @@ namespace XPBD
 
 		void DispatchHardProject(SoftBodyGPUState body)
 		{
-			if (_shapesBuffer == null) return;
+			if (_shapesBuffer == null)
+				return;
 			var cs = CollisionShapesCS;
-			cs.SetInt("_ParticleCount",     body.ParticleCount);
-			cs.SetFloat("_ContactSkin",      _contactSkin);
-			cs.SetFloat("_ParticleRadius",    _particleRadius);
-			cs.SetBuffer(_kHardProject, "_Particles",       body.ParticleBuffer);
-			cs.SetBuffer(_kHardProject, "_Positions",       body.PositionsBuffer);
-			cs.SetBuffer(_kHardProject, "_Shapes",          _shapesBuffer);
+			cs.SetInt("_ParticleCount", body.ParticleCount);
+			cs.SetFloat("_ContactSkin", _contactSkin);
+			cs.SetFloat("_ParticleRadius", _particleRadius);
+			cs.SetBuffer(_kHardProject, "_Particles", body.ParticleBuffer);
+			cs.SetBuffer(_kHardProject, "_Positions", body.PositionsBuffer);
+			cs.SetBuffer(_kHardProject, "_Shapes", _shapesBuffer);
 			cs.SetBuffer(_kHardProject, "_ShapeVelocities", _shapeVelBuffer);
+			// [3/26/2026 jzq]
+			cs.SetBuffer(_kHardProject, "_MeshFacePlanes", _meshFacePlanesBuffer);
 			cs.Dispatch(_kHardProject, Ceil(body.ParticleCount), 1, 1);
 		}
 
@@ -872,7 +875,7 @@ namespace XPBD
 			var cs = SoftSoftCollisionCS;
 			cs.SetInt("_CountA", body.State.ParticleCount);
 			cs.SetBuffer(_kComputeBounds, "_PositionsA", body.State.PositionsBuffer);
-			cs.SetBuffer(_kComputeBounds, "_BoundsBuf",  buf);
+			cs.SetBuffer(_kComputeBounds, "_BoundsBuf", buf);
 			cs.Dispatch(_kComputeBounds, Ceil(body.State.ParticleCount), 1, 1);
 		}
 
@@ -882,7 +885,7 @@ namespace XPBD
 		bool ReadLiveBounds(SoftBodyComponent body, out Vector3 centroid, out float radius)
 		{
 			centroid = Vector3.zero;
-			radius   = body.BoundingRadius; // fallback to rest-pose
+			radius = body.BoundingRadius; // fallback to rest-pose
 
 			int id = body.GetInstanceID();
 			if (!_bodyBoundsBuffers.TryGetValue(id, out var buf) || buf == null)
@@ -961,7 +964,7 @@ namespace XPBD
 				// If (centreA-centreB distance) > (radA + radB + colRadius), bodies
 				// can't possibly have any particle pairs within colRadius → skip N×M.
 				if (ReadLiveBounds(a, out var centA, out var radA) &&
-				    ReadLiveBounds(b, out var centB, out var radB))
+					ReadLiveBounds(b, out var centB, out var radB))
 				{
 					if (Vector3.Distance(centA, centB) > radA + radB + radius)
 						continue;
@@ -999,13 +1002,13 @@ namespace XPBD
 				applyCs.SetInt("_CountA", nA);
 				applyCs.SetBuffer(_kApplySoftSoftDelta, "_ParticlesA", a.State.ParticleBuffer);
 				applyCs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", a.State.PositionsBuffer);
-				applyCs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA",  bufs.DeltaA);
+				applyCs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA", bufs.DeltaA);
 				applyCs.Dispatch(_kApplySoftSoftDelta, Ceil(nA), 1, 1);
 
 				applyCs.SetInt("_CountA", nB);
 				applyCs.SetBuffer(_kApplySoftSoftDelta, "_ParticlesA", b.State.ParticleBuffer);
 				applyCs.SetBuffer(_kApplySoftSoftDelta, "_PositionsA", b.State.PositionsBuffer);
-				applyCs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA",  bufs.DeltaB);
+				applyCs.SetBuffer(_kApplySoftSoftDelta, "_DeltaBufA", bufs.DeltaB);
 				applyCs.Dispatch(_kApplySoftSoftDelta, Ceil(nB), 1, 1);
 			}
 		}
@@ -1015,14 +1018,14 @@ namespace XPBD
 		void DispatchPresolve(SoftBodyComponent bodyCmp)
 		{
 			var body = bodyCmp.State;
-			var cs   = SoftBodySimCS;
-			cs.SetFloat("_DeltaTime",          _subDT);
+			var cs = SoftBodySimCS;
+			cs.SetFloat("_DeltaTime", _subDT);
 			cs.SetFloat("_DistanceCompliance", EdgeCompliance);
-			cs.SetFloat("_VolumeCompliance",   VolumeCompliance);
-			cs.SetFloat("_ContactSkin",        _contactSkin);
+			cs.SetFloat("_VolumeCompliance", VolumeCompliance);
+			cs.SetFloat("_ContactSkin", _contactSkin);
 			cs.SetInt("_ParticleCount", body.ParticleCount);
-			cs.SetInt("_EdgeCount",     body.EdgeCount);
-			cs.SetInt("_TetCount",      body.TetCount);
+			cs.SetInt("_EdgeCount", body.EdgeCount);
+			cs.SetInt("_TetCount", body.TetCount);
 
 			BindSimBuffers(cs, _kPresolve, bodyCmp);
 			cs.Dispatch(_kPresolve, Ceil(body.ParticleCount), 1, 1);
@@ -1039,9 +1042,9 @@ namespace XPBD
 		void DispatchWriteCollisionState(SoftBodyGPUState body)
 		{
 			var cs = CollisionShapesCS;
-			cs.SetBuffer(_kWriteCollisionState, "_Positions",      body.PositionsBuffer);
-			cs.SetBuffer(_kWriteCollisionState, "_Particles",      body.ParticleBuffer);
-			cs.SetBuffer(_kWriteCollisionState, "_ColSize",        body.ColSizeBuffer);
+			cs.SetBuffer(_kWriteCollisionState, "_Positions", body.PositionsBuffer);
+			cs.SetBuffer(_kWriteCollisionState, "_Particles", body.ParticleBuffer);
+			cs.SetBuffer(_kWriteCollisionState, "_ColSize", body.ColSizeBuffer);
 			cs.SetBuffer(_kWriteCollisionState, "_ColConstraints", body.ColConstraintBuffer);
 			cs.SetBuffer(_kWriteCollisionState, "_CollisionState", body.CollisionStateBuffer);
 			cs.Dispatch(_kWriteCollisionState, Ceil(MAX_COLLISION_CONSTRAINTS), 1, 1);
@@ -1050,7 +1053,7 @@ namespace XPBD
 		void DispatchClampDelta(SoftBodyComponent bodyCmp)
 		{
 			var body = bodyCmp.State;
-			var cs   = SoftBodySimCS;
+			var cs = SoftBodySimCS;
 			cs.SetInt("_ParticleCount", body.ParticleCount);
 			BindSimBuffers(cs, _kClampDelta, bodyCmp);
 			cs.Dispatch(_kClampDelta, Ceil(body.ParticleCount), 1, 1);
@@ -1059,10 +1062,10 @@ namespace XPBD
 		void DispatchConstraintsAndPostsolve(SoftBodyComponent bodyCmp)
 		{
 			var body = bodyCmp.State;
-			var cs   = SoftBodySimCS;
+			var cs = SoftBodySimCS;
 
 			int stretchKernel = UseExclusionStretch ? _kStretchExclusion : _kStretch;
-			int volumeKernel  = UseExclusionStretch ? _kVolumeExclusion  : _kVolume;
+			int volumeKernel = UseExclusionStretch ? _kVolumeExclusion : _kVolume;
 			int excIter = UseExclusionStretch ? ExclusionIterations : 1;
 			for (int ei = 0; ei < excIter; ei++)
 			{
@@ -1104,7 +1107,7 @@ namespace XPBD
 			// _DeltaRaw (RWByteAddressBuffer) used by constraint kernels for CAS atomic adds.
 			if (_bodyDeltaBuffers.TryGetValue(bodyCmp.GetInstanceID(), out var deltaBuffer))
 			{
-				cs.SetBuffer(kernel, "_Delta",    deltaBuffer);
+				cs.SetBuffer(kernel, "_Delta", deltaBuffer);
 				cs.SetBuffer(kernel, "_DeltaRaw", deltaBuffer);
 			}
 			if (ReferenceEquals(cs, SoftBodySimCS))
@@ -1189,17 +1192,17 @@ namespace XPBD
 
 		void CacheKernelIDs()
 		{
-			_kPresolve  = SoftBodySimCS.FindKernel("Presolve");
+			_kPresolve = SoftBodySimCS.FindKernel("Presolve");
 			_kPostsolve = SoftBodySimCS.FindKernel("Postsolve");
-			_kStretch   = SoftBodySimCS.FindKernel("StretchConstraint");
-			_kVolume    = SoftBodySimCS.FindKernel("VolumeConstraint");
-			_kClearDelta             = SoftBodySimCS.FindKernel("ClearDelta");
-			_kClampDelta             = SoftBodySimCS.FindKernel("ClampDelta");
-			_kStretchExclusion        = SoftBodySimCS.FindKernel("StretchConstraintWithExclusion");
-			_kVolumeExclusion         = SoftBodySimCS.FindKernel("VolumeConstraintWithExclusion");
+			_kStretch = SoftBodySimCS.FindKernel("StretchConstraint");
+			_kVolume = SoftBodySimCS.FindKernel("VolumeConstraint");
+			_kClearDelta = SoftBodySimCS.FindKernel("ClearDelta");
+			_kClampDelta = SoftBodySimCS.FindKernel("ClampDelta");
+			_kStretchExclusion = SoftBodySimCS.FindKernel("StretchConstraintWithExclusion");
+			_kVolumeExclusion = SoftBodySimCS.FindKernel("VolumeConstraintWithExclusion");
 			_kWriteCollisionState = CollisionShapesCS.FindKernel("WriteCollisionState");
 			_kClearCollisionState = CollisionShapesCS.FindKernel("ClearCollisionState");
-			_kHardProject         = CollisionShapesCS.FindKernel("HardProjectParticles");
+			_kHardProject = CollisionShapesCS.FindKernel("HardProjectParticles");
 
 			_kClearImpulse = CollisionShapesCS.FindKernel("ClearImpulseAccum");
 			_kDetectShapes = CollisionShapesCS.FindKernel("DetectShapes");
@@ -1207,9 +1210,9 @@ namespace XPBD
 
 			if (SoftSoftCollisionCS)
 			{
-				_kComputeBounds      = SoftSoftCollisionCS.FindKernel("ComputeBounds");
+				_kComputeBounds = SoftSoftCollisionCS.FindKernel("ComputeBounds");
 				_kClearSoftSoftDelta = SoftSoftCollisionCS.FindKernel("ClearSoftSoftDelta");
-				_kDetectSoftSoft     = SoftSoftCollisionCS.FindKernel("DetectSoftSoft");
+				_kDetectSoftSoft = SoftSoftCollisionCS.FindKernel("DetectSoftSoft");
 			}
 			// ApplySoftSoftDelta lives in its own file (SoftSoftApply.compute).
 			// See SoftSoftCollision.compute header: split-file rule prevents Unity

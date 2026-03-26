@@ -761,6 +761,37 @@ void HardProjectParticles(uint3 id : SV_DispatchThreadID)
                     vel -= nrm * vRelN;
             }
         }
+        else if (s.shapeType == SHAPE_CONVEX)
+        {
+            // AABB bounds reject (same as TestConvex).
+            float3 bDelta = abs(pos - s.axis) - s.axis2;
+            if (bDelta.x > 0.0 || bDelta.y > 0.0 || bDelta.z > 0.0) continue;
+
+            uint faceOffset = asuint(s.param0);
+            uint faceCount  = asuint(s.param1);
+            if (faceCount == 0u) continue;
+
+            // Find shallowest-penetrating face.
+            float minPen   = 1e38;
+            int   bestFace = -1;
+            for (uint fi = 0u; fi < faceCount; fi++)
+            {
+                float4 pl   = _MeshFacePlanes[faceOffset + fi];
+                float  dist = dot(pl.xyz, pos) + pl.w;
+                if (dist >= 0.0) { bestFace = -1; break; } // outside this plane = not inside
+                float pen = -dist;
+                if (pen < minPen) { minPen = pen; bestFace = (int)fi; }
+            }
+            if (bestFace < 0) continue;
+
+            float4 best = _MeshFacePlanes[faceOffset + (uint)bestFace];
+            float3 nrm  = best.xyz;
+            pos = pos + nrm * minPen;   // push to surface along shallowest face
+
+            float vRelN = dot(vel - surfVel, nrm);
+            if (vRelN < 0.0)
+                vel -= nrm * vRelN;
+        }
     }
 
     _Positions[pi].predict    = pos;

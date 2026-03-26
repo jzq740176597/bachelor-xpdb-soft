@@ -405,8 +405,25 @@ namespace XPBD
 						d.param1 = Mathf.Max(0f, cc.height * 0.5f * axScl - d.param0);
 						break;
 					}
-				default: // Convex — centre irrelevant for GPU, AABB stored in axis/axis2
-					break;
+				default: // Convex MeshCollider
+					{
+						// Mirror the MeshCollider case in BuildDescriptor exactly.
+						// FacePlanes and FacePlanesOffset are already updated for this
+						// substep's interpolated pose by RefreshDescriptorAtFraction
+						// before this method is called.
+						var mc2 = (MeshCollider)_col;
+						d.centre = pos;  // unused by GPU; kept for debug clarity
+						d.param0 = System.BitConverter.ToSingle(
+							System.BitConverter.GetBytes(FacePlanesOffset), 0);
+						d.param1 = System.BitConverter.ToSingle(
+							System.BitConverter.GetBytes((uint)(FacePlanes?.Length ?? 0)), 0);
+						// AABB for GPU bounds-reject in TestConvex.
+						// mc2.bounds is world-space and Unity keeps it current.
+						var bnd = mc2.bounds;
+						d.axis  = bnd.center;
+						d.axis2 = bnd.extents;
+						break;
+					}
 			}
 			return d;
 		}
