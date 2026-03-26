@@ -5,28 +5,17 @@
 //
 // ATTACHMENT TYPES:
 //
-//   Static   — particles are teleported to their rest-offset positions relative
-//               to the target transform every fixed step, then their velocity is
-//               zeroed.  The soft body cannot pull the target.  Use for hard pins
-//               (e.g. a sphere hanging from a ceiling hook).
+//   Static   — particles are snapped to their rest-offset positions every substep
+//               and the saved position anchor is also updated, so Postsolve derives
+//               zero velocity.  The soft body cannot pull the target.
 //
-//   Dynamic  — particles are driven toward the target via a spring/damper impulse.
-//               The target can be influenced by the accumulated reaction force
-//               (if the target has a Rigidbody).  Use for two-way coupling
-//               (e.g. a cloth draped over a moving rigidbody character).
-//
-// RUNTIME REQUIREMENTS:
-//   - SoftBodyComponent must be on the same GameObject or assignable via SoftBody field.
-//   - The SoftBodySimulationManager must be running.
-//   - Particle positions are read/written via GPU readback each FixedUpdate.
-//     This is a synchronous stall — acceptable for small groups (< 50 particles).
-//     For large groups consider async readback in a future patch.
+//   Dynamic  — particles are driven toward the target via XPBD positional correction
+//               every substep. If AttachTarget has a non-kinematic Rigidbody, the
+//               equal-and-opposite reaction force is fed back for two-way coupling.
 //
 // COORDINATE SPACE:
-//   Particles live in world space (SoftBodyGPUState was initialized with the
-//   body's localToWorldMatrix baked in at spawn).  AttachTarget is also world-space.
-//   RestOffsets are computed once at attachment time in the target's local space,
-//   so the group follows the target's rotation and translation correctly.
+//   Particles live in world space. RestOffsets are stored in AttachTarget's local
+//   space so the group follows the target's rotation and translation correctly.
 
 using System.Collections.Generic;
 using UnityEngine;
@@ -50,29 +39,27 @@ namespace XPBD
 		[Tooltip("Particle group defined in the TetrahedralMeshAsset editor.")]
 		public ParticleGroup ParticleGrp;
 
-		[Tooltip("Static: hard-pin (zero velocity, teleport). " +
-				 "Dynamic: spring-drive (two-way coupling with Rigidbody target).")]
+		[Tooltip("Static: hard-pin (zero velocity). " +
+				 "Dynamic: XPBD spring (two-way coupling with non-kinematic Rigidbody).")]
 		public AttachmentType Type = AttachmentType.Static;
 
 		[Header("Dynamic settings (ignored for Static)")]
-		[Range(0f, 1f)]
-		[Tooltip("Spring compliance: 0 = rigid, 1 = very soft spring.")]
-		public float Compliance = 0.01f;
-
-		[Range(0f, 1f)]
-		[Tooltip("Velocity damping applied to attachment correction. 1 = fully damped.")]
-		public float Damping = 0.5f;
+		[Tooltip("XPBD compliance: 0 = rigid snap, higher = softer spring.\n" +
+				 "Formula: corrScale = 1 / (1 + Compliance / subDt²).\n" +
+				 "At subDt ≈ 0.00083 s (60 Hz / 20 substeps):\n" +
+				 "  1e-5 ≈ very stiff,  1e-3 ≈ medium,  0.1 ≈ very soft.")]
+		public float Compliance = 1e-5f;
 
 		// ── Inspector: Debug Gizmos ───────────────────────────────────────────
 		[Header("Debug Gizmos (Dynamic only)")]
-		public bool ShowGizmos = true;
+		public bool  ShowGizmos          = true;
 		public float GizmoParticleRadius = 0.04f;
-		public Color GizmoParticleColor = new Color(0.2f, 0.8f, 1f, 0.85f);
-		public Color GizmoRestColor = Color.green;
-		public Color GizmoStretchColor = Color.red;
-		public Color GizmoCompressColor = Color.cyan;
+		public Color GizmoParticleColor  = new Color(0.2f, 0.8f, 1f, 0.85f);
+		public Color GizmoRestColor      = Color.green;
+		public Color GizmoStretchColor   = Color.red;
+		public Color GizmoCompressColor  = Color.cyan;
 
-		[Tooltip("Strain at which edge colour fully saturates. E.g. 0.10 = ±10%.")]
+		[Tooltip("Strain at which edge/link colour fully saturates. E.g. 0.10 = ±10%.")]
 		[Range(0.01f, 0.5f)]
 		public float StrainSaturate = 0.10f;
 
@@ -87,12 +74,14 @@ namespace XPBD
 		// Rest offsets in AttachTarget's LOCAL space, computed at Enable time.
 		Vector3[] _restOffsets;
 
-		// Cached particle indices from the group
+		// Cached particle indices from the group.
 		int[] _indices;
 
-		// GPU readback scratch buffers (allocated once, reused each SimStep).
+		// GPU readback scratch buffers — allocated once, reused every substep.
 		// _posRaw  : PositionsBuffer — GPUPbdPositions[] — 8 floats/particle
+		//            layout: predict.x/y/z, _pad0, delta.x/y/z, _pad1
 		// _partRaw : ParticleBuffer  — Particle[]        — 8 floats/particle
+		//            layout: position.x/y/z, _pad0, velocity.x/y/z, invMass
 		float[] _posRaw;
 		float[] _partRaw;
 
@@ -143,23 +132,15 @@ namespace XPBD
 				RestoreInvMass();
 		}
 
-		// Scratch buffers for GPU readback — allocated once per body, reused.
-		// _posRaw  : PositionsBuffer  — GPUPbdPositions[]  — 8 floats/particle (predict.xyz, pad, delta.xyz, pad)
-		// _partRaw : ParticleBuffer   — Particle[]         — 8 floats/particle (pos.xyz, pad, vel.xyz, invMass)
-		//float[] _posRaw;   // PositionsBuffer readback (predict)
-		//float[] _partRaw;  // ParticleBuffer  readback (position anchor + invMass)
-
 		// ── SimStep — called every substep by Manager after this body's Presolve ──
 		//
 		// Buffer state at entry (Presolve just ran):
-		//   PositionsBuffer[i].predict  = old_predict + vel * dt   (new predicted pos)
-		//   ParticleBuffer [i].position = old_predict              (saved anchor for Postsolve)
+		//   PositionsBuffer[i].predict  = old_predict + vel*dt   ← current predicted pos
+		//   ParticleBuffer [i].position = old_predict            ← saved anchor for Postsolve
 		//
-		// We write the corrected predict back. Postsolve then computes:
-		//   velocity = (corrected_predict - saved_anchor) / dt
-		// No explicit velocity injection needed — Postsolve derives it automatically.
-		// Running every substep means elastic constraints propagate each correction
-		// through the mesh incrementally, preventing the sudden large deltas that explode.
+		// We write corrected predict into PositionsBuffer.
+		// Postsolve derives: velocity = (corrected_predict - saved_anchor) / dt
+		// No explicit velocity injection — Postsolve handles it automatically.
 		void SimStep(SoftBodyComponent simBody, ComputeBuffer posBuffer, ComputeBuffer deltaBuffer, float subDt)
 		{
 			if (simBody != _softBody)
@@ -182,10 +163,16 @@ namespace XPBD
 
 			posBuffer.GetData(_posRaw);
 
-			bool dirtyPos = false;
+			bool dirtyPos  = false;
 			bool dirtyPart = false;
 
 			float dt = Mathf.Max(subDt, 1e-6f);
+
+			// Cache Rigidbody lookup outside loop — TryGetComponent every particle is wasteful.
+			Rigidbody targetRb = null;
+			bool hasReaction = Type == AttachmentType.Dynamic
+				&& AttachTarget.TryGetComponent(out targetRb)
+				&& !targetRb.isKinematic;  // kinematic bodies ignore AddForce entirely
 
 			for (int g = 0; g < _indices.Length; g++)
 			{
@@ -196,19 +183,18 @@ namespace XPBD
 				Vector3 targetWorld = AttachTarget.TransformPoint(
 					g < _restOffsets.Length ? _restOffsets[g] : Vector3.zero);
 
-				int o = idx * fpp;
+				int     o       = idx * fpp;
 				Vector3 predict = new Vector3(_posRaw[o], _posRaw[o + 1], _posRaw[o + 2]);
-				Vector3 delta = targetWorld - predict;
+				Vector3 delta   = targetWorld - predict;
 
 				if (delta.sqrMagnitude < 1e-10f)
 					continue;
 
 				if (Type == AttachmentType.Static)
 				{
-					// Hard pin every substep: snap predict to target.
-					// Also update the saved anchor (ParticleBuffer.position) to match
-					// so Postsolve derives ~zero velocity instead of fighting gravity.
-					_posRaw[o] = targetWorld.x;
+					// Snap predict to target every substep.
+					// Also update the saved anchor so Postsolve derives ~zero velocity.
+					_posRaw[o]     = targetWorld.x;
 					_posRaw[o + 1] = targetWorld.y;
 					_posRaw[o + 2] = targetWorld.z;
 					dirtyPos = true;
@@ -218,25 +204,41 @@ namespace XPBD
 						state.ParticleBuffer.GetData(_partRaw);
 						dirtyPart = true;
 					}
-					_partRaw[o] = targetWorld.x;
+					_partRaw[o]     = targetWorld.x;
 					_partRaw[o + 1] = targetWorld.y;
 					_partRaw[o + 2] = targetWorld.z;
 				}
 				else // Dynamic
 				{
-					// XPBD positional correction.
-					// corrScale = 1/(1 + Compliance/dt²).
-					// Compliance=0 → full snap; higher Compliance → softer spring.
-					// Safe at corrScale=1 because this runs every substep:
-					// elastic constraints distribute the correction through the mesh
-					// gradually — no single frame sees the full accumulated gap.
+					// XPBD positional correction into predict.
+					// corrScale = 1 / (1 + Compliance / dt²)
+					// Compliance = 0   → corrScale = 1   → full snap this substep
+					// Compliance = 1e-5 → very stiff at subDt ≈ 0.00083 s
 					float corrScale = 1f / (1f + Compliance / (dt * dt));
-					Vector3 corr = delta * corrScale;
+					Vector3 corr    = delta * corrScale;
 
-					_posRaw[o] = predict.x + corr.x;
+					_posRaw[o]     = predict.x + corr.x;
 					_posRaw[o + 1] = predict.y + corr.y;
 					_posRaw[o + 2] = predict.z + corr.z;
 					dirtyPos = true;
+
+					// Two-way coupling: feed reaction into target Rigidbody.
+					// Skipped for kinematic bodies (they ignore AddForce).
+					if (hasReaction)
+					{
+						if (!dirtyPart)
+						{
+							state.ParticleBuffer.GetData(_partRaw);
+							dirtyPart = true;
+						}
+						float invMass = _partRaw[idx * fpp + 7];
+						if (invMass > 1e-6f)
+						{
+							float   mass     = 1f / invMass;
+							Vector3 reaction = -corr * mass / dt;
+							targetRb.AddForceAtPosition(reaction, predict, ForceMode.Force);
+						}
+					}
 				}
 			}
 
@@ -363,64 +365,46 @@ namespace XPBD
 			{
 				if (idx < 0 || idx >= particles.Length)
 					continue;
-
-				Vector3 wp = hasLive
-					? new Vector3(
-						_posRaw[idx * fpp],
-						_posRaw[idx * fpp + 1],
-						_posRaw[idx * fpp + 2])
-					: _softBody.transform.TransformPoint(particles[idx].Position);
-
+				Vector3 wp = ParticlePos(idx, fpp, hasLive, particles);
 				Gizmos.DrawSphere(wp, GizmoParticleRadius);
 			}
 
-			// ── Spring links ──────────────────────────────────────────────────
-			// Only draw edges whose both endpoints belong to this group.
-			if (edges == null || edges.Length == 0)
-				return;
-
-			var inGroup = new HashSet<int>(indices);
-
-			foreach (var e in edges)
+			// ── Intra-group spring links (strain coloured) ────────────────────
+			if (edges != null && edges.Length > 0)
 			{
-				int a = (int) e.IndexA;
-				int b = (int) e.IndexB;
-				if (!inGroup.Contains(a) || !inGroup.Contains(b))
-					continue;
-				if (a >= particles.Length || b >= particles.Length)
-					continue;
+				var inGroup = new HashSet<int>(indices);
+				foreach (var e in edges)
+				{
+					int a = (int)e.IndexA;
+					int b = (int)e.IndexB;
+					if (!inGroup.Contains(a) || !inGroup.Contains(b))
+						continue;
+					if (a >= particles.Length || b >= particles.Length)
+						continue;
 
-				Vector3 wpA = hasLive
-					? new Vector3(
-						_posRaw[a * fpp],
-						_posRaw[a * fpp + 1],
-						_posRaw[a * fpp + 2])
-					: _softBody.transform.TransformPoint(particles[a].Position);
+					Vector3 wpA = ParticlePos(a, fpp, hasLive, particles);
+					Vector3 wpB = ParticlePos(b, fpp, hasLive, particles);
 
-				Vector3 wpB = hasLive
-					? new Vector3(
-						_posRaw[b * fpp],
-						_posRaw[b * fpp + 1],
-						_posRaw[b * fpp + 2])
-					: _softBody.transform.TransformPoint(particles[b].Position);
+					float strain = e.RestLen > 1e-6f
+						? (Vector3.Distance(wpA, wpB) - e.RestLen) / e.RestLen
+						: 0f;
 
-				float curLen = Vector3.Distance(wpA, wpB);
-				float strain = e.RestLen > 1e-6f ? (curLen - e.RestLen) / e.RestLen : 0f;
+					Gizmos.color = EvalStrainColor(strain);
+					Gizmos.DrawLine(wpA, wpB);
 
-				Gizmos.color = EvalStrainColor(strain);
-				Gizmos.DrawLine(wpA, wpB);
-
-				// Strain % label at midpoint
-				UnityEditor.Handles.Label(
-					(wpA + wpB) * 0.5f,
-					$"{strain * 100f:+0.#;-0.#;0}%",
-					UnityEditor.EditorStyles.miniLabel);
+					UnityEditor.Handles.Label(
+						(wpA + wpB) * 0.5f,
+						$"{strain * 100f:+0.#;-0.#;0}%",
+						UnityEditor.EditorStyles.miniLabel);
+				}
 			}
-			// ── AttachTarget links ────────────────────────────────────────────
-			// Draw a line from each particle to its target world-space anchor,
-			// plus a wire-sphere at the target to make it easy to spot.
-			Gizmos.color = new Color(1f, 0.85f, 0.1f, 0.9f); // yellow
-			Gizmos.DrawWireSphere(AttachTarget.position, GizmoParticleRadius * 1.5f);
+
+			// ── Particle → anchor links (strain coloured by stretch to target) ─
+			// Each particle has a rest-offset anchor on AttachTarget.
+			// The link colour shows how far the particle is from its anchor:
+			//   green = at rest distance, red = stretched, cyan = compressed.
+			// A small diamond is drawn AT the anchor point on the target.
+			bool hasOffsets = _restOffsets != null && _restOffsets.Length == indices.Length;
 
 			for (int g = 0; g < indices.Length; g++)
 			{
@@ -428,25 +412,49 @@ namespace XPBD
 				if (idx < 0 || idx >= particles.Length)
 					continue;
 
-				Vector3 wp = hasLive
-					? new Vector3(
-						_posRaw[idx * fpp],
-						_posRaw[idx * fpp + 1],
-						_posRaw[idx * fpp + 2])
-					: _softBody.transform.TransformPoint(particles[idx].Position);
+				Vector3 wp = ParticlePos(idx, fpp, hasLive, particles);
 
-				// Target anchor = rest offset transformed by the current AttachTarget pose.
-				Vector3 anchor = (_restOffsets != null && g < _restOffsets.Length)
+				// Anchor = rest-offset position on the target (not the target origin).
+				Vector3 anchor = hasOffsets
 					? AttachTarget.TransformPoint(_restOffsets[g])
 					: AttachTarget.position;
 
+				// Strain relative to rest (rest distance = 0 at attachment time).
+				// Positive = particle has moved away from anchor (stretched).
+				float linkDist   = Vector3.Distance(wp, anchor);
+				float linkStrain = linkDist > 1e-4f ? linkDist : 0f; // always ≥ 0
+				// Map: 0 = green, >0 = red (never compressed, only stretched or at rest).
+				float t = Mathf.Clamp01(linkStrain / Mathf.Max(StrainSaturate, 1e-5f));
+				Color linkColor = Color.Lerp(GizmoRestColor, GizmoStretchColor, t);
+
+				Gizmos.color = linkColor;
 				Gizmos.DrawLine(wp, anchor);
+
+				// Small diamond at anchor to show where the particle SHOULD be.
+				float r = GizmoParticleRadius * 0.7f;
+				Gizmos.color = new Color(linkColor.r, linkColor.g, linkColor.b, 1f);
+				Gizmos.DrawWireSphere(anchor, r);
+
+				// Distance label at midpoint of link.
+				UnityEditor.Handles.Label(
+					(wp + anchor) * 0.5f,
+					$"{linkDist * 100f:0.#} cm",
+					UnityEditor.EditorStyles.miniLabel);
 			}
+
+			// Target origin marker.
+			Gizmos.color = new Color(1f, 0.85f, 0.1f, 0.9f);
+			Gizmos.DrawWireSphere(AttachTarget.position, GizmoParticleRadius * 1.5f);
 		}
 
-		// Lerp rest→stretch or rest→compress based on signed strain.
-		// Strains within ±RestBand show GizmoRestColor.
-		// Outside the band, lerp saturates at ±StrainSaturate.
+		// World-space particle position: live GPU data if available, else rest-pose.
+		Vector3 ParticlePos(int idx, int fpp, bool hasLive, ParticleData[] particles)
+		{
+			if (hasLive)
+				return new Vector3(_posRaw[idx * fpp], _posRaw[idx * fpp + 1], _posRaw[idx * fpp + 2]);
+			return _softBody.transform.TransformPoint(particles[idx].Position);
+		}
+
 		Color EvalStrainColor(float strain)
 		{
 			if (strain > RestBand)
