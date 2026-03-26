@@ -103,6 +103,13 @@ namespace XPBD
 		readonly List<SoftBodyComponent> _bodies = new();
 		readonly List<XpbdColliderSource> _colliders = new();
 
+		// ── Attachment callbacks ───────────────────────────────────────────────
+		// Called every substep after Presolve, before constraints.
+		// Signature: (body, positionsBuffer, deltaBuffer, subDt)
+		// Attachment writes corrections directly into positionsBuffer.predict
+		// for the specific body it owns — no full GetData/SetData round-trip.
+		readonly List<System.Action<SoftBodyComponent, ComputeBuffer, ComputeBuffer, float>> _attachmentCallbacks = new();
+
 		// ── Soft-soft pair registry ───────────────────────────────────────────
 		// Canonical key: (lower instanceID, higher instanceID) so (A,B)==(B,A).
 		// Value is null until first EnsureSoftSoftPairBuffers allocates it.
@@ -225,6 +232,19 @@ namespace XPBD
 					if (!body)
 						continue;
 					DispatchPresolve(body);
+
+					// Attachment corrections — runs every substep immediately after
+					// this body's Presolve so predict is current. Attachment writes
+					// into PositionsBuffer directly (indexed by particle), before
+					// constraints read it. GetData stalls the GPU here which is
+					// acceptable: small groups only, and correctness requires sync.
+					if (_attachmentCallbacks.Count > 0)
+					{
+						int id = body.GetInstanceID();
+						_bodyDeltaBuffers.TryGetValue(id, out var deltaBuffer);
+						foreach (var cb in _attachmentCallbacks)
+							cb(body, body.State.PositionsBuffer, deltaBuffer, _subDT);
+					}
 				}
 
 				// Advance colliders to substep-end position.
@@ -316,6 +336,29 @@ namespace XPBD
 		}
 
 		// ── Public API ────────────────────────────────────────────────────────
+
+		/// <summary>
+		/// Duration of one XPBD substep in seconds.
+		/// Equals (1/FixedTimeStepFPS) / SubSteps.
+		/// </summary>
+		public float SubDT => _subDT;
+
+		/// <summary>
+		/// Register a per-substep attachment callback.
+		/// Called after each body's Presolve, before constraints.
+		/// Arguments: (body, positionsBuffer, deltaBuffer, subDt).
+		/// Only called for the body the attachment owns.
+		/// </summary>
+		public void RegisterAttachment(System.Action<SoftBodyComponent, ComputeBuffer, ComputeBuffer, float> cb)
+		{
+			if (!_attachmentCallbacks.Contains(cb))
+				_attachmentCallbacks.Add(cb);
+		}
+
+		public void UnregisterAttachment(System.Action<SoftBodyComponent, ComputeBuffer, ComputeBuffer, float> cb)
+		{
+			_attachmentCallbacks.Remove(cb);
+		}
 
 		public void AddBody(SoftBodyComponent body)
 		{
