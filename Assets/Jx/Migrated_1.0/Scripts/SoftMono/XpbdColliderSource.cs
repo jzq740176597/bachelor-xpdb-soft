@@ -122,15 +122,15 @@ namespace XPBD
 		// [3/12/2026 jzq]
 		static bool ValidateCld_S(Collider c)
 		{
+			if (!c.enabled)
+				return false;
 			if (c is MeshCollider mc)
 			{
 				if (!mc.convex)
-				{
 					Debug.LogError($"[XPBD] '{c.name}': MeshCollider must have convex = true", c);
-					return false;
-				}
+				return mc.convex;
 			}
-			return c.enabled;
+			return (c is SphereCollider || c is BoxCollider || c is CapsuleCollider);
 		}
 		// ─────────────────────────────────────────────────────────────────────
 		void Awake()
@@ -187,8 +187,11 @@ namespace XPBD
 				case BoxCollider:
 					Shape = ShapeType.OBB;
 					break;
-				default:
+				case CapsuleCollider:
 					Shape = ShapeType.Capsule;
+					break;
+				default:
+					Debug.LogError($"Invalid ColliderType '{_col.GetType()}'");
 					break;
 			}
 			// Use Body.position for kinematic so _prevPos tracks the physics-committed
@@ -397,7 +400,7 @@ namespace XPBD
 							axScl = Mathf.Abs(transform.lossyScale.y);
 
 						d.centre = pos + rot * Vector3.Scale(cc.center, transform.lossyScale);
-						d.axis   = (rot * localAx).normalized;
+						d.axis = (rot * localAx).normalized;
 						d.param0 = cc.radius * MaxScale();
 						d.param1 = Mathf.Max(0f, cc.height * 0.5f * axScl - d.param0);
 						break;
