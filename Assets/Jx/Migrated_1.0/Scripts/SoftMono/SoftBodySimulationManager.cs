@@ -54,6 +54,8 @@ namespace XPBD
 		[Header("Compute Shaders")]
 		public ComputeShader SoftBodySimCS;
 		public ComputeShader CollisionShapesCS;
+		[Header("SDF Collision")]
+		public ComputeShader SdfCollisionCS;   // SdfCollision.compute
 		public ComputeShader SoftSoftCollisionCS; // SoftSoftCollision.compute  — ComputeBounds, ClearSoftSoftDelta, DetectSoftSoft
 		public ComputeShader SoftSoftApplyCS;     // SoftSoftApply.compute      — ApplySoftSoftDelta
 		public ComputeShader DeformCS;
@@ -157,6 +159,151 @@ namespace XPBD
 		float _contactSkin = 0.04f;
 		float _particleRadius = 0.05f;
 
+		#region Sdf_Collider
+		readonly List<XpbdSdfCollider> _sdfColliders = new();
+
+		// Flat SDF data buffer — all grids packed, indexed by SdfDataOffset per shape.
+		ComputeBuffer _sdfDataBuffer;
+		// Per-SDF-shape descriptor buffer — one SdfShapeDescriptorCPU per shape.
+		ComputeBuffer _sdfShapesBuffer;
+		// Per-SDF-shape world-to-local matrix buffer.
+		ComputeBuffer _sdfTransformBuffer;
+
+		int _kSdfDetect;
+		int _sdfTotalCells;
+
+		// CPU scratch arrays
+		SdfShapeDescriptorCPU[] _cpuSdfShapes = Array.Empty<SdfShapeDescriptorCPU>();
+		Matrix4x4[] _cpuSdfTransforms = Array.Empty<Matrix4x4>();
+
+		// Add SDF to Public API region:
+		public void RegisterSdfCollider(XpbdSdfCollider src)
+		{
+			if (!_sdfColliders.Contains(src))
+				_sdfColliders.Add(src);
+		}
+
+		public void UnregisterSdfCollider(XpbdSdfCollider src)
+		{
+			_sdfColliders.Remove(src);
+		}
+		void RebuildSdfBuffers()
+		{
+			int count = _sdfColliders.Count;
+			if (count == 0)
+				return;
+
+			// Accumulate total SDF cell count and assign data offsets.
+			int totalCells = 0;
+			for (int i = 0; i < count; i++)
+			{
+				var src = _sdfColliders[i];
+				if (src.SdfAsset == null || !src.SdfAsset.IsBaked)
+					continue;
+				src.SdfDataOffset = totalCells;
+				totalCells += src.SdfAsset.SdfGrid.Length;
+			}
+			_sdfTotalCells = totalCells;
+
+			// Reallocate if layout changed.
+			bool needRebuild = _sdfDataBuffer == null
+							|| _sdfDataBuffer.count != Mathf.Max(totalCells, 1)
+							|| _sdfShapesBuffer == null
+							|| _sdfShapesBuffer.count != count;
+
+			if (needRebuild)
+			{
+				ReleaseSdfBuffers();
+				// stride = sizeof(SdfShapeDescriptorCPU) = 128 bytes
+				_sdfShapesBuffer = new ComputeBuffer(count, 128);
+				_sdfTransformBuffer = new ComputeBuffer(count, 64); // Matrix4x4 = 64 bytes
+				_sdfDataBuffer = new ComputeBuffer(Mathf.Max(totalCells, 1), sizeof(float));
+			}
+
+			// Fill CPU arrays.
+			if (_cpuSdfShapes.Length < count)
+				_cpuSdfShapes = new SdfShapeDescriptorCPU[count];
+			if (_cpuSdfTransforms.Length < count)
+				_cpuSdfTransforms = new Matrix4x4[count];
+
+			int cellIdx = 0;
+			// Temporary float array for SDF data — only reallocate if total changed.
+			var sdfFlat = new float[Mathf.Max(totalCells, 1)];
+
+			for (int i = 0; i < count; i++)
+			{
+				var src = _sdfColliders[i];
+				src.RefreshDescriptor(_subDT);
+				var desc = src.Descriptor;
+
+				_cpuSdfShapes[i] = desc;
+				_cpuSdfTransforms[i] = src.transform.worldToLocalMatrix;
+
+				if (src.SdfAsset != null && src.SdfAsset.IsBaked)
+				{
+					var grid = src.SdfAsset.SdfGrid;
+					System.Array.Copy(grid, 0, sdfFlat, cellIdx, grid.Length);
+					cellIdx += grid.Length;
+				}
+			}
+
+			_sdfShapesBuffer.SetData(_cpuSdfShapes, 0, 0, count);
+			_sdfTransformBuffer.SetData(_cpuSdfTransforms, 0, 0, count);
+			if (totalCells > 0)
+				_sdfDataBuffer.SetData(sdfFlat, 0, 0, totalCells);
+		}
+
+		// ── STEP 7: UploadSdfTransformsForSubstep ────────────────────────────────────
+		// Called every substep to update world-to-local matrices (moving SDF colliders).
+
+		void UploadSdfTransformsForSubstep()
+		{
+			int count = _sdfColliders.Count;
+			for (int i = 0; i < count; i++)
+			{
+				_cpuSdfTransforms[i] = _sdfColliders[i].transform.worldToLocalMatrix;
+				_sdfColliders[i].RefreshDescriptor(_subDT);
+				_cpuSdfShapes[i] = _sdfColliders[i].Descriptor;
+			}
+			_sdfShapesBuffer.SetData(_cpuSdfShapes, 0, 0, count);
+			_sdfTransformBuffer.SetData(_cpuSdfTransforms, 0, 0, count);
+		}
+
+		// ── STEP 8: DispatchSdfDetect ─────────────────────────────────────────────────
+		// Called in substep loop in same slot as DispatchDetectShapes, for each body.
+
+		void DispatchSdfDetect(SoftBodyGPUState body)
+		{
+			if (_sdfColliders.Count == 0 || SdfCollisionCS == null)
+				return;
+
+			int count = _sdfColliders.Count;
+			SdfCollisionCS.SetInt("_SdfShapeCount", count);
+			SdfCollisionCS.SetInt("_SdfParticleCount", body.ParticleCount);
+			SdfCollisionCS.SetBuffer(_kSdfDetect, "_SdfShapes", _sdfShapesBuffer);
+			SdfCollisionCS.SetBuffer(_kSdfDetect, "_SdfTransforms", _sdfTransformBuffer);
+			SdfCollisionCS.SetBuffer(_kSdfDetect, "_SdfData", _sdfDataBuffer);
+			SdfCollisionCS.SetBuffer(_kSdfDetect, "_Particles", body.ParticleBuffer);
+			SdfCollisionCS.SetBuffer(_kSdfDetect, "_Positions", body.PositionsBuffer);
+			SdfCollisionCS.SetBuffer(_kSdfDetect, "_ColSize", body.ColSizeBuffer);
+			SdfCollisionCS.SetBuffer(_kSdfDetect, "_ColConstraints", body.ColConstraintBuffer);
+
+			int threads = (count * body.ParticleCount + 31) / 32;
+			SdfCollisionCS.Dispatch(_kSdfDetect, threads, 1, 1);
+		}
+
+		// ── STEP 9: ReleaseSdfBuffers ─────────────────────────────────────────────────
+
+		void ReleaseSdfBuffers()
+		{
+			_sdfDataBuffer?.Release();
+			_sdfDataBuffer = null;
+			_sdfShapesBuffer?.Release();
+			_sdfShapesBuffer = null;
+			_sdfTransformBuffer?.Release();
+			_sdfTransformBuffer = null;
+		}
+		#endregion //Sdf_Collider
 		// ─────────────────────────────────────────────────────────────────────
 		void Awake()
 		{
@@ -177,6 +324,7 @@ namespace XPBD
 
 			ReleaseCollisionBuffers();
 			ReleaseSoftSoftBuffers();
+			ReleaseSdfBuffers(); // [3/26/2026 jzq]
 			SoftBodyGPUState.ClearAssetCache_S();
 			if (Instance == this)
 				Instance = null;
@@ -196,7 +344,8 @@ namespace XPBD
 
 			bool hasRigid = _colliders.Count > 0 && CollisionShapesCS;
 			bool hasSoftSoft = _softSoftPairs.Count > 0 && SoftSoftCollisionCS && SoftSoftApplyCS;
-
+			// [3/26/2026 jzq]
+			bool hasSdf = _sdfColliders.Count > 0 && SdfCollisionCS;
 			if (hasRigid)
 			{
 				// Snapshot BEFORE RebuildCollisionBuffers so frameStartPos captures
@@ -210,11 +359,13 @@ namespace XPBD
 				// Recompute adaptive contact skin from the largest registered body.
 				UpdateContactSkin();
 				RebuildCollisionBuffers(_fixedDT);
+
 				if (_dynSlotCount > 0)
 					DispatchClearImpulse();
-
 			}
-
+			// [3/26/2026 jzq]
+			if (hasSdf)
+				RebuildSdfBuffers();
 			if (hasSoftSoft)
 				EnsureSoftSoftPairBuffers();
 
@@ -259,11 +410,12 @@ namespace XPBD
 					}
 					UploadShapesForSubstep();
 				}
-
+				if (hasSdf)
+					UploadSdfTransformsForSubstep();  /// once per substep, outside body loop
 				// Collision pass 1: CCD — before elastic constraints.
 				// Detect+solve to push particles out, then WriteCollisionState so
 				// ClampDelta can suppress inward elastic deltas in Stretch/Volume.
-				if (hasRigid)
+				if (hasRigid || hasSdf)
 				{
 					foreach (var body in _bodies)
 					{
@@ -271,9 +423,14 @@ namespace XPBD
 							continue;
 						DispatchClearCollisionState(body.State);
 						ResetColSize(body.State);
-						DispatchDetectShapes(body.State);
-						DispatchShapesSolve(body);
-						DispatchWriteCollisionState(body.State);
+						if (hasSdf)
+							DispatchSdfDetect(body.State);
+						if (hasRigid)
+						{
+							DispatchDetectShapes(body.State);
+							DispatchShapesSolve(body);
+							DispatchWriteCollisionState(body.State);
+						}
 					}
 				}
 
@@ -1225,6 +1382,9 @@ namespace XPBD
 			_kTetDeform = DeformCS.FindKernel("TetDeform");
 			_kRecalcNormals = DeformCS.FindKernel("RecalcNormals");
 			_kNormalizeNormals = DeformCS.FindKernel("NormalizeNormals");
+			// [3/26/2026 jzq]
+			if (SdfCollisionCS)
+				_kSdfDetect = SdfCollisionCS.FindKernel("SdfDetect");
 		}
 	}
 

@@ -76,6 +76,13 @@ public static class MonoEx
 			var c = t.GetChild(i);
 			if (c)
 			{
+#if UNITY_EDITOR
+				if (!Application.isPlaying)
+				{
+					GameObject.DestroyImmediate(c.gameObject);
+					continue;
+				}
+#endif
 				c.SetParent(null);
 				GameObject.Destroy(c.gameObject);
 			}

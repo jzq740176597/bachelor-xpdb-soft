@@ -316,7 +316,6 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   SoftBodySimCS: {fileID: 7200000, guid: 083384a4c37b66743b9a76c82bd162bd, type: 3}
   CollisionShapesCS: {fileID: 7200000, guid: 7f9439041d81b494282cf35dd273d234, type: 3}
-  SdfCollisionCS: {fileID: 0}
   SoftSoftCollisionCS: {fileID: 7200000, guid: fff94285cf1780146a5d67887134f8c1, type: 3}
   SoftSoftApplyCS: {fileID: 7200000, guid: 25710c1129b73b04cb930c403596ccac, type: 3}
   DeformCS: {fileID: 7200000, guid: 21cc22ea2a32d254e885707879d019ec, type: 3}
@@ -617,7 +616,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 502732249623097388, guid: 1e1279fdf54e8fa46bef41d6cc000f1e, type: 3}
       propertyPath: m_Name
-      value: curve_pipe_straight
+      value: curve_pipe_straight (1)
       objectReference: {fileID: 0}
     - target: {fileID: 519779222921814826, guid: 1e1279fdf54e8fa46bef41d6cc000f1e, type: 3}
       propertyPath: m_IsActive
@@ -1884,8 +1883,7 @@ PrefabInstance:
       value: 0
       objectReference: {fileID: 0}
     m_RemovedComponents: []
-    m_RemovedGameObjects:
-    - {fileID: 7393138770372210302, guid: 1e1279fdf54e8fa46bef41d6cc000f1e, type: 3}
+    m_RemovedGameObjects: []
     m_AddedGameObjects: []
     m_AddedComponents: []
   m_SourcePrefab: {fileID: 100100000, guid: 1e1279fdf54e8fa46bef41d6cc000f1e, type: 3}

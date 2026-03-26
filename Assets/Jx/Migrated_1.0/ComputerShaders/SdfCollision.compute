@@ -1,0 +1,236 @@
+// SdfCollision.compute
+//
+// GPU collision kernels for XpbdSdfCollider — arbitrary closed meshes
+// represented as baked 3D signed-distance-field grids.
+//
+// ── Design ───────────────────────────────────────────────────────────────────
+// Kept entirely separate from Collision_Shapes.compute so:
+//   • Analytic shapes (sphere/OBB/capsule) are unaffected
+//   • Unity doesn't demand SDF buffers be bound for non-SDF dispatches
+//   • SDF feature can be disabled at zero cost by not dispatching these kernels
+//
+// ── SDF layout ───────────────────────────────────────────────────────────────
+// _SdfData     : float[] — all SDF grids packed flat, indexed by sdfDataOffset
+// _SdfShapes   : SdfShapeDescriptor[] — one entry per registered SDF collider
+// _SdfTransforms: float4x4[] — world-to-local matrix per SDF collider (same index)
+//
+// ── Contact test ─────────────────────────────────────────────────────────────
+// For each (SDF shape × particle):
+//   1. AABB reject in world space → skip most particles cheaply
+//   2. Transform particle to local space via _SdfTransforms[si]
+//   3. Trilinear sample of SDF grid
+//   4. If sdf < contactSkin → contact detected
+//   5. Normal = normalised central-difference gradient of SDF (6-tap)
+//   6. Emit ColConstraint into shared _ColConstraints buffer (same as Collision_Shapes)
+//
+// SolveCollisions and HardProject in Collision_Shapes.compute handle the
+// actual constraint solve — we reuse that pipeline directly.
+//
+// ── Coordinate conventions ───────────────────────────────────────────────────
+// SDF values: negative = inside mesh, positive = outside.
+// Gradient points outward (toward +SDF). Contact normal = gradient direction.
+// Penetration depth = -sdf (positive when inside).
+
+#pragma kernel SdfDetect
+
+#pragma target 5.0
+
+#define EPSILON        1e-6
+#define MAX_CONSTRAINTS 10000
+#define GROUP_SIZE      32
+
+// ── Structs ───────────────────────────────────────────────────────────────────
+
+struct Particle     { float3 position; float _p0; float3 velocity; float invMass; };
+struct PbdPositions { float3 predict;  float _p0; float3 delta;    float _p1;    };
+
+struct ColConstraint
+{
+	float3 contactPt;
+	uint   pIdx;
+	float3 normal;
+	float  surfVelN;
+	uint   colType;
+	uint   dynSlot;
+	float  rbInvMass;
+	float  sphereRadius; // 0 for SDF contacts (plane-mode in SolveCollisions)
+};
+
+// Must match SdfShapeDescriptorCPU in XpbdSdfCollider.cs (128 bytes, 2 × float4×4)
+struct SdfShapeDescriptor
+{
+	// block 0
+	float3 aabbCentre;
+	float  contactSkin;
+	float3 aabbExtents;
+	uint   sdfDataOffset;
+	uint   resX, resY, resZ;
+	uint   colType;
+	uint   dynSlot;
+	float  rbInvMass;
+	float  _pad0;
+
+	// block 1
+	float3 boundsMin;
+	float  _pad1;
+	float3 boundsMax;
+	float  _pad2;
+	float3 surfaceVelocity;
+	float  _pad3;
+	float4 _pad4; // reserved
+};
+
+// ── Uniforms ──────────────────────────────────────────────────────────────────
+
+uint  _SdfShapeCount;
+uint  _SdfParticleCount;
+
+// ── Buffers ───────────────────────────────────────────────────────────────────
+
+StructuredBuffer<SdfShapeDescriptor> _SdfShapes;
+StructuredBuffer<float4x4>           _SdfTransforms;  // world-to-local per shape
+StructuredBuffer<float>              _SdfData;         // flat packed SDF grids
+
+StructuredBuffer<Particle>           _Particles;
+StructuredBuffer<PbdPositions>       _Positions;
+
+// Shared with Collision_Shapes.compute — same ColConstraints buffer
+RWStructuredBuffer<uint>             _ColSize;
+RWStructuredBuffer<ColConstraint>    _ColConstraints;
+
+// ── SDF sampling ─────────────────────────────────────────────────────────────
+
+// Trilinear sample of SDF at local-space position p.
+// Returns 1e38 if outside the grid bounds.
+float SampleSdf(SdfShapeDescriptor s, float3 p)
+{
+	float3 bMin = s.boundsMin;
+	float3 bMax = s.boundsMax;
+	float3 bSz  = bMax - bMin;
+
+	// Map p to [0, res-1] continuous coordinates
+	float3 uvw = float3(
+		(p.x - bMin.x) / bSz.x * (float)s.resX - 0.5,
+		(p.y - bMin.y) / bSz.y * (float)s.resY - 0.5,
+		(p.z - bMin.z) / bSz.z * (float)s.resZ - 0.5);
+
+	// Bounds check — outside grid
+	if (uvw.x < -0.5 || uvw.y < -0.5 || uvw.z < -0.5 ||
+		uvw.x > (float)s.resX - 0.5 ||
+		uvw.y > (float)s.resY - 0.5 ||
+		uvw.z > (float)s.resZ - 0.5)
+		return 1e38;
+
+	int3 i0 = clamp((int3)floor(uvw),    int3(0,0,0), int3(s.resX-1, s.resY-1, s.resZ-1));
+	int3 i1 = clamp(i0 + int3(1,1,1),   int3(0,0,0), int3(s.resX-1, s.resY-1, s.resZ-1));
+	float3 t = uvw - (float3)i0;
+
+	uint rx = s.resX, ry = s.resY;
+	uint off = s.sdfDataOffset;
+
+	// 8 corners
+	float c000 = _SdfData[off + i0.x + i0.y * rx + i0.z * rx * ry];
+	float c100 = _SdfData[off + i1.x + i0.y * rx + i0.z * rx * ry];
+	float c010 = _SdfData[off + i0.x + i1.y * rx + i0.z * rx * ry];
+	float c110 = _SdfData[off + i1.x + i1.y * rx + i0.z * rx * ry];
+	float c001 = _SdfData[off + i0.x + i0.y * rx + i1.z * rx * ry];
+	float c101 = _SdfData[off + i1.x + i0.y * rx + i1.z * rx * ry];
+	float c011 = _SdfData[off + i0.x + i1.y * rx + i1.z * rx * ry];
+	float c111 = _SdfData[off + i1.x + i1.y * rx + i1.z * rx * ry];
+
+	return lerp(
+		lerp(lerp(c000, c100, t.x), lerp(c010, c110, t.x), t.y),
+		lerp(lerp(c001, c101, t.x), lerp(c011, c111, t.x), t.y),
+		t.z);
+}
+
+// Central-difference gradient of SDF at local position p.
+// Result is NOT normalised — caller normalises for the contact normal.
+// Uses one-cell step size for accuracy vs noise trade-off.
+float3 SdfGradient(SdfShapeDescriptor s, float3 p)
+{
+	float3 cellSz = (s.boundsMax - s.boundsMin) / float3(s.resX, s.resY, s.resZ);
+	float3 h      = cellSz;
+
+	float dx = SampleSdf(s, p + float3(h.x, 0, 0)) - SampleSdf(s, p - float3(h.x, 0, 0));
+	float dy = SampleSdf(s, p + float3(0, h.y, 0)) - SampleSdf(s, p - float3(0, h.y, 0));
+	float dz = SampleSdf(s, p + float3(0, 0, h.z)) - SampleSdf(s, p - float3(0, 0, h.z));
+
+	return float3(dx, dy, dz); // unnormalised; divide by 2h already implicit if uniform
+}
+
+// ── Kernel: SdfDetect ─────────────────────────────────────────────────────────
+// One thread per (SDF shape × particle).
+// Index = si * _SdfParticleCount + pi.
+//
+// On contact: emits a ColConstraint into _ColConstraints (shared with
+// Collision_Shapes.compute). SolveCollisions handles the actual solve.
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void SdfDetect(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= _SdfShapeCount * _SdfParticleCount) return;
+
+	uint si = id.x / _SdfParticleCount;
+	uint pi = id.x % _SdfParticleCount;
+
+	SdfShapeDescriptor s = _SdfShapes[si];
+	float3 pWorld        = _Positions[pi].predict;
+
+	// ── World-space AABB broad reject ─────────────────────────────────────
+	float3 bDelta = abs(pWorld - s.aabbCentre) - (s.aabbExtents + s.contactSkin);
+	if (bDelta.x > 0.0 || bDelta.y > 0.0 || bDelta.z > 0.0)
+		return;
+
+	// ── Transform particle to local SDF space ────────────────────────────
+	float4x4 w2l  = _SdfTransforms[si];
+	float3   pLocal = mul(w2l, float4(pWorld, 1.0)).xyz;
+
+	// ── Sample SDF ───────────────────────────────────────────────────────
+	float sdfVal = SampleSdf(s, pLocal);
+
+	// sdfVal < contactSkin: particle is inside or approaching the surface
+	if (sdfVal >= s.contactSkin)
+		return;
+
+	// ── Compute contact normal via gradient ──────────────────────────────
+	float3 gradLocal = SdfGradient(s, pLocal);
+	float  gradLen   = length(gradLocal);
+
+	float3 nrmLocal;
+	if (gradLen > EPSILON)
+		nrmLocal = gradLocal / gradLen;
+	else
+		nrmLocal = float3(0, 1, 0); // degenerate fallback
+
+	// Transform normal to world space using inverse-transpose of world-to-local
+	// = transpose of world-to-local = columns of localToWorld rotation block.
+	// For uniform scale: nrmWorld = normalize(mul((float3x3)transpose(w2l), nrmLocal))
+	float3x3 w2l3 = (float3x3)w2l;
+	float3   nrmWorld = normalize(mul(transpose(w2l3), nrmLocal));
+
+	// ── Contact point ─────────────────────────────────────────────────────
+	// Project predicted position onto surface in world space.
+	// For SDF contacts we use plane-mode in SolveCollisions (sphereRadius = 0).
+	// contactPt = world position on surface = pWorld - sdfVal * nrmWorld.
+	// (sdfVal is signed: negative inside, so this pushes outward when inside)
+	float3 cp = pWorld - sdfVal * nrmWorld;
+
+	// ── Emit constraint ───────────────────────────────────────────────────
+	uint slot;
+	InterlockedAdd(_ColSize[0], 1u, slot);
+	if (slot >= MAX_CONSTRAINTS)
+		return;
+
+	ColConstraint c;
+	c.contactPt    = cp;
+	c.pIdx         = pi;
+	c.normal       = nrmWorld;
+	c.surfVelN     = dot(s.surfaceVelocity, nrmWorld);
+	c.colType      = s.colType;
+	c.dynSlot      = s.dynSlot;
+	c.rbInvMass    = s.rbInvMass;
+	c.sphereRadius = 0.0; // plane mode — SolveCollisions uses stored normal
+
+	_ColConstraints[slot] = c;
+}
