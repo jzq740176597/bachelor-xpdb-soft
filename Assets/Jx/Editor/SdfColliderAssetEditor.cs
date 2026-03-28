@@ -1,11 +1,15 @@
 // SdfColliderAssetEditor.cs  —  place in any Editor/ folder.
 //
-// Inspector for SdfColliderAsset:
-//   • Bake button with progress bar
-//   • Axis-slice visualiser: renders one 2D cross-section of the SDF grid
-//     as a colour-coded texture (blue=outside, red=inside, green=surface)
-//   • Slice axis (X/Y/Z) + slice position slider
-//   • "Rebuild on change" toggle for live preview while tuning parameters
+// Inspector for SdfColliderAsset.
+// Renders a 3D marching-cubes iso-surface preview in the Scene view
+// when any XpbdSdfCollider component using this asset is selected.
+//
+// Two surfaces are drawn:
+//   GREEN  (iso = 0)     — the contact surface. Soft particles crossing here get pushed out.
+//   RED    (iso = -skin) — the interior solid. Anything inside is deeply penetrating.
+//
+// The preview is rebuilt only when the asset changes or the user clicks Bake.
+// It is NOT built at runtime — editor only.
 
 #if UNITY_EDITOR
 using UnityEngine;
@@ -20,15 +24,19 @@ namespace XPBD
 		SerializedProperty _bakePadding;
 		SerializedProperty _sourceMesh;
 
-		// Visualiser state
-		enum SliceAxis { X, Y, Z }
-		SliceAxis _sliceAxis   = SliceAxis.Y;
-		float     _sliceT      = 0.5f;       // 0–1 normalised position along axis
-		Texture2D _sliceTex;
-		bool      _showVis     = true;
+		// Preview meshes (local-space, rebuilt on bake)
+		Mesh _surfaceMesh;   // iso = 0,      green
+		Mesh _interiorMesh;  // iso = -_skin,  red
 
-		// Colour range scale — SDF values beyond ±_visRange show max saturation
-		float _visRange = 0.3f;
+		// Inspector controls
+		bool  _showPreviewInScene = true;
+		float _previewSkin        = 0.05f;  // interior offset in metres
+		float _surfaceAlpha       = 0.35f;
+		float _interiorAlpha      = 0.20f;
+
+		// Materials — created once, shared across repaint calls
+		Material _surfaceMat;
+		Material _interiorMat;
 
 		void OnEnable()
 		{
@@ -36,15 +44,24 @@ namespace XPBD
 			_bakePadding    = serializedObject.FindProperty("BakePadding");
 			// [3/28/2026 jzq]
 			_sourceMesh = serializedObject.FindProperty("SourceMesh");
+			
+			_surfaceMat  = CreateTransparentMat(new Color(0.1f, 0.9f, 0.2f, _surfaceAlpha));
+			_interiorMat = CreateTransparentMat(new Color(0.9f, 0.1f, 0.1f, _interiorAlpha));
+
+			var asset = (SdfColliderAsset)target;
+			if (asset.IsBaked)
+				RebuildPreviewMeshes(asset);
+
+			SceneView.duringSceneGui += OnSceneGUI;
 		}
 
 		void OnDisable()
 		{
-			if (_sliceTex != null)
-			{
-				DestroyImmediate(_sliceTex);
-				_sliceTex = null;
-			}
+			SceneView.duringSceneGui -= OnSceneGUI;
+			DestroyImmediate(_surfaceMesh);
+			DestroyImmediate(_interiorMesh);
+			DestroyImmediate(_surfaceMat);
+			DestroyImmediate(_interiorMat);
 		}
 
 		public override void OnInspectorGUI()
@@ -91,7 +108,7 @@ namespace XPBD
 					MessageType.Warning);
 			}
 
-			// ── Buttons ───────────────────────────────────────────────────
+			// ── Bake / Clear buttons ───────────────────────────────────────
 			EditorGUILayout.Space(4);
 			bool canBake = _sourceMesh.objectReferenceValue != null;
 			using (new EditorGUI.DisabledGroupScope(!canBake))
@@ -99,13 +116,12 @@ namespace XPBD
 				if (GUILayout.Button("Bake SDF", GUILayout.Height(28)))
 				{
 					DoBake(asset);
-					RebuildSlice(asset);
+					RebuildPreviewMeshes(asset);
 				}
 			}
 			if (!canBake)
 				EditorGUILayout.HelpBox("Assign a Source Mesh above.", MessageType.None);
 
-			// ── Clear button ──────────────────────────────────────────────
 			using (new EditorGUI.DisabledGroupScope(!asset.IsBaked))
 			{
 				if (GUILayout.Button("Clear Bake Data"))
@@ -114,138 +130,83 @@ namespace XPBD
 					asset.ResX = asset.ResY = asset.ResZ = 0;
 					EditorUtility.SetDirty(asset);
 					AssetDatabase.SaveAssets();
-					DestroyImmediate(_sliceTex);
-					_sliceTex = null;
+					DestroyImmediate(_interiorMesh); _interiorMesh = null;
 				}
 			}
 
-			// ── Slice visualiser ──────────────────────────────────────────
+			// ── 3D Scene preview controls ─────────────────────────────────
 			if (!asset.IsBaked)
 				return;
 
 			EditorGUILayout.Space(8);
-			_showVis = EditorGUILayout.Foldout(_showVis, "SDF Slice Visualiser", true);
-			if (!_showVis)
-				return;
+			EditorGUILayout.LabelField("3D Scene Preview", EditorStyles.boldLabel);
 
-			EditorGUI.indentLevel++;
+			_showPreviewInScene = EditorGUILayout.Toggle("Show in Scene", _showPreviewInScene);
 
-			bool changed = false;
-
-			var newAxis = (SliceAxis)EditorGUILayout.EnumPopup("Slice Axis", _sliceAxis);
-			if (newAxis != _sliceAxis)
+			EditorGUI.BeginChangeCheck();
+			_previewSkin   = EditorGUILayout.Slider("Interior Offset (m)", _previewSkin, 0.001f, 0.3f);
+			_surfaceAlpha  = EditorGUILayout.Slider("Surface Alpha",  _surfaceAlpha,  0f, 1f);
+			_interiorAlpha = EditorGUILayout.Slider("Interior Alpha", _interiorAlpha, 0f, 1f);
+			if (EditorGUI.EndChangeCheck())
 			{
-				_sliceAxis = newAxis;
-				changed = true;
+				_surfaceMat.color  = new Color(0.1f, 0.9f, 0.2f, _surfaceAlpha);
+				_interiorMat.color = new Color(0.9f, 0.1f, 0.1f, _interiorAlpha);
+				RebuildPreviewMeshes(asset);
 			}
 
-			float newT = EditorGUILayout.Slider("Slice Position", _sliceT, 0f, 1f);
-			if (!Mathf.Approximately(newT, _sliceT))
-			{
-				_sliceT = newT;
-				changed = true;
-			}
+			EditorGUILayout.HelpBox(
+				"GREEN = contact surface (iso = 0). Particles crossing this get pushed out.\n" +
+				"RED   = solid interior (iso = −offset). Deep penetration zone.\n\n" +
+				"Hollow pipe: expect GREEN shells on outer + inner walls, RED band = shell material.\n" +
+				"If bore shows RED, the mesh normals are flipped — flip them in Blender.",
+				MessageType.None);
 
-			float newRange = EditorGUILayout.FloatField("Colour Range (m)", _visRange);
-			newRange = Mathf.Max(newRange, 0.001f);
-			if (!Mathf.Approximately(newRange, _visRange))
-			{
-				_visRange = newRange;
-				changed = true;
-			}
-
-			if (changed || _sliceTex == null)
-				RebuildSlice(asset);
-
-			if (_sliceTex != null)
-			{
-				// Draw the texture — scale to fit inspector width
-				float w = EditorGUIUtility.currentViewWidth - 32f;
-				var   r = GUILayoutUtility.GetRect(w, w);
-				EditorGUI.DrawPreviewTexture(r, _sliceTex, null, ScaleMode.ScaleToFit);
-
-				// Legend
-				EditorGUILayout.BeginHorizontal();
-				DrawColorSwatch(Color.blue);
-				EditorGUILayout.LabelField("Outside");
-				DrawColorSwatch(Color.green);
-				EditorGUILayout.LabelField("Surface (≈0)");
-				DrawColorSwatch(Color.red);
-				EditorGUILayout.LabelField("Inside");
-				EditorGUILayout.EndHorizontal();
-
-				EditorGUILayout.HelpBox(
-					"Green band = contact surface.\n" +
-					"Red region = solid interior (particles here get pushed out).\n" +
-					"Blue region = exterior (no contact).\n" +
-					"Thin shell: expect a thin red band at each wall — outside walls " +
-					"are blue, bore/air is also blue, shell material is red.",
-					MessageType.None);
-			}
-
-			EditorGUI.indentLevel--;
+			if (_showPreviewInScene)
+				SceneView.RepaintAll();
 		}
 
-		// Build a 2D texture of the SDF slice.
-		void RebuildSlice(SdfColliderAsset asset)
+		// ── Scene view rendering ──────────────────────────────────────────────
+
+		void OnSceneGUI(SceneView sv)
 		{
+			if (!_showPreviewInScene)
+				return;
+
+			var asset = (SdfColliderAsset)target;
 			if (!asset.IsBaked)
 				return;
 
-			int res = asset.ResX; // assumes cubic for now
-			int sliceIdx = Mathf.Clamp(Mathf.RoundToInt(_sliceT * (res - 1)), 0, res - 1);
-
-			if (_sliceTex == null || _sliceTex.width != res)
+			// Find any XpbdSdfCollider in the scene using this asset to get a transform
+			// for converting local→world. If none found, draw at origin.
+			var colliders = Object.FindObjectsByType<XpbdSdfCollider>(FindObjectsSortMode.None);
+			Matrix4x4 localToWorld = Matrix4x4.identity;
+			foreach (var col in colliders)
 			{
-				DestroyImmediate(_sliceTex);
-				_sliceTex = new Texture2D(res, res, TextureFormat.RGB24, false)
+				if (col.SdfAsset == asset)
 				{
-					filterMode = FilterMode.Point,
-					wrapMode   = TextureWrapMode.Clamp,
-				};
-			}
-
-			var pixels = new Color[res * res];
-			for (int j = 0; j < res; j++)
-			{
-				for (int i = 0; i < res; i++)
-				{
-					float sdf;
-					switch (_sliceAxis)
-					{
-						case SliceAxis.X:
-							sdf = asset.SdfGrid[sliceIdx + j * res + i * res * res];
-							break;
-						case SliceAxis.Z:
-							sdf = asset.SdfGrid[i + j * res + sliceIdx * res * res];
-							break;
-						default: // Y
-							sdf = asset.SdfGrid[i + sliceIdx * res + j * res * res];
-							break;
-					}
-					pixels[j * res + i] = SdfToColor(sdf);
+					localToWorld = col.transform.localToWorldMatrix;
+					break;
 				}
 			}
 
-			_sliceTex.SetPixels(pixels);
-			_sliceTex.Apply();
+			if (_surfaceMesh != null && _surfaceMat != null)
+			{
+				_surfaceMat.SetPass(0);
+				Graphics.DrawMeshNow(_surfaceMesh, localToWorld);
+			}
+			if (_interiorMesh != null && _interiorMat != null)
+			{
+				_interiorMat.SetPass(0);
+				Graphics.DrawMeshNow(_interiorMesh, localToWorld);
+			}
 		}
 
-		// Map SDF value to colour:
-		//   outside (positive): blue, fading toward green at surface
-		//   inside  (negative): red,  fading toward green at surface
-		Color SdfToColor(float sdf)
+		void RebuildPreviewMeshes(SdfColliderAsset asset)
 		{
-			float t = Mathf.Clamp01(Mathf.Abs(sdf) / _visRange);
-			if (sdf >= 0f)
-				return Color.Lerp(Color.green, Color.blue,  t);
-			return     Color.Lerp(Color.green, Color.red,   t);
-		}
-
-		void DrawColorSwatch(Color c)
-		{
-			var r = GUILayoutUtility.GetRect(16, 16, GUILayout.Width(16), GUILayout.Height(16));
-			EditorGUI.DrawRect(r, c);
+			DestroyImmediate(_surfaceMesh);
+			DestroyImmediate(_interiorMesh);
+			_surfaceMesh  = SdfMarchingCubes.Extract(asset, 0f);
+			_interiorMesh = SdfMarchingCubes.Extract(asset, -_previewSkin);
 		}
 
 		void DoBake(SdfColliderAsset asset)
@@ -265,6 +226,28 @@ namespace XPBD
 			{
 				EditorUtility.ClearProgressBar();
 			}
+		}
+
+		static Material CreateTransparentMat(Color color)
+		{
+			// Use the built-in transparent diffuse shader available in all Unity versions
+			var mat = new Material(Shader.Find("Transparent/Diffuse")
+					?? Shader.Find("Legacy Shaders/Transparent/Diffuse")
+					?? Shader.Find("Standard"));
+			mat.color = color;
+			if (mat.HasProperty("_Mode"))
+			{
+				mat.SetFloat("_Mode", 3);
+				mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+				mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+				mat.SetInt("_ZWrite", 0);
+				mat.DisableKeyword("_ALPHATEST_ON");
+				mat.EnableKeyword("_ALPHABLEND_ON");
+				mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+				mat.renderQueue = 3000;
+			}
+			mat.hideFlags = HideFlags.HideAndDontSave;
+			return mat;
 		}
 	}
 }
