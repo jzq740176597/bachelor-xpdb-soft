@@ -162,10 +162,23 @@ float3 SdfGradient(SdfShapeDescriptor s, float3 p)
 
 // ── Kernel: SdfDetect ─────────────────────────────────────────────────────────
 // One thread per (SDF shape × particle).
-// Index = si * _SdfParticleCount + pi.
 //
-// On contact: emits a ColConstraint into _ColConstraints (shared with
-// Collision_Shapes.compute). SolveCollisions handles the actual solve.
+// ── CCD strategy ─────────────────────────────────────────────────────────────
+// Static-only detection misses fast-moving particles that tunnel through thin
+// SDF shells in a single substep. We use speculative CCD:
+//   1. Sample SDF at pEnd (predict) — normal case.
+//   2. If pEnd is outside (sdf >= contactSkin), also sample along the swept
+//      segment pStart→pEnd at N intermediate points.
+//   3. If any intermediate point is inside, emit contact at that point.
+//
+// This is cheaper than true continuous ray-marching (no iteration needed per
+// point) and robust for typical substep sizes. NumCcdSteps = 3 gives good
+// coverage: checks at 25%, 50%, 75% of the swept path.
+//
+// Clamped to thin-shell cases only (sdf at pEnd > -contactSkin) to avoid
+// extra samples for particles deep inside a large volume.
+
+#define SDF_CCD_STEPS 3   // intermediate samples along the sweep
 
 [numthreads(GROUP_SIZE, 1, 1)]
 void SdfDetect(uint3 id : SV_DispatchThreadID)
@@ -176,46 +189,74 @@ void SdfDetect(uint3 id : SV_DispatchThreadID)
 	uint pi = id.x % _SdfParticleCount;
 
 	SdfShapeDescriptor s = _SdfShapes[si];
-	float3 pWorld        = _Positions[pi].predict;
+	float3 pEnd          = _Positions[pi].predict;
+	float3 pStart        = _Particles[pi].position; // set by Presolve each substep
 
-	// ── World-space AABB broad reject ─────────────────────────────────────
-	float3 bDelta = abs(pWorld - s.aabbCentre) - (s.aabbExtents + s.contactSkin);
+	// ── World-space AABB broad reject (expanded by contactSkin) ───────────
+	// Use the union of pStart and pEnd bounding box so sweeping particles
+	// are not rejected by the AABB before they reach the surface.
+	float3 pMin = min(pStart, pEnd);
+	float3 pMax = max(pStart, pEnd);
+	float3 sweepCentre  = (pMin + pMax) * 0.5;
+	float3 sweepExtents = (pMax - pMin) * 0.5;
+	float3 bDelta = abs(sweepCentre - s.aabbCentre) - (s.aabbExtents + sweepExtents + s.contactSkin);
 	if (bDelta.x > 0.0 || bDelta.y > 0.0 || bDelta.z > 0.0)
 		return;
 
-	// ── Transform particle to local SDF space ────────────────────────────
-	float4x4 w2l  = _SdfTransforms[si];
-	float3   pLocal = mul(w2l, float4(pWorld, 1.0)).xyz;
+	float4x4 w2l = _SdfTransforms[si];
 
-	// ── Sample SDF ───────────────────────────────────────────────────────
-	float sdfVal = SampleSdf(s, pLocal);
+	// ── Test pEnd (normal static check) ──────────────────────────────────
+	float3 pEndLocal = mul(w2l, float4(pEnd, 1.0)).xyz;
+	float  sdfEnd    = SampleSdf(s, pEndLocal);
 
-	// sdfVal < contactSkin: particle is inside or approaching the surface
-	if (sdfVal >= s.contactSkin)
+	float3 contactWorld = pEnd;
+	float3 contactLocal = pEndLocal;
+	float  sdfContact   = sdfEnd;
+	bool   hit          = (sdfEnd < s.contactSkin);
+
+	// ── CCD sweep: check intermediate points pStart→pEnd ─────────────────
+	// Only needed when pEnd is outside (no static contact) or just inside skin.
+	// Skips when particle is already deep inside — no tunnelling possible there.
+	if (!hit || sdfEnd > -s.contactSkin * 2.0)
+	{
+		[unroll]
+		for (int step = 1; step <= SDF_CCD_STEPS; step++)
+		{
+			float   t      = (float)step / (float)(SDF_CCD_STEPS + 1);
+			float3  pMid   = lerp(pStart, pEnd, t);
+			float3  pLocal = mul(w2l, float4(pMid, 1.0)).xyz;
+			float   sdfMid = SampleSdf(s, pLocal);
+
+			if (sdfMid < s.contactSkin)
+			{
+				// Prefer the earliest contact along the sweep (smallest t).
+				// Since we iterate t in increasing order, the first hit found is earliest.
+				if (!hit || sdfMid < sdfContact)
+				{
+					contactWorld = pMid;
+					contactLocal = pLocal;
+					sdfContact   = sdfMid;
+					hit          = true;
+					break; // earliest contact found
+				}
+			}
+		}
+	}
+
+	if (!hit)
 		return;
 
-	// ── Compute contact normal via gradient ──────────────────────────────
-	float3 gradLocal = SdfGradient(s, pLocal);
+	// ── Contact normal via SDF gradient ──────────────────────────────────
+	float3 gradLocal = SdfGradient(s, contactLocal);
 	float  gradLen   = length(gradLocal);
+	float3 nrmLocal  = gradLen > EPSILON ? gradLocal / gradLen : float3(0, 1, 0);
 
-	float3 nrmLocal;
-	if (gradLen > EPSILON)
-		nrmLocal = gradLocal / gradLen;
-	else
-		nrmLocal = float3(0, 1, 0); // degenerate fallback
-
-	// Transform normal to world space using inverse-transpose of world-to-local
-	// = transpose of world-to-local = columns of localToWorld rotation block.
-	// For uniform scale: nrmWorld = normalize(mul((float3x3)transpose(w2l), nrmLocal))
-	float3x3 w2l3 = (float3x3)w2l;
+	// Transform normal to world space via inverse-transpose of w2l
+	float3x3 w2l3    = (float3x3)w2l;
 	float3   nrmWorld = normalize(mul(transpose(w2l3), nrmLocal));
 
-	// ── Contact point ─────────────────────────────────────────────────────
-	// Project predicted position onto surface in world space.
-	// For SDF contacts we use plane-mode in SolveCollisions (sphereRadius = 0).
-	// contactPt = world position on surface = pWorld - sdfVal * nrmWorld.
-	// (sdfVal is signed: negative inside, so this pushes outward when inside)
-	float3 cp = pWorld - sdfVal * nrmWorld;
+	// Contact point on the surface
+	float3 cp = contactWorld - sdfContact * nrmWorld;
 
 	// ── Emit constraint ───────────────────────────────────────────────────
 	uint slot;
@@ -231,7 +272,7 @@ void SdfDetect(uint3 id : SV_DispatchThreadID)
 	c.colType      = s.colType;
 	c.dynSlot      = s.dynSlot;
 	c.rbInvMass    = s.rbInvMass;
-	c.sphereRadius = 0.0; // plane mode — SolveCollisions uses stored normal
+	c.sphereRadius = 0.0; // plane mode
 
 	_ColConstraints[slot] = c;
 }
