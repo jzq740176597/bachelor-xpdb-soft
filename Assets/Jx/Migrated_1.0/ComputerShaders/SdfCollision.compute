@@ -59,7 +59,7 @@ struct ColConstraint
 // Must match SdfShapeDescriptorCPU in XpbdSdfCollider.cs (128 bytes, 2 × float4×4)
 struct SdfShapeDescriptor
 {
-	// block 0
+	// block 0 (64 bytes)
 	float3 aabbCentre;
 	float  contactSkin;
 	float3 aabbExtents;
@@ -69,15 +69,16 @@ struct SdfShapeDescriptor
 	uint   dynSlot;
 	float  rbInvMass;
 	float  _pad0;
+	float  _pad0b;  // matches SdfShapeDescriptorCPU._pad0b — keeps block 1 at byte 64
 
-	// block 1
+	// block 1 (64 bytes)
 	float3 boundsMin;
 	float  _pad1;
 	float3 boundsMax;
 	float  _pad2;
 	float3 surfaceVelocity;
 	float  _pad3;
-	float4 _pad4; // reserved
+	float4 _pad4; // reserved — world-to-local in separate _SdfTransforms buffer
 };
 
 // ── Uniforms ──────────────────────────────────────────────────────────────────

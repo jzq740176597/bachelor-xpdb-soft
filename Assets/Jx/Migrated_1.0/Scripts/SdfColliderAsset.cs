@@ -33,7 +33,7 @@ using UnityEngine;
 
 namespace XPBD
 {
-	[CreateAssetMenu(menuName = "XPBD/SDF Collider Asset", fileName = "MeshSdfCollider")]
+	[CreateAssetMenu(menuName = "XPBD/SDF Collider Asset", fileName = "NewSdfCollider")]
 	public sealed class SdfColliderAsset : ScriptableObject
 	{
 		#region Inspector
@@ -52,33 +52,38 @@ namespace XPBD
 		// Flat SDF grid in LOCAL space: index = x + y*Res + z*Res*Res
 		// Value = signed distance to nearest surface in local units.
 		// Negative inside, positive outside.
-		[HideInInspector] //too large make Inspect TOO SLOW! [3/26/2026 jzq]
 		public float[] SdfGrid;
 
 		// Grid dimensions (may differ per axis in future; currently cubic)
-		[ReadOnly]
 		public int ResX, ResY, ResZ;
 
 		// Local-space AABB of the baked volume (= mesh bounds + BakePadding)
-		[ReadOnly]
 		public Vector3 BoundsMin;
-		[ReadOnly]
 		public Vector3 BoundsMax;
 
 		// Cell size in local units (= (BoundsMax - BoundsMin) / Res)
-		[ReadOnly]
 		public Vector3 CellSize;
 
 		// Source mesh path (for re-bake; runtime only uses SdfGrid)
-		[HideInInspector]
-		public string SourceMeshGuid;
+		//[HideInInspector]
+		public Mesh SourceMesh;
 		#endregion
 
 		// ── Accessors ─────────────────────────────────────────────────────────
-		public bool IsBaked => SdfGrid != null && SdfGrid.Length > 0 && SdfGrid.Length == ResX * ResY * ResZ;
+		public bool IsBaked => SdfGrid != null
+			&& ResX > 0 && ResY > 0 && ResZ > 0
+			&& SdfGrid.Length == ResX * ResY * ResZ;
 
 		public Vector3 BoundsSize => BoundsMax - BoundsMin;
-
+		// [3/28/2026 jzq]
+		public void ClearData()
+		{
+			if (IsBaked)
+			{
+				//make IsBaked => false
+				SdfGrid = null;
+			}
+		}
 		// Sample SDF trilinearly at LOCAL-space position p.
 		// Returns float.MaxValue if outside the baked volume.
 		public float SampleLocal(Vector3 p)

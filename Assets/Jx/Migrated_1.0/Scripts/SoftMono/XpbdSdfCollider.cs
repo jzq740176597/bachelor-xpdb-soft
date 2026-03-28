@@ -31,17 +31,17 @@ namespace XPBD
 {
 	[AddComponentMenu("XPBD/SDF Collider")]
 	[DisallowMultipleComponent]
-	public class XpbdSdfCollider : MonoBehaviour
+	public sealed class XpbdSdfCollider : MonoBehaviour
 	{
 		// ── Inspector ─────────────────────────────────────────────────────────
 		[Header("SDF Data")]
 		[Tooltip("Pre-baked SDF asset. If null, bakes from MeshFilter/MeshAsset at Awake (slow).")]
 		public SdfColliderAsset SdfAsset;
 
-		[Tooltip("MeshFilter to bake from if SdfAsset is null. " +
-				 "The filter's sharedMesh is used in its local space.")]
-		[Header("--Null (to Get On Self)--")] // [3/26/2026 jzq]
-		public MeshFilter SourceMeshFilter;
+		//[Tooltip("MeshFilter to bake from if SdfAsset is null. " +
+		//		 "The filter's sharedMesh is used in its local space.")]
+		//[Header("--Null (to Get On Self)--")] // [3/26/2026 jzq]
+		////public MeshFilter SourceMeshFilter;
 
 		//[Tooltip("Direct mesh asset fallback if SourceMeshFilter is also null.")]
 		//public Mesh SourceMeshAsset;
@@ -97,14 +97,20 @@ namespace XPBD
 					: XpbdColliderSource.ColType.Dynamic;
 			}
 
-			EnsureSdfAsset();
-			UploadSdfBuffer();
+			if (EnsureSdfAsset())
+				UploadSdfBuffer();
 		}
 
 		void OnEnable()
 		{
 			if (SdfAsset == null || !SdfAsset.IsBaked)
+			{
+				Debug.LogError(
+					$"[XpbdSdfCollider] '{name}': SdfAsset is not baked " +
+					"(ResX=0 or SdfGrid empty). Open the asset and click 'Bake SDF' " +
+					"in the Inspector, then assign a Source Mesh.", this);
 				return;
+			}
 			SoftBodySimulationManager.Instance?.RegisterSdfCollider(this);
 			_registered = true;
 		}
@@ -117,7 +123,21 @@ namespace XPBD
 				_registered = false;
 			}
 		}
-
+		// [3/28/2026 jzq]
+		void OnDrawGizmos()
+		{
+			if (!SdfAsset.IsBaked /* || !SdfAsset.SourceMesh*/)
+				return;
+			var gizmoColor = Color.gray;
+			Gizmos.color = gizmoColor;
+			//Gizmos.DrawWireMesh(SdfAsset.SourceMesh, transform.position, transform.rotation, transform.localScale);
+			Gizmos.DrawMesh(
+				SdfAsset.SourceMesh,
+				transform.position,
+				transform.rotation,
+				transform.localScale
+			);
+		}
 		void OnDestroy()
 		{
 			SdfDataBuffer?.Release();
@@ -171,30 +191,34 @@ namespace XPBD
 		}
 
 		// ── Helpers ───────────────────────────────────────────────────────────
-		void EnsureSdfAsset()
+		bool EnsureSdfAsset()
 		{
 			if (SdfAsset != null && SdfAsset.IsBaked)
-				return;
+				return true;
+			//No runtime bake [3/28/2026 jzq]
+			Debug.LogError($"'{name}' should Ensure : SdfAsset != null && SdfAsset.IsBaked");
+			return false;
 
-			Mesh mesh = ResolveMesh();
-			if (mesh == null)
-			{
-				Debug.LogWarning($"[XpbdSdfCollider] '{name}': No mesh source found. " +
-					"Assign SdfAsset, SourceMeshFilter, or SourceMeshAsset.", this);
-				return;
-			}
+			//Mesh mesh = ResolveMesh();
+			//if (mesh == null)
+			//{
+			//	Debug.LogWarning($"[XpbdSdfCollider] '{name}': No mesh source found. " +
+			//		"Assign SdfAsset, SourceMeshFilter, or SourceMeshAsset.", this);
+			//	return false;
+			//}
 
-			if (SdfAsset == null)
-			{
-				// Create a temporary runtime-only asset (not persisted to disk)
-				SdfAsset = ScriptableObject.CreateInstance<SdfColliderAsset>();
-				SdfAsset.BakeResolution = 32;
-				SdfAsset.BakePadding = 0.05f;
-				Debug.LogWarning($"[XpbdSdfCollider] '{name}': No SdfAsset assigned. " +
-					"Baking at runtime (slow). Use the XPBD → Bake SDF menu for production.", this);
-			}
+			//if (SdfAsset == null)
+			//{
+			//	// Create a temporary runtime-only asset (not persisted to disk)
+			//	SdfAsset = ScriptableObject.CreateInstance<SdfColliderAsset>();
+			//	SdfAsset.BakeResolution = 32;
+			//	SdfAsset.BakePadding = 0.05f;
+			//	Debug.LogWarning($"[XpbdSdfCollider] '{name}': No SdfAsset assigned. " +
+			//		"Baking at runtime (slow). Use the XPBD → Bake SDF menu for production.", this);
+			//}
 
-			SdfBaker.Bake(mesh, SdfAsset);
+			//SdfBaker.Bake(mesh, SdfAsset);
+			//return true;
 		}
 
 		void UploadSdfBuffer()
@@ -209,14 +233,14 @@ namespace XPBD
 			SdfDataBuffer.SetData(SdfAsset.SdfGrid);
 		}
 
-		Mesh ResolveMesh()
-		{
-			if (!SourceMeshFilter) // [3/26/2026 jzq]
-				SourceMeshFilter = GetComponent<MeshFilter>();
-			if (SourceMeshFilter && SourceMeshFilter.sharedMesh)
-				return SourceMeshFilter.sharedMesh;
-			return null; // SourceMeshAsset;
-		}
+		//Mesh ResolveMesh()
+		//{
+		//	if (!SourceMeshFilter) // [3/26/2026 jzq]
+		//		SourceMeshFilter = GetComponent<MeshFilter>();
+		//	if (SourceMeshFilter && SourceMeshFilter.sharedMesh)
+		//		return SourceMeshFilter.sharedMesh;
+		//	return null; // SourceMeshAsset;
+		//}
 
 		static Vector3 AbsScale(Vector3 s) =>
 			new Vector3(Mathf.Abs(s.x), Mathf.Abs(s.y), Mathf.Abs(s.z));

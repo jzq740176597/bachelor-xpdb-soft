@@ -75,16 +75,22 @@ namespace XPBD
 	}
 
 	// ─── ColConstraint ────────────────────────────────────────────────────────
-	// C++ : alignas(16) glm::vec3 orig; alignas(4) uint32_t particleIndex;
-	//       alignas(16) glm::vec3 normal;
-	// Size: 32 bytes
+	// Must match Collision_Shapes.compute and SdfCollision.compute exactly.
+	// HLSL layout (48 bytes):
+	//   float3 contactPt (12) + uint pIdx (4)
+	//   float3 normal    (12) + float surfVelN (4)
+	//   uint colType (4) + uint dynSlot (4) + float rbInvMass (4) + float sphereRadius (4)
 	[StructLayout(LayoutKind.Sequential)]
 	public struct GPUColConstraint
 	{
-		public Vector3 orig;          // 12 bytes
-		public uint particleIndex; //  4 bytes → 16 aligned
-		public Vector3 normal;        // 12 bytes
-		public float _pad;          //  4 bytes → 32 bytes total
+		public Vector3 contactPt;      // 12 bytes
+		public uint    pIdx;           //  4 bytes → 16
+		public Vector3 normal;         // 12 bytes
+		public float   surfVelN;       //  4 bytes → 32
+		public uint    colType;        //  4 bytes
+		public uint    dynSlot;        //  4 bytes
+		public float   rbInvMass;      //  4 bytes
+		public float   sphereRadius;   //  4 bytes → 48 bytes total
 	}
 
 	// ─── SkinningInfo ─────────────────────────────────────────────────────────
@@ -105,7 +111,7 @@ namespace XPBD
 		public static readonly int PbdPositions = Marshal.SizeOf<GPUPbdPositions>();  // 32
 		public static readonly int Edge = Marshal.SizeOf<GPUEdge>();          // 16
 		public static readonly int Tetrahedral = Marshal.SizeOf<GPUTetrahedral>();   // 32
-		public static readonly int ColConstraint = Marshal.SizeOf<GPUColConstraint>(); // 32
+		public static readonly int ColConstraint = Marshal.SizeOf<GPUColConstraint>();  // 48
 		public static readonly int SkinningInfo = Marshal.SizeOf<GPUSkinningInfo>();  // 16
 	}
 }

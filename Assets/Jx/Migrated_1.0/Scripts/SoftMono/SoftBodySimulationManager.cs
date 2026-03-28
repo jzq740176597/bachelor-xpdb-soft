@@ -426,11 +426,11 @@ namespace XPBD
 						if (hasSdf)
 							DispatchSdfDetect(body.State);
 						if (hasRigid)
-						{
 							DispatchDetectShapes(body.State);
-							DispatchShapesSolve(body);
-							DispatchWriteCollisionState(body.State);
-						}
+						// SolveCollisions consumes _ColConstraints written by BOTH
+						// SdfDetect and DetectShapes — must run whenever either fires.
+						DispatchShapesSolve(body);
+						DispatchWriteCollisionState(body.State);
 					}
 				}
 
@@ -455,10 +455,13 @@ namespace XPBD
 					{
 						if (!body)
 							continue;
-						if (hasRigid)
+						if (hasRigid || hasSdf)
 						{
 							ResetColSize(body.State);
-							DispatchDetectShapes(body.State);
+							if (hasSdf)
+								DispatchSdfDetect(body.State);
+							if (hasRigid)
+								DispatchDetectShapes(body.State);
 							DispatchShapesSolve(body);
 						}
 						if (hasSoftSoft && ci == CollisionIterations - 1)
@@ -911,16 +914,24 @@ namespace XPBD
 		void DispatchShapesSolve(SoftBodyComponent bodyCmp)
 		{
 			var body = bodyCmp.State;
-			var cs = CollisionShapesCS;
+			var cs   = CollisionShapesCS;
 			cs.SetFloat("_ColDeltaTime", _subDT);
 			cs.SetFloat("_ContactSkin", _contactSkin);
 			cs.SetFloat("_ParticleRadius", _particleRadius);
 			cs.SetFloat("_CollisionDeltaWeight", (float) SubSteps);
 			cs.SetInt("_ParticleCount", body.ParticleCount);
-			cs.SetBuffer(_kShapesSolve, "_ImpulseBytes", _impulseBuffer);
-			cs.SetBuffer(_kShapesSolve, "_Particles", body.ParticleBuffer);
-			cs.SetBuffer(_kShapesSolve, "_Positions", body.PositionsBuffer);
-			cs.SetBuffer(_kShapesSolve, "_ColSize", body.ColSizeBuffer);
+
+			// _impulseBuffer is only allocated by RebuildCollisionBuffers when
+			// rigid colliders are present. In SDF-only mode it is null, so we
+			// allocate a minimal 1-slot dummy so the kernel binding doesn't crash.
+			// Dynamic impulse feedback is a no-op in this case (dynSlotCount = 0).
+			if (_impulseBuffer == null)
+				_impulseBuffer = new ComputeBuffer(IMPULSE_STRIDE / 4, sizeof(uint), ComputeBufferType.Raw);
+
+			cs.SetBuffer(_kShapesSolve, "_ImpulseBytes",   _impulseBuffer);
+			cs.SetBuffer(_kShapesSolve, "_Particles",      body.ParticleBuffer);
+			cs.SetBuffer(_kShapesSolve, "_Positions",      body.PositionsBuffer);
+			cs.SetBuffer(_kShapesSolve, "_ColSize",        body.ColSizeBuffer);
 			cs.SetBuffer(_kShapesSolve, "_ColConstraints", body.ColConstraintBuffer);
 			cs.SetBuffer(_kShapesSolve, "_CollisionState", body.CollisionStateBuffer);
 			if (_bodyDeltaBuffers.TryGetValue(bodyCmp.GetInstanceID(), out var deltaBuffer))
