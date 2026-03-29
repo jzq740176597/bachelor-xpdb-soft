@@ -230,23 +230,51 @@ namespace XPBD
 
 		static Material CreateTransparentMat(Color color)
 		{
-			// Use the built-in transparent diffuse shader available in all Unity versions
-			var mat = new Material(Shader.Find("Transparent/Diffuse")
-					?? Shader.Find("Legacy Shaders/Transparent/Diffuse")
-					?? Shader.Find("Standard"));
-			mat.color = color;
-			if (mat.HasProperty("_Mode"))
-			{
-				mat.SetFloat("_Mode", 3);
-				mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-				mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-				mat.SetInt("_ZWrite", 0);
-				mat.DisableKeyword("_ALPHATEST_ON");
-				mat.EnableKeyword("_ALPHABLEND_ON");
-				mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-				mat.renderQueue = 3000;
-			}
-			mat.hideFlags = HideFlags.HideAndDontSave;
+			// Build a minimal inline shader that is:
+			//   • Double-sided (Cull Off) — marching cubes normals point outward,
+			//     so backfaces would be culled without this.
+			//   • Alpha-blended transparent
+			//   • Unlit — no lighting needed for a debug visualiser
+			//   • Works in Built-in RP, URP, and HDRP (no pipeline-specific shader needed)
+			const string shaderSrc = @"
+Shader ""Hidden/XPBD_SdfDebug""
+{
+    Properties { _Color (""Color"", Color) = (1,1,1,0.4) }
+    SubShader
+    {
+        Tags { ""Queue""=""Transparent"" ""RenderType""=""Transparent"" }
+        Pass
+        {
+            Cull Off
+            ZWrite Off
+            Blend SrcAlpha OneMinusSrcAlpha
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
+            #include ""UnityCG.cginc""
+            struct v2f { float4 pos : SV_POSITION; float3 nrm : TEXCOORD0; };
+            float4 _Color;
+            v2f vert(float4 vertex : POSITION, float3 normal : NORMAL)
+            {
+                v2f o;
+                o.pos = UnityObjectToClipPos(vertex);
+                o.nrm = UnityObjectToWorldNormal(normal);
+                return o;
+            }
+            half4 frag(v2f i) : SV_Target
+            {
+                // Simple diffuse shading so depth is readable (optional)
+                float ndotl = abs(dot(normalize(i.nrm), normalize(float3(1,1,-1))));
+                float shade = lerp(0.6, 1.0, ndotl);
+                return half4(_Color.rgb * shade, _Color.a);
+            }
+            ENDCG
+        }
+    }
+}";
+			var shader = ShaderUtil.CreateShaderAsset(shaderSrc, false);
+			var mat    = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+			mat.color  = color;
 			return mat;
 		}
 	}
