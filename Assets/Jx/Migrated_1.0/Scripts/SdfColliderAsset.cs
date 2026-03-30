@@ -91,10 +91,13 @@ namespace XPBD
 			if (!IsBaked)
 				return float.MaxValue;
 
+			// Corner-layout: index ix maps to BoundsMin + ix*CellSize.
+			// No -0.5 offset — that was shifting every sample half a cell
+			// toward the origin, misaligning the collision surface and gradient.
 			Vector3 uvw = new Vector3(
-				(p.x - BoundsMin.x) / BoundsSize.x * ResX - 0.5f,
-				(p.y - BoundsMin.y) / BoundsSize.y * ResY - 0.5f,
-				(p.z - BoundsMin.z) / BoundsSize.z * ResZ - 0.5f);
+				(p.x - BoundsMin.x) / CellSize.x,
+				(p.y - BoundsMin.y) / CellSize.y,
+				(p.z - BoundsMin.z) / CellSize.z);
 
 			int x0 = Mathf.Clamp((int) uvw.x, 0, ResX - 1);
 			int y0 = Mathf.Clamp((int) uvw.y, 0, ResY - 1);

@@ -115,11 +115,13 @@ namespace XPBD
 				}
 			}
 
-			// ── Pass 2: flood-fill outside from boundary ──────────────────
-			// Shell thickness = distance at which flood-fill is blocked.
-			// Use half a cell diagonal to catch thin geometry robustly.
-			float cellDiag   = cellSz.magnitude;
-			float floodShell = cellDiag * 0.5f;
+		// ── Pass 2: flood-fill outside from boundary ──────────────────
+		// Shell thickness = distance at which flood-fill is blocked.
+		// Use half the MINIMUM cell axis — NOT the diagonal — so the fill
+		// can thread through narrow bores (pipe interior).  The diagonal
+		// is too thick at low res and classifies the bore as inside,
+		// fracturing the iso-surface.
+		float floodShell = Mathf.Min(cellSz.x, Mathf.Min(cellSz.y, cellSz.z)) * 0.5f;
 
 			// outside[i] = true if voxel is confirmed OUTSIDE via flood fill
 			var outside = new bool[total];
@@ -182,9 +184,11 @@ namespace XPBD
 			for (int i = 0; i < total; i++)
 			{
 				// Winding number confident inside: |w| > 2π
-				bool windingInside   = Mathf.Abs(wind[i]) > Mathf.PI * 2f;
+				// π is the correct Van Oosterom threshold (see file header comment);
+				// 2π was too high for thin-shell pipe walls at res=32.
+				bool windingInside   = Mathf.Abs(wind[i]) > Mathf.PI;
 				// Winding number ambiguous inside: π < |w| <= 2π (thin shells)
-				bool windingMaybeIn  = Mathf.Abs(wind[i]) > Mathf.PI;
+				bool windingMaybeIn  = Mathf.Abs(wind[i]) > Mathf.PI * 0.5f;
 				// Flood-fill says outside
 				bool floodOutside    = outside[i];
 
