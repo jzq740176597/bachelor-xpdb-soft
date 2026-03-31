@@ -4,12 +4,19 @@
 // Renders a 3D marching-cubes iso-surface preview in the Scene view
 // when any XpbdSdfCollider component using this asset is selected.
 //
-// Two surfaces are drawn:
-//   GREEN  (iso = 0)     — the contact surface. Soft particles crossing here get pushed out.
-//   RED    (iso = -skin) — the interior solid. Anything inside is deeply penetrating.
+// One mesh (iso = 0), drawn in up to two independent passes:
 //
-// The preview is rebuilt only when the asset changes or the user clicks Bake.
-// It is NOT built at runtime — editor only.
+//   OUTER pass — Cull Front OFF, Cull Back ON  (front faces only)
+//     GREEN. Shows the contact surface — the boundary particles collide against.
+//     Visible from outside the collider looking in.
+//
+//   INNER pass — Cull Front ON, Cull Back OFF  (back faces only)
+//     RED. Shows the interior wall face — the inward-facing side of the shell.
+//     Visible from inside the collider looking out.
+//
+// Each pass is independently toggled by a checkbox and has its own alpha.
+// Because each pass renders a different set of faces, they never compete
+// for the same pixel → zero Z-fighting, no depth-bias tricks needed.
 
 #if UNITY_EDITOR
 using UnityEngine;
@@ -24,32 +31,30 @@ namespace XPBD
 		SerializedProperty _bakePadding;
 		SerializedProperty _sourceMesh;
 
-		// Preview meshes (local-space, rebuilt on bake)
-		Mesh _surfaceMesh;   // iso = 0,      green — contact surface
-		Mesh _interiorMesh;  // iso = auto,   red   — wall material mid-depth
+		// Single mesh, two materials for independent face-set rendering
+		Mesh     _surfaceMesh;
+		Material _outerMat;   // Cull Back  — front faces — GREEN
+		Material _innerMat;   // Cull Front — back faces  — RED
 
 		// Inspector controls
 		bool  _showPreviewInScene = true;
-		float _surfaceAlpha       = 0.35f;
-		float _interiorAlpha      = 0.20f;
-
-		// Materials — created once, shared across repaint calls
-		Material _surfaceMat;
-		Material _interiorMat;
+		bool  _showOuter          = true;
+		bool  _showInner          = true;
+		float _outerAlpha         = 0.40f;
+		float _innerAlpha         = 0.35f;
 
 		void OnEnable()
 		{
 			_bakeResolution = serializedObject.FindProperty("BakeResolution");
 			_bakePadding    = serializedObject.FindProperty("BakePadding");
-			// [3/28/2026 jzq]
-			_sourceMesh = serializedObject.FindProperty("SourceMesh");
-			
-			_surfaceMat  = CreateTransparentMat(new Color(0.1f, 0.9f, 0.2f, _surfaceAlpha));
-			_interiorMat = CreateTransparentMat(new Color(0.9f, 0.1f, 0.1f, _interiorAlpha));
+			_sourceMesh     = serializedObject.FindProperty("SourceMesh");
+
+			_outerMat = MakeMat(new Color(0.1f, 0.9f, 0.2f, _outerAlpha), cullFront: false);
+			_innerMat = MakeMat(new Color(0.9f, 0.2f, 0.1f, _innerAlpha), cullFront: true);
 
 			var asset = (SdfColliderAsset)target;
 			if (asset.IsBaked)
-				RebuildPreviewMeshes(asset);
+				RebuildMesh(asset);
 
 			SceneView.duringSceneGui += OnSceneGUI;
 		}
@@ -58,9 +63,8 @@ namespace XPBD
 		{
 			SceneView.duringSceneGui -= OnSceneGUI;
 			DestroyImmediate(_surfaceMesh);
-			DestroyImmediate(_interiorMesh);
-			DestroyImmediate(_surfaceMat);
-			DestroyImmediate(_interiorMat);
+			DestroyImmediate(_outerMat);
+			DestroyImmediate(_innerMat);
 		}
 
 		public override void OnInspectorGUI()
@@ -72,7 +76,6 @@ namespace XPBD
 			serializedObject.Update();
 			EditorGUILayout.PropertyField(_bakeResolution);
 			EditorGUILayout.PropertyField(_bakePadding);
-			// [3/28/2026 jzq]
 			{
 				EditorGUI.BeginChangeCheck();
 				EditorGUILayout.PropertyField(_sourceMesh);
@@ -85,9 +88,6 @@ namespace XPBD
 			}
 			serializedObject.ApplyModifiedProperties();
 
-			//_sourceMesh = (Mesh) EditorGUILayout.ObjectField(
-			//	"Source Mesh", _sourceMesh, typeof(Mesh), false);
-
 			// ── Status ────────────────────────────────────────────────────
 			EditorGUILayout.Space(6);
 			EditorGUILayout.LabelField("Status", EditorStyles.boldLabel);
@@ -95,10 +95,17 @@ namespace XPBD
 			{
 				int   cells = asset.ResX * asset.ResY * asset.ResZ;
 				float kb    = cells * 4f / 1024f;
+				int negCount = 0;
+				foreach (float v in asset.SdfGrid)
+					if (v < 0f) negCount++;
 				EditorGUILayout.HelpBox(
 					$"Baked  {asset.ResX}×{asset.ResY}×{asset.ResZ} = {cells:N0} cells  ({kb:F0} KB)\n" +
-					$"Bounds  {asset.BoundsMin:F3}  →  {asset.BoundsMax:F3}",
-					MessageType.Info);
+					$"Bounds  {asset.BoundsMin:F3}  →  {asset.BoundsMax:F3}\n" +
+					$"Signed voxels (interior): {negCount:N0}  " +
+					(negCount == 0
+						? "⚠ zero — re-bake with fixed SdfBaker.cs"
+						: "✓"),
+					negCount == 0 ? MessageType.Warning : MessageType.Info);
 			}
 			else
 			{
@@ -115,7 +122,7 @@ namespace XPBD
 				if (GUILayout.Button("Bake SDF", GUILayout.Height(28)))
 				{
 					DoBake(asset);
-					RebuildPreviewMeshes(asset);
+					RebuildMesh(asset);
 				}
 			}
 			if (!canBake)
@@ -129,59 +136,71 @@ namespace XPBD
 					asset.ResX = asset.ResY = asset.ResZ = 0;
 					EditorUtility.SetDirty(asset);
 					AssetDatabase.SaveAssets();
-					DestroyImmediate(_interiorMesh); _interiorMesh = null;
+					DestroyImmediate(_surfaceMesh); _surfaceMesh = null;
 				}
 			}
 
-			// ── 3D Scene preview controls ─────────────────────────────────
 			if (!asset.IsBaked)
 				return;
 
+			// ── 3D Scene preview controls ─────────────────────────────────
 			EditorGUILayout.Space(8);
 			EditorGUILayout.LabelField("3D Scene Preview", EditorStyles.boldLabel);
 
 			_showPreviewInScene = EditorGUILayout.Toggle("Show in Scene", _showPreviewInScene);
+			if (!_showPreviewInScene)
+				return;
 
 			EditorGUI.BeginChangeCheck();
-			_surfaceAlpha  = EditorGUILayout.Slider("Surface Alpha",  _surfaceAlpha,  0f, 1f);
-			_interiorAlpha = EditorGUILayout.Slider("Interior Alpha", _interiorAlpha, 0f, 1f);
-			if (EditorGUI.EndChangeCheck())
+
+			// Outer surface row
+			using (new EditorGUILayout.HorizontalScope())
 			{
-				_surfaceMat.color  = new Color(0.1f, 0.9f, 0.2f, _surfaceAlpha);
-				_interiorMat.color = new Color(0.9f, 0.1f, 0.1f, _interiorAlpha);
-				RebuildPreviewMeshes(asset);
+				_showOuter  = EditorGUILayout.ToggleLeft(
+					new GUIContent("Outer  (GREEN = front faces, contact surface)"),
+					_showOuter, GUILayout.Width(320));
+				_outerAlpha = EditorGUILayout.Slider(_outerAlpha, 0f, 1f);
 			}
 
-			// Show what interior iso is being used
-			float autoIso = ComputeAutoInteriorIso(asset);
-			string interiorDesc = autoIso < 0f
-				? $"RED   = wall interior (iso = {autoIso:F5}, auto = half cell diagonal depth)."
-				: "RED   = not drawn (thin-shell mesh — wall depth < half cell diagonal, would Z-fight).";
+			// Inner surface row
+			using (new EditorGUILayout.HorizontalScope())
+			{
+				_showInner  = EditorGUILayout.ToggleLeft(
+					new GUIContent("Inner  (RED   = back faces,  wall interior)"),
+					_showInner, GUILayout.Width(320));
+				_innerAlpha = EditorGUILayout.Slider(_innerAlpha, 0f, 1f);
+			}
+
+			if (EditorGUI.EndChangeCheck())
+			{
+				_outerMat.color = new Color(0.1f, 0.9f, 0.2f, _outerAlpha);
+				_innerMat.color = new Color(0.9f, 0.2f, 0.1f, _innerAlpha);
+				SceneView.RepaintAll();
+			}
+
 			EditorGUILayout.HelpBox(
-				"GREEN = contact surface (iso = 0). Particles crossing here get pushed out.\n" +
-				interiorDesc + "\n\n" +
-				"Hollow pipe/bracket: GREEN only — thin shell, no interior mesh drawn.\n" +
-				"Solid sphere/cube:   GREEN outer shell + RED thin ring just inside.\n" +
-				"If RED fills entire interior, re-bake — normals may be flipped in DCC tool.",
+				"One mesh (iso = 0), two independent face-culling passes.\n" +
+				"OUTER: Cull Back  → front faces → green contact surface.\n" +
+				"INNER: Cull Front → back faces  → red interior wall face.\n\n" +
+				"Different face sets → zero Z-fighting by construction.\n" +
+				"Hollow pipe:  outer green shell + inner green bore wall (red between them).\n" +
+				"Solid sphere: outer green shell + inner red hemisphere visible through it.",
 				MessageType.None);
 
-			if (_showPreviewInScene)
-				SceneView.RepaintAll();
+			SceneView.RepaintAll();
 		}
 
 		// ── Scene view rendering ──────────────────────────────────────────────
 
 		void OnSceneGUI(SceneView sv)
 		{
-			if (!_showPreviewInScene)
+			if (!_showPreviewInScene || _surfaceMesh == null)
 				return;
 
 			var asset = (SdfColliderAsset)target;
 			if (!asset.IsBaked)
 				return;
 
-			// Find any XpbdSdfCollider in the scene using this asset to get a transform
-			// for converting local→world. If none found, draw at origin.
 			var colliders = Object.FindObjectsByType<XpbdSdfCollider>(FindObjectsSortMode.None);
 			Matrix4x4 localToWorld = Matrix4x4.identity;
 			foreach (var col in colliders)
@@ -193,67 +212,24 @@ namespace XPBD
 				}
 			}
 
-			if (_surfaceMesh != null && _surfaceMat != null)
+			// Draw inner pass first (back faces, red) so it is behind outer pass
+			// in painter's-algorithm order. Depth test handles the rest.
+			if (_showInner && _innerMat != null)
 			{
-				_surfaceMat.SetPass(0);
+				_innerMat.SetPass(0);
 				Graphics.DrawMeshNow(_surfaceMesh, localToWorld);
 			}
-			if (_interiorMesh != null && _interiorMat != null)
+			if (_showOuter && _outerMat != null)
 			{
-				_interiorMat.SetPass(0);
-				Graphics.DrawMeshNow(_interiorMesh, localToWorld);
+				_outerMat.SetPass(0);
+				Graphics.DrawMeshNow(_surfaceMesh, localToWorld);
 			}
 		}
 
-		void RebuildPreviewMeshes(SdfColliderAsset asset)
+		void RebuildMesh(SdfColliderAsset asset)
 		{
 			DestroyImmediate(_surfaceMesh);
-			DestroyImmediate(_interiorMesh);
-			_surfaceMesh  = SdfMarchingCubes.Extract(asset, 0f);
-			// Only draw interior mesh for solid/thick-wall objects.
-			// For thin shells (pipe) the negative region is < cellDiag deep —
-			// the interior iso would land on top of the green surface → Z-fighting fracture.
-			float autoIso = ComputeAutoInteriorIso(asset);
-			_interiorMesh = autoIso < 0f ? SdfMarchingCubes.Extract(asset, autoIso) : null;
-		}
-
-		// Returns the iso-level for the red interior preview mesh, or 0 if the
-		// negative region is too thin to draw without Z-fighting the green surface.
-		//
-		// Rule:
-		//   • If the deepest negative value is shallower than half a cell diagonal
-		//     (thin-shell mesh: pipe, bracket, hollow box) → return 0 (skip interior).
-		//   • Otherwise (solid mesh: sphere, cube, terrain) → use half the cell diagonal
-		//     as the interior depth, clamped so it never exceeds the actual data range.
-		//
-		// Using cellDiag*0.5 as interior depth gives a thin but visible red ring just
-		// inside the green surface on any solid shape, regardless of its size.
-		// It does NOT use minVal*0.5 (which would fill a huge interior on large solids).
-		static float ComputeAutoInteriorIso(SdfColliderAsset asset)
-		{
-			if (!asset.IsBaked)
-				return 0f;
-
-			// Find the most-negative SDF value in the grid
-			float minVal = 0f;
-			foreach (float v in asset.SdfGrid)
-			{
-				if (v < minVal)
-					minVal = v;
-			}
-
-			float cellDiag  = asset.CellSize.magnitude;
-			float halfDiag  = cellDiag * 0.5f;
-
-			// Thin shell: wall depth < half cell diagonal → surfaces would coincide → skip
-			if (-minVal < halfDiag)
-				return 0f;
-
-			// Solid/thick: clamp interior iso to half-diagonal depth so the red ring
-			// is always thin regardless of how large the solid interior is
-			float iso = -halfDiag;
-			// Don't go deeper than the actual data (shouldn't happen after the clamp, but safe)
-			return Mathf.Max(iso, minVal * 0.99f);
+			_surfaceMesh = SdfMarchingCubes.Extract(asset, 0f);
 		}
 
 		void DoBake(SdfColliderAsset asset)
@@ -266,7 +242,7 @@ namespace XPBD
 				SdfBaker.Bake(_sourceMesh.objectReferenceValue as Mesh, asset);
 				EditorUtility.SetDirty(asset);
 				AssetDatabase.SaveAssets();
-				if (asset.IsBaked) // [3/28/2026 jzq]
+				if (asset.IsBaked)
 					Debug.Log($"[SdfBaker] Done. {asset.ResX}³ = {asset.SdfGrid.Length:N0} cells.", asset);
 			}
 			finally
@@ -275,50 +251,46 @@ namespace XPBD
 			}
 		}
 
-		static Material CreateTransparentMat(Color color)
+		// cullFront=false → Cull Back  → only front faces rendered (outer/green)
+		// cullFront=true  → Cull Front → only back  faces rendered (inner/red)
+		static Material MakeMat(Color color, bool cullFront)
 		{
-			// Build a minimal inline shader that is:
-			//   • Double-sided (Cull Off) — marching cubes normals point outward,
-			//     so backfaces would be culled without this.
-			//   • Alpha-blended transparent
-			//   • Unlit — no lighting needed for a debug visualiser
-			//   • Works in Built-in RP, URP, and HDRP (no pipeline-specific shader needed)
-			const string shaderSrc = @"
-Shader ""Hidden/XPBD_SdfDebug""
-{
-    Properties { _Color (""Color"", Color) = (1,1,1,0.4) }
+			string cull = cullFront ? "Front" : "Back";
+			string shaderSrc = $@"
+Shader ""Hidden/XPBD_SdfDebug_{cull}""
+{{
+    Properties {{ _Color (""Color"", Color) = (1,1,1,0.4) }}
     SubShader
-    {
-        Tags { ""Queue""=""Transparent"" ""RenderType""=""Transparent"" }
+    {{
+        Tags {{ ""Queue""=""Transparent"" ""RenderType""=""Transparent"" }}
         Pass
-        {
-            Cull Off
+        {{
+            Cull {cull}
             ZWrite Off
             Blend SrcAlpha OneMinusSrcAlpha
             CGPROGRAM
             #pragma vertex vert
             #pragma fragment frag
             #include ""UnityCG.cginc""
-            struct v2f { float4 pos : SV_POSITION; float3 nrm : TEXCOORD0; };
+            struct v2f {{ float4 pos : SV_POSITION; float3 nrm : TEXCOORD0; }};
             float4 _Color;
             v2f vert(float4 vertex : POSITION, float3 normal : NORMAL)
-            {
+            {{
                 v2f o;
                 o.pos = UnityObjectToClipPos(vertex);
                 o.nrm = UnityObjectToWorldNormal(normal);
                 return o;
-            }
+            }}
             half4 frag(v2f i) : SV_Target
-            {
-                // Simple diffuse shading so depth is readable (optional)
+            {{
                 float ndotl = abs(dot(normalize(i.nrm), normalize(float3(1,1,-1))));
-                float shade = lerp(0.6, 1.0, ndotl);
+                float shade = lerp(0.55, 1.0, ndotl);
                 return half4(_Color.rgb * shade, _Color.a);
-            }
+            }}
             ENDCG
-        }
-    }
-}";
+        }}
+    }}
+}}";
 			var shader = ShaderUtil.CreateShaderAsset(shaderSrc, false);
 			var mat    = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
 			mat.color  = color;
