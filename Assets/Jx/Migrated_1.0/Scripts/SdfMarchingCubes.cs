@@ -66,9 +66,9 @@ namespace XPBD
 							int cz = iz + CornerOffsets[k].z;
 							val[k] = asset.SdfGrid[cx + cy * rx + cz * rx * ry];
 							pos[k] = bMin + new Vector3(
-								(cx + 0.5f) * cellSz.x,
-								(cy + 0.5f) * cellSz.y,
-								(cz + 0.5f) * cellSz.z);
+								cx * cellSz.x,
+								cy * cellSz.y,
+								cz * cellSz.z);
 						}
 
 						MarchCube(val, pos, isoLevel, asset, verts, norms, indices);

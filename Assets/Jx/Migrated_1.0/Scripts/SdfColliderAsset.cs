@@ -91,9 +91,10 @@ namespace XPBD
 			if (!IsBaked)
 				return float.MaxValue;
 
-			// Corner-layout: index ix maps to BoundsMin + ix*CellSize.
-			// No -0.5 offset — that was shifting every sample half a cell
-			// toward the origin, misaligning the collision surface and gradient.
+			// Corner layout: baker stores index ix at position BoundsMin + ix*CellSize.
+			// Correct UV = (p - BoundsMin) / CellSize — no -0.5 offset.
+			// The old -0.5 shifted every sample half a cell toward origin, misaligning
+			// the collision surface and making the 6-tap gradient point the wrong way.
 			Vector3 uvw = new Vector3(
 				(p.x - BoundsMin.x) / CellSize.x,
 				(p.y - BoundsMin.y) / CellSize.y,

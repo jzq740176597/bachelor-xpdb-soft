@@ -25,12 +25,11 @@ namespace XPBD
 		SerializedProperty _sourceMesh;
 
 		// Preview meshes (local-space, rebuilt on bake)
-		Mesh _surfaceMesh;   // iso = 0,      green
-		Mesh _interiorMesh;  // iso = -_skin,  red
+		Mesh _surfaceMesh;   // iso = 0,      green — contact surface
+		Mesh _interiorMesh;  // iso = auto,   red   — wall material mid-depth
 
 		// Inspector controls
 		bool  _showPreviewInScene = true;
-		float _previewSkin        = 0.05f;  // interior offset in metres
 		float _surfaceAlpha       = 0.35f;
 		float _interiorAlpha      = 0.20f;
 
@@ -144,7 +143,6 @@ namespace XPBD
 			_showPreviewInScene = EditorGUILayout.Toggle("Show in Scene", _showPreviewInScene);
 
 			EditorGUI.BeginChangeCheck();
-			_previewSkin   = EditorGUILayout.Slider("Interior Offset (m)", _previewSkin, 0.001f, 0.3f);
 			_surfaceAlpha  = EditorGUILayout.Slider("Surface Alpha",  _surfaceAlpha,  0f, 1f);
 			_interiorAlpha = EditorGUILayout.Slider("Interior Alpha", _interiorAlpha, 0f, 1f);
 			if (EditorGUI.EndChangeCheck())
@@ -154,11 +152,17 @@ namespace XPBD
 				RebuildPreviewMeshes(asset);
 			}
 
+			// Show what interior iso is being used
+			float autoIso = ComputeAutoInteriorIso(asset);
+			string interiorDesc = autoIso < 0f
+				? $"RED   = wall interior (iso = {autoIso:F5}, auto = half cell diagonal depth)."
+				: "RED   = not drawn (thin-shell mesh — wall depth < half cell diagonal, would Z-fight).";
 			EditorGUILayout.HelpBox(
-				"GREEN = contact surface (iso = 0). Particles crossing this get pushed out.\n" +
-				"RED   = solid interior (iso = −offset). Deep penetration zone.\n\n" +
-				"Hollow pipe: expect GREEN shells on outer + inner walls, RED band = shell material.\n" +
-				"If bore shows RED, the mesh normals are flipped — flip them in Blender.",
+				"GREEN = contact surface (iso = 0). Particles crossing here get pushed out.\n" +
+				interiorDesc + "\n\n" +
+				"Hollow pipe/bracket: GREEN only — thin shell, no interior mesh drawn.\n" +
+				"Solid sphere/cube:   GREEN outer shell + RED thin ring just inside.\n" +
+				"If RED fills entire interior, re-bake — normals may be flipped in DCC tool.",
 				MessageType.None);
 
 			if (_showPreviewInScene)
@@ -206,7 +210,50 @@ namespace XPBD
 			DestroyImmediate(_surfaceMesh);
 			DestroyImmediate(_interiorMesh);
 			_surfaceMesh  = SdfMarchingCubes.Extract(asset, 0f);
-			_interiorMesh = SdfMarchingCubes.Extract(asset, -_previewSkin);
+			// Only draw interior mesh for solid/thick-wall objects.
+			// For thin shells (pipe) the negative region is < cellDiag deep —
+			// the interior iso would land on top of the green surface → Z-fighting fracture.
+			float autoIso = ComputeAutoInteriorIso(asset);
+			_interiorMesh = autoIso < 0f ? SdfMarchingCubes.Extract(asset, autoIso) : null;
+		}
+
+		// Returns the iso-level for the red interior preview mesh, or 0 if the
+		// negative region is too thin to draw without Z-fighting the green surface.
+		//
+		// Rule:
+		//   • If the deepest negative value is shallower than half a cell diagonal
+		//     (thin-shell mesh: pipe, bracket, hollow box) → return 0 (skip interior).
+		//   • Otherwise (solid mesh: sphere, cube, terrain) → use half the cell diagonal
+		//     as the interior depth, clamped so it never exceeds the actual data range.
+		//
+		// Using cellDiag*0.5 as interior depth gives a thin but visible red ring just
+		// inside the green surface on any solid shape, regardless of its size.
+		// It does NOT use minVal*0.5 (which would fill a huge interior on large solids).
+		static float ComputeAutoInteriorIso(SdfColliderAsset asset)
+		{
+			if (!asset.IsBaked)
+				return 0f;
+
+			// Find the most-negative SDF value in the grid
+			float minVal = 0f;
+			foreach (float v in asset.SdfGrid)
+			{
+				if (v < minVal)
+					minVal = v;
+			}
+
+			float cellDiag  = asset.CellSize.magnitude;
+			float halfDiag  = cellDiag * 0.5f;
+
+			// Thin shell: wall depth < half cell diagonal → surfaces would coincide → skip
+			if (-minVal < halfDiag)
+				return 0f;
+
+			// Solid/thick: clamp interior iso to half-diagonal depth so the red ring
+			// is always thin regardless of how large the solid interior is
+			float iso = -halfDiag;
+			// Don't go deeper than the actual data (shouldn't happen after the clamp, but safe)
+			return Mathf.Max(iso, minVal * 0.99f);
 		}
 
 		void DoBake(SdfColliderAsset asset)

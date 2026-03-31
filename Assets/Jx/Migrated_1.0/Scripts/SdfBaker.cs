@@ -2,26 +2,35 @@
 //
 // Bakes a Mesh into a signed-distance-field grid stored in SdfColliderAsset.
 //
-// ── Sign determination: two-pass robust method ────────────────────────────────
-// Pass 1 — Generalized winding number (Van Oosterom & Strackee):
-//   Accumulates signed solid angles. Robust for closed + thin-shell meshes.
-//   Threshold: |winding| > π (not 2π) — catches thin shells at grazing angles.
+// ── Sign determination: flood-fill only ───────────────────────────────────────
+// Pass 1 — Unsigned distance:
+//   Per-voxel minimum distance to any mesh triangle. Always positive.
 //
-// Pass 2 — Flood-fill from grid boundary:
-//   Any voxel reachable from the 6 grid-face boundaries without crossing the
-//   zero-distance shell is definitively OUTSIDE. This corrects winding-number
-//   failures on open meshes (missing end-caps, non-manifold geometry).
-//   Algorithm: 6-connected BFS starting from all boundary voxels.
-//   A voxel is "blocked" (interior) when its unsigned dist < floodFillShell,
-//   which is set to one cell diagonal — just wide enough to stop the fill
-//   at the surface without leaking through thin geometry.
+// Pass 2 — Flood-fill from grid boundary (6-connected BFS):
+//   Seeds all 6 grid-face boundary voxels that are not too close to the surface,
+//   then propagates inward. Any voxel reachable from the boundary without
+//   crossing the surface shell is OUTSIDE.
 //
-// The two passes are combined: a voxel is inside only if BOTH agree, OR
-// if the winding number is confident (|w| > 2π) regardless of flood-fill.
-// This makes the bake work correctly for:
-//   • Solid primitives (sphere, cube)           — winding number suffices
-//   • Thin shells (pipe, bracket, hollow box)   — flood-fill prevents bore leakage
-//   • Open meshes (no bottom cap)               — flood-fill marks open space outside
+//   A voxel stops the BFS ("blocked") when dist < floodShell, where floodShell
+//   = half the shortest cell axis. Using the minimum axis (not the diagonal)
+//   ensures the fill threads through narrow bores at low resolution.
+//
+//   After BFS: not-reached voxels ARE the mesh wall material → sign negative.
+//
+// ── Why winding number was removed ────────────────────────────────────────────
+// The original design combined flood-fill with a winding-number gate:
+//   inside = windingInside  OR  (!floodOutside AND windingMaybeIn)
+// This fails completely for open-ended meshes (e.g. a pipe with no end-caps):
+//   • Winding number → ~0 everywhere (solid angles from opposite walls cancel).
+//   • windingInside=false, windingMaybeIn=false for ALL voxels.
+//   • Even wall-material voxels enclosed by the flood-fill shell get inside=false.
+//   • Result: zero negative voxels, pure unsigned SDF, no collision response.
+//
+// The flood-fill alone is the correct and sufficient criterion:
+//   • Open bore   → fill enters through open pipe ends → bore marked outside ✓
+//   • Wall material → blocked by shell → not reached → signed negative ✓
+//   • Outside space → fill reaches from boundary → signed positive ✓
+//   • Solid meshes → fill stops at surface everywhere → interior signed negative ✓
 
 using System.Collections.Generic;
 using UnityEngine;
@@ -69,24 +78,18 @@ namespace XPBD
 			var tv0  = new Vector3[triCount];
 			var tv1  = new Vector3[triCount];
 			var tv2  = new Vector3[triCount];
-			var tnrm = new Vector3[triCount];
 			for (int t = 0; t < triCount; t++)
 			{
-				var a = verts[tris[t * 3]];
-				var b = verts[tris[t * 3 + 1]];
-				var c = verts[tris[t * 3 + 2]];
-				tv0[t]  = a;
-				tv1[t]  = b;
-				tv2[t]  = c;
-				tnrm[t] = Vector3.Cross(b - a, c - a);
+				tv0[t] = verts[tris[t * 3]];
+				tv1[t] = verts[tris[t * 3 + 1]];
+				tv2[t] = verts[tris[t * 3 + 2]];
 			}
 
 			int     total  = res * res * res;
 			var     dist   = new float[total];   // unsigned distance
-			var     wind   = new float[total];   // winding number
 			Vector3 cellSz = asset.CellSize;
 
-			// ── Pass 1: unsigned distance + winding number ────────────────
+			// ── Pass 1: unsigned distance ─────────────────────────────────
 			for (int iz = 0; iz < res; iz++)
 			{
 				for (int iy = 0; iy < res; iy++)
@@ -99,29 +102,24 @@ namespace XPBD
 							bMin.z + iz * cellSz.z);
 
 						float minDist2 = float.MaxValue;
-						float wSum     = 0f;
 						for (int t = 0; t < triCount; t++)
 						{
 							float d2 = PointTriangleDistSq(p, tv0[t], tv1[t], tv2[t]);
 							if (d2 < minDist2)
 								minDist2 = d2;
-							wSum += SignedSolidAngle(p, tv0[t], tv1[t], tv2[t], tnrm[t]);
 						}
 
 						int idx = ix + iy * res + iz * res * res;
 						dist[idx] = Mathf.Sqrt(minDist2);
-						wind[idx] = wSum;
 					}
 				}
 			}
 
-		// ── Pass 2: flood-fill outside from boundary ──────────────────
-		// Shell thickness = distance at which flood-fill is blocked.
-		// Use half the MINIMUM cell axis — NOT the diagonal — so the fill
-		// can thread through narrow bores (pipe interior).  The diagonal
-		// is too thick at low res and classifies the bore as inside,
-		// fracturing the iso-surface.
-		float floodShell = Mathf.Min(cellSz.x, Mathf.Min(cellSz.y, cellSz.z)) * 0.5f;
+			// ── Pass 2: flood-fill outside from boundary ──────────────────
+			// Block the BFS at voxels closer than half the shortest cell axis.
+			// Using the minimum axis (not the diagonal) lets the fill thread
+			// through narrow bores without being blocked by overly thick walls.
+			float floodShell = Mathf.Min(cellSz.x, Mathf.Min(cellSz.y, cellSz.z)) * 0.5f;
 
 			// outside[i] = true if voxel is confirmed OUTSIDE via flood fill
 			var outside = new bool[total];
@@ -171,7 +169,7 @@ namespace XPBD
 					int nIdx = nx + ny * res + nz * res * res;
 					if (outside[nIdx])
 						continue;
-					// Blocked by surface (dist < floodShell = near the mesh surface)
+					// Blocked by surface shell — this voxel is wall material
 					if (dist[nIdx] < floodShell)
 						continue;
 					outside[nIdx] = true;
@@ -179,32 +177,16 @@ namespace XPBD
 				}
 			}
 
-			// ── Combine: assign final signed distance ─────────────────────
+			// ── Combine: sign = flood-fill result only ────────────────────
+			// Voxels not reached by flood-fill ARE the mesh wall material.
+			// This works for both open meshes (pipe bores entered through open
+			// ends → bore correctly stays outside) and closed meshes (fill
+			// stops at all surfaces → interior correctly stays inside).
+			// The winding-number gate was removed because it breaks completely
+			// for open-ended meshes where winding → 0 everywhere.
 			var grid = new float[total];
 			for (int i = 0; i < total; i++)
-			{
-				// Winding number confident inside: |w| > 2π
-				// π is the correct Van Oosterom threshold (see file header comment);
-				// 2π was too high for thin-shell pipe walls at res=32.
-				bool windingInside   = Mathf.Abs(wind[i]) > Mathf.PI;
-				// Winding number ambiguous inside: π < |w| <= 2π (thin shells)
-				bool windingMaybeIn  = Mathf.Abs(wind[i]) > Mathf.PI * 0.5f;
-				// Flood-fill says outside
-				bool floodOutside    = outside[i];
-
-				bool inside;
-				if (windingInside)
-					// Strong winding signal — trust it regardless of flood-fill
-					inside = true;
-				else if (floodOutside)
-					// Flood-fill reached here from boundary — definitively outside
-					inside = false;
-				else
-					// Flood-fill didn't reach (enclosed pocket) + maybe winding → inside
-					inside = windingMaybeIn;
-
-				grid[i] = inside ? -dist[i] : dist[i];
-			}
+				grid[i] = outside[i] ? dist[i] : -dist[i];
 
 			asset.SdfGrid = grid;
 			Debug.Log($"[SdfBaker] '{mesh.name}' → {res}³ = {total:N0} cells  " +
@@ -212,23 +194,6 @@ namespace XPBD
 		}
 
 		// ── Geometry helpers ──────────────────────────────────────────────────
-
-		static float SignedSolidAngle(Vector3 p,
-			Vector3 a, Vector3 b, Vector3 c, Vector3 faceNrm)
-		{
-			Vector3 ra = a - p, rb = b - p, rc = c - p;
-			float la = ra.magnitude, lb = rb.magnitude, lc = rc.magnitude;
-			if (la < 1e-10f || lb < 1e-10f || lc < 1e-10f)
-				return 0f;
-			float num   = Vector3.Dot(ra, Vector3.Cross(rb, rc));
-			float denom = la * lb * lc
-				+ Vector3.Dot(ra, rb) * lc
-				+ Vector3.Dot(rb, rc) * la
-				+ Vector3.Dot(rc, ra) * lb;
-			if (Mathf.Abs(denom) < 1e-10f)
-				return 0f;
-			return 2f * Mathf.Atan2(num, denom);
-		}
 
 		static float PointTriangleDistSq(Vector3 p, Vector3 a, Vector3 b, Vector3 c)
 		{
