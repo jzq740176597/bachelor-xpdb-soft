@@ -103,23 +103,37 @@ RWStructuredBuffer<ColConstraint>    _ColConstraints;
 
 // Trilinear sample of SDF at local-space position p.
 // Returns 1e38 if outside the grid bounds.
+//
+// Corner layout: baker stores index i at BoundsMin + i * cellSz,
+// where cellSz = bSz / (res - 1).  This means:
+//   index 0       → BoundsMin
+//   index res - 1 → BoundsMax
+//
+// UV = (p - bMin) / cellSz  maps BoundsMin → 0, BoundsMax → res-1.
+// Do NOT subtract 0.5 (old voxel-centre convention) — that shifts every
+// sample half a cell and completely misses the thin negative shell of
+// a pipe wall at runtime, causing soft-body pass-through.
 float SampleSdf(SdfShapeDescriptor s, float3 p)
 {
-	float3 bMin = s.boundsMin;
-	float3 bMax = s.boundsMax;
-	float3 bSz  = bMax - bMin;
+	float3 bMin   = s.boundsMin;
+	float3 bMax   = s.boundsMax;
+	// cellSz matches baker: bSz / (res - 1), NOT bSz / res
+	float3 cellSz = (bMax - bMin) / float3(
+		max((float)s.resX - 1u, 1u),
+		max((float)s.resY - 1u, 1u),
+		max((float)s.resZ - 1u, 1u));
 
-	// Map p to [0, res-1] continuous coordinates
+	// Map p to corner-layout continuous coordinates [0, res-1]
 	float3 uvw = float3(
-		(p.x - bMin.x) / bSz.x * (float)s.resX - 0.5,
-		(p.y - bMin.y) / bSz.y * (float)s.resY - 0.5,
-		(p.z - bMin.z) / bSz.z * (float)s.resZ - 0.5);
+		(p.x - bMin.x) / cellSz.x,
+		(p.y - bMin.y) / cellSz.y,
+		(p.z - bMin.z) / cellSz.z);
 
-	// Bounds check — outside grid
-	if (uvw.x < -0.5 || uvw.y < -0.5 || uvw.z < -0.5 ||
-		uvw.x > (float)s.resX - 0.5 ||
-		uvw.y > (float)s.resY - 0.5 ||
-		uvw.z > (float)s.resZ - 0.5)
+	// Bounds check — outside grid [0, res-1]
+	if (uvw.x < 0.0 || uvw.y < 0.0 || uvw.z < 0.0 ||
+		uvw.x > (float)(s.resX - 1u) ||
+		uvw.y > (float)(s.resY - 1u) ||
+		uvw.z > (float)(s.resZ - 1u))
 		return 1e38;
 
 	int3 i0 = clamp((int3)floor(uvw),    int3(0,0,0), int3(s.resX-1, s.resY-1, s.resZ-1));
@@ -147,11 +161,15 @@ float SampleSdf(SdfShapeDescriptor s, float3 p)
 
 // Central-difference gradient of SDF at local position p.
 // Result is NOT normalised — caller normalises for the contact normal.
-// Uses one-cell step size for accuracy vs noise trade-off.
+// Step size = one cell width per axis (matches baker corner layout).
+// Uses (res - 1) denominator to match baker: cellSz = bSz / (res-1).
 float3 SdfGradient(SdfShapeDescriptor s, float3 p)
 {
-	float3 cellSz = (s.boundsMax - s.boundsMin) / float3(s.resX, s.resY, s.resZ);
-	float3 h      = cellSz;
+	float3 cellSz = (s.boundsMax - s.boundsMin) / float3(
+		max((float)s.resX - 1u, 1u),
+		max((float)s.resY - 1u, 1u),
+		max((float)s.resZ - 1u, 1u));
+	float3 h = cellSz;
 
 	float dx = SampleSdf(s, p + float3(h.x, 0, 0)) - SampleSdf(s, p - float3(h.x, 0, 0));
 	float dy = SampleSdf(s, p + float3(0, h.y, 0)) - SampleSdf(s, p - float3(0, h.y, 0));
