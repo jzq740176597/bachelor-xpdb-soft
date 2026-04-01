@@ -75,6 +75,12 @@ namespace XPBD
 			get; private set;
 		}
 
+		// World-to-local from the PREVIOUS substep.
+		// Used by SdfDetect for collider-motion CCD: pStart is transformed
+		// with this matrix so a fast-moving collider hitting a slow particle
+		// is detected even when the particle barely moves.
+		public Matrix4x4 PrevWorldToLocal { get; private set; }
+
 		// Descriptor uploaded to _sdfShapesBuffer each substep.
 		public SdfShapeDescriptorCPU Descriptor
 		{
@@ -152,7 +158,8 @@ namespace XPBD
 
 			// World-to-local for GPU: transforms world-space particle position into
 			// the SDF grid's local space for sampling.
-			WorldToLocal = transform.worldToLocalMatrix;
+			PrevWorldToLocal = WorldToLocal;  // save before update (collider-motion CCD)
+			WorldToLocal     = transform.worldToLocalMatrix;
 
 			// Surface velocity for kinematic coupling
 			Vector3 surfVel = Vector3.zero;
@@ -161,14 +168,35 @@ namespace XPBD
 			else if (ColliderType == XpbdColliderSource.ColType.Kinematic)
 				surfVel = Vector3.zero; // filled by manager sweep if needed
 
+			// ── World-space AABB for broad-phase reject ──────────────────
+			// Transform all 8 local-space corners to world space and take
+			// the min/max. This correctly handles rotation and non-uniform scale.
+			// The old code (localExtents * lossyScale) only worked for axis-aligned
+			// transforms — a 45° rotated pipe had 40% underestimated Z extents,
+			// causing broad-phase false rejects and pass-through.
+			Vector3 bMin = SdfAsset.BoundsMin;
+			Vector3 bMax = SdfAsset.BoundsMax;
+			Vector3 worldMin =  Vector3.one * float.MaxValue;
+			Vector3 worldMax = -Vector3.one * float.MaxValue;
+			for (int cx = 0; cx < 2; cx++)
+			for (int cy = 0; cy < 2; cy++)
+			for (int cz = 0; cz < 2; cz++)
+			{
+				Vector3 corner = new Vector3(
+					cx == 0 ? bMin.x : bMax.x,
+					cy == 0 ? bMin.y : bMax.y,
+					cz == 0 ? bMin.z : bMax.z);
+				Vector3 w = transform.TransformPoint(corner);
+				worldMin = Vector3.Min(worldMin, w);
+				worldMax = Vector3.Max(worldMax, w);
+			}
+			Vector3 aabbCentre  = (worldMin + worldMax) * 0.5f;
+			Vector3 aabbExtents = (worldMax - worldMin) * 0.5f;
+
 			Descriptor = new SdfShapeDescriptorCPU
 			{
-				// World-space AABB for broad-phase reject (GPU skips SDF sample if outside)
-				aabbCentre = transform.TransformPoint(
-					(SdfAsset.BoundsMin + SdfAsset.BoundsMax) * 0.5f),
-				aabbExtents = Vector3.Scale(
-					(SdfAsset.BoundsMax - SdfAsset.BoundsMin) * 0.5f,
-					AbsScale(transform.lossyScale)),
+				aabbCentre  = aabbCentre,
+				aabbExtents = aabbExtents,
 
 				// Grid layout
 				sdfDataOffset = (uint) SdfDataOffset,

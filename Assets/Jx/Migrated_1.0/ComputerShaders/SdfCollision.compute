@@ -89,8 +89,9 @@ uint  _SdfParticleCount;
 // ── Buffers ───────────────────────────────────────────────────────────────────
 
 StructuredBuffer<SdfShapeDescriptor> _SdfShapes;
-StructuredBuffer<float4x4>           _SdfTransforms;  // world-to-local per shape
-StructuredBuffer<float>              _SdfData;         // flat packed SDF grids
+StructuredBuffer<float4x4>           _SdfTransforms;     // world-to-local this substep
+StructuredBuffer<float4x4>           _SdfPrevTransforms; // world-to-local prev substep (collider-motion CCD)
+StructuredBuffer<float>              _SdfData;            // flat packed SDF grids
 
 StructuredBuffer<Particle>           _Particles;
 StructuredBuffer<PbdPositions>       _Positions;
@@ -182,21 +183,22 @@ float3 SdfGradient(SdfShapeDescriptor s, float3 p)
 // One thread per (SDF shape × particle).
 //
 // ── CCD strategy ─────────────────────────────────────────────────────────────
-// Static-only detection misses fast-moving particles that tunnel through thin
-// SDF shells in a single substep. We use speculative CCD:
-//   1. Sample SDF at pEnd (predict) — normal case.
-//   2. If pEnd is outside (sdf >= contactSkin), also sample along the swept
-//      segment pStart→pEnd at N intermediate points.
-//   3. If any intermediate point is inside, emit contact at that point.
+// Two sources of relative motion must be handled:
+//   A) Particle motion:   pStart→pEnd in world space (particle moved, collider still)
+//   B) Collider motion:   collider moved, particle barely changed in world space
 //
-// This is cheaper than true continuous ray-marching (no iteration needed per
-// point) and robust for typical substep sizes. NumCcdSteps = 3 gives good
-// coverage: checks at 25%, 50%, 75% of the swept path.
+// Both are captured by sweeping in LOCAL space:
+//   localStart = _SdfPrevTransforms[si] * pStart  (particle pos in prev-frame local)
+//   localEnd   = _SdfTransforms[si]    * pEnd     (particle pos in curr-frame local)
+//   Intermediate: lerp(localStart, localEnd, t) — covers BOTH motions in one sweep.
 //
-// Clamped to thin-shell cases only (sdf at pEnd > -contactSkin) to avoid
-// extra samples for particles deep inside a large volume.
+// This correctly handles the Inspector-move scenario: when you drag the pipe
+// in the editor, pStart≈pEnd in world space, but localStart and localEnd differ
+// because the grid has moved under the particle.
+//
+// NumCcdSteps = 4 gives samples at 20%, 40%, 60%, 80% of the local sweep.
 
-#define SDF_CCD_STEPS 3   // intermediate samples along the sweep
+#define SDF_CCD_STEPS 4
 
 [numthreads(GROUP_SIZE, 1, 1)]
 void SdfDetect(uint3 id : SV_DispatchThreadID)
@@ -210,52 +212,52 @@ void SdfDetect(uint3 id : SV_DispatchThreadID)
 	float3 pEnd          = _Positions[pi].predict;
 	float3 pStart        = _Particles[pi].position; // set by Presolve each substep
 
-	// ── World-space AABB broad reject (expanded by contactSkin) ───────────
-	// Use the union of pStart and pEnd bounding box so sweeping particles
-	// are not rejected by the AABB before they reach the surface.
+	// ── World-space AABB broad reject ─────────────────────────────────────
+	// Expand by pStart so a fast-moving collider that was near pStart last
+	// substep is not rejected even if pEnd is still outside the AABB.
 	float3 pMin = min(pStart, pEnd);
 	float3 pMax = max(pStart, pEnd);
 	float3 sweepCentre  = (pMin + pMax) * 0.5;
 	float3 sweepExtents = (pMax - pMin) * 0.5;
-	float3 bDelta = abs(sweepCentre - s.aabbCentre) - (s.aabbExtents + sweepExtents + s.contactSkin);
+	float3 bDelta = abs(sweepCentre - s.aabbCentre)
+	              - (s.aabbExtents + sweepExtents + s.contactSkin);
 	if (bDelta.x > 0.0 || bDelta.y > 0.0 || bDelta.z > 0.0)
 		return;
 
-	float4x4 w2l = _SdfTransforms[si];
+	float4x4 w2l     = _SdfTransforms[si];
+	float4x4 w2lPrev = _SdfPrevTransforms[si];
 
-	// ── Test pEnd (normal static check) ──────────────────────────────────
-	float3 pEndLocal = mul(w2l, float4(pEnd, 1.0)).xyz;
-	float  sdfEnd    = SampleSdf(s, pEndLocal);
+	// ── Local-space sweep endpoints ───────────────────────────────────────
+	// pStart in previous-frame local space, pEnd in current-frame local space.
+	// Lerping between these captures BOTH particle motion AND collider motion.
+	float3 localStart = mul(w2lPrev, float4(pStart, 1.0)).xyz;
+	float3 localEnd   = mul(w2l,     float4(pEnd,   1.0)).xyz;
 
-	float3 contactWorld = pEnd;
-	float3 contactLocal = pEndLocal;
+	// ── Static check at pEnd ──────────────────────────────────────────────
+	float  sdfEnd     = SampleSdf(s, localEnd);
+	float3 contactLocal = localEnd;
 	float  sdfContact   = sdfEnd;
 	bool   hit          = (sdfEnd < s.contactSkin);
 
-	// ── CCD sweep: check intermediate points pStart→pEnd ─────────────────
-	// Only needed when pEnd is outside (no static contact) or just inside skin.
-	// Skips when particle is already deep inside — no tunnelling possible there.
+	// ── CCD sweep in local space ──────────────────────────────────────────
+	// Always run unless particle is already deeply inside (no tunnelling possible).
 	if (!hit || sdfEnd > -s.contactSkin * 2.0)
 	{
 		[unroll]
 		for (int step = 1; step <= SDF_CCD_STEPS; step++)
 		{
-			float   t      = (float)step / (float)(SDF_CCD_STEPS + 1);
-			float3  pMid   = lerp(pStart, pEnd, t);
-			float3  pLocal = mul(w2l, float4(pMid, 1.0)).xyz;
-			float   sdfMid = SampleSdf(s, pLocal);
+			float  t      = (float)step / (float)(SDF_CCD_STEPS + 1);
+			float3 pLocal = lerp(localStart, localEnd, t);
+			float  sdfMid = SampleSdf(s, pLocal);
 
 			if (sdfMid < s.contactSkin)
 			{
-				// Prefer the earliest contact along the sweep (smallest t).
-				// Since we iterate t in increasing order, the first hit found is earliest.
 				if (!hit || sdfMid < sdfContact)
 				{
-					contactWorld = pMid;
 					contactLocal = pLocal;
 					sdfContact   = sdfMid;
 					hit          = true;
-					break; // earliest contact found
+					break; // earliest contact first
 				}
 			}
 		}
@@ -264,16 +266,32 @@ void SdfDetect(uint3 id : SV_DispatchThreadID)
 	if (!hit)
 		return;
 
+	// ── Contact point in world space ──────────────────────────────────────
+	// Use the inverse (local-to-world) of current transform.
+	// For the contact world position we approximate with pEnd adjusted by
+	// the SDF depth along the world-space normal (computed below).
+	// We store contactLocal for gradient computation.
+	float4x4 l2w = transpose(w2l); // only valid for orthogonal; fine for rigid bodies
+	// Actually reconstruct world contact as lerped world position at hit t.
+	// Re-derive t from contactLocal:
+	float3 localDelta = localEnd - localStart;
+	float  localLen   = length(localDelta);
+	float  hitT       = localLen > 1e-6
+	                  ? saturate(dot(contactLocal - localStart, localDelta) / (localLen * localLen))
+	                  : 1.0;
+	float3 contactWorld = lerp(pStart, pEnd, hitT);
+
 	// ── Contact normal via SDF gradient ──────────────────────────────────
 	float3 gradLocal = SdfGradient(s, contactLocal);
 	float  gradLen   = length(gradLocal);
 	float3 nrmLocal  = gradLen > EPSILON ? gradLocal / gradLen : float3(0, 1, 0);
 
-	// Transform normal to world space via inverse-transpose of w2l
-	float3x3 w2l3    = (float3x3)w2l;
+	// Transform normal local→world via inverse-transpose of w2l.
+	// For rigid bodies (orthogonal transforms) this equals transpose(w2l).
+	float3x3 w2l3     = (float3x3)w2l;
 	float3   nrmWorld = normalize(mul(transpose(w2l3), nrmLocal));
 
-	// Contact point on the surface
+	// Contact point on the surface (push outward by sdfContact which is negative inside)
 	float3 cp = contactWorld - sdfContact * nrmWorld;
 
 	// ── Emit constraint ───────────────────────────────────────────────────

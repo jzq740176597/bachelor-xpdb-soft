@@ -1,3 +1,7 @@
+--4-1
+1. pipe sdf easily penetrate when move
+2. possible use generated soft-asset with diff-uniform scaled to create Soft? 
+
 --3-22
 1. small-sphere => hang attach but jittering (with damp = 1)
 2. xpbd-colliderSource => sphereBoxCld Still penetrate even tunnelling when move fast! (ref : PhysX imp ,utilise unity MovePostion()?)

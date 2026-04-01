@@ -168,13 +168,15 @@ namespace XPBD
 		ComputeBuffer _sdfShapesBuffer;
 		// Per-SDF-shape world-to-local matrix buffer.
 		ComputeBuffer _sdfTransformBuffer;
+		ComputeBuffer _sdfPrevTransformBuffer; // previous substep w2l for collider-motion CCD
 
 		int _kSdfDetect;
 		int _sdfTotalCells;
 
 		// CPU scratch arrays
 		SdfShapeDescriptorCPU[] _cpuSdfShapes = Array.Empty<SdfShapeDescriptorCPU>();
-		Matrix4x4[] _cpuSdfTransforms = Array.Empty<Matrix4x4>();
+		Matrix4x4[] _cpuSdfTransforms     = Array.Empty<Matrix4x4>();
+		Matrix4x4[] _cpuSdfPrevTransforms  = Array.Empty<Matrix4x4>();
 
 		// Add SDF to Public API region:
 		public void RegisterSdfCollider(XpbdSdfCollider src)
@@ -216,7 +218,8 @@ namespace XPBD
 				ReleaseSdfBuffers();
 				// stride = sizeof(SdfShapeDescriptorCPU) = 128 bytes
 				_sdfShapesBuffer = new ComputeBuffer(count, 128);
-				_sdfTransformBuffer = new ComputeBuffer(count, 64); // Matrix4x4 = 64 bytes
+				_sdfTransformBuffer     = new ComputeBuffer(count, 64); // Matrix4x4 = 64 bytes
+				_sdfPrevTransformBuffer = new ComputeBuffer(count, 64);
 				_sdfDataBuffer = new ComputeBuffer(Mathf.Max(totalCells, 1), sizeof(float));
 			}
 
@@ -225,6 +228,8 @@ namespace XPBD
 				_cpuSdfShapes = new SdfShapeDescriptorCPU[count];
 			if (_cpuSdfTransforms.Length < count)
 				_cpuSdfTransforms = new Matrix4x4[count];
+			if (_cpuSdfPrevTransforms.Length < count)
+				_cpuSdfPrevTransforms = new Matrix4x4[count];
 
 			int cellIdx = 0;
 			// Temporary float array for SDF data — only reallocate if total changed.
@@ -249,6 +254,9 @@ namespace XPBD
 
 			_sdfShapesBuffer.SetData(_cpuSdfShapes, 0, 0, count);
 			_sdfTransformBuffer.SetData(_cpuSdfTransforms, 0, 0, count);
+			// Initialise prev-transforms to the same value on first build
+			System.Array.Copy(_cpuSdfTransforms, _cpuSdfPrevTransforms, count);
+			_sdfPrevTransformBuffer.SetData(_cpuSdfPrevTransforms, 0, 0, count);
 			if (totalCells > 0)
 				_sdfDataBuffer.SetData(sdfFlat, 0, 0, totalCells);
 		}
@@ -261,11 +269,15 @@ namespace XPBD
 			int count = _sdfColliders.Count;
 			for (int i = 0; i < count; i++)
 			{
-				_cpuSdfTransforms[i] = _sdfColliders[i].transform.worldToLocalMatrix;
+				// Save previous w2l BEFORE refreshing so the compute shader can
+				// detect fast-moving colliders sweeping through slow particles.
+				_cpuSdfPrevTransforms[i] = _cpuSdfTransforms[i];
 				_sdfColliders[i].RefreshDescriptor(_subDT);
-				_cpuSdfShapes[i] = _sdfColliders[i].Descriptor;
+				_cpuSdfTransforms[i] = _sdfColliders[i].WorldToLocal;
+				_cpuSdfShapes[i]     = _sdfColliders[i].Descriptor;
 			}
 			_sdfShapesBuffer.SetData(_cpuSdfShapes, 0, 0, count);
+			_sdfPrevTransformBuffer.SetData(_cpuSdfPrevTransforms, 0, 0, count);
 			_sdfTransformBuffer.SetData(_cpuSdfTransforms, 0, 0, count);
 		}
 
@@ -281,7 +293,8 @@ namespace XPBD
 			SdfCollisionCS.SetInt("_SdfShapeCount", count);
 			SdfCollisionCS.SetInt("_SdfParticleCount", body.ParticleCount);
 			SdfCollisionCS.SetBuffer(_kSdfDetect, "_SdfShapes", _sdfShapesBuffer);
-			SdfCollisionCS.SetBuffer(_kSdfDetect, "_SdfTransforms", _sdfTransformBuffer);
+			SdfCollisionCS.SetBuffer(_kSdfDetect, "_SdfTransforms",     _sdfTransformBuffer);
+			SdfCollisionCS.SetBuffer(_kSdfDetect, "_SdfPrevTransforms", _sdfPrevTransformBuffer);
 			SdfCollisionCS.SetBuffer(_kSdfDetect, "_SdfData", _sdfDataBuffer);
 			SdfCollisionCS.SetBuffer(_kSdfDetect, "_Particles", body.ParticleBuffer);
 			SdfCollisionCS.SetBuffer(_kSdfDetect, "_Positions", body.PositionsBuffer);
@@ -302,6 +315,8 @@ namespace XPBD
 			_sdfShapesBuffer = null;
 			_sdfTransformBuffer?.Release();
 			_sdfTransformBuffer = null;
+			_sdfPrevTransformBuffer?.Release();
+			_sdfPrevTransformBuffer = null;
 		}
 		#endregion //Sdf_Collider
 		// ─────────────────────────────────────────────────────────────────────
