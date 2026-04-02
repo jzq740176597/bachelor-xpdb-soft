@@ -281,33 +281,36 @@ void SdfDetect(uint3 id : SV_DispatchThreadID)
 	                  : 1.0;
 	float3 contactWorld = lerp(pStart, pEnd, hitT);
 
-	// ── Contact normal via SDF gradient ──────────────────────────────────
-	float3 gradLocal = SdfGradient(s, contactLocal);
-	float  gradLen   = length(gradLocal);
-	float3 nrmLocal  = gradLen > EPSILON ? gradLocal / gradLen : float3(0, 1, 0);
+	// ── Re-evaluate SDF at PREDICT (pEnd) position, not CCD hit position ─
+	//
+	// Bug (diagnosed from data): When the pipe moves fast toward a particle,
+	// CCD finds the contact at an intermediate point where sdf ≈ contactSkin.
+	// cp = contactWorld - sdfContact * nrm places the surface point near the
+	// CCD-hit position. SolveCollisions then computes:
+	//   pen = dot(predict - cp, nrm) - contactSkin
+	//       ≈ dot(contactWorld - cp, nrm) - contactSkin
+	//       = sdfContact - contactSkin ≈ 0
+	// Zero correction even though particle is deep inside the wall in the new frame.
+	// The velocity kill also fires weakly (particle barely moved, pipe moved).
+	//
+	// Fix: compute cp and nrm from the CURRENT predict (pEnd in current local frame).
+	// pen = sdfAtPredict - contactSkin correctly reflects how far the particle is
+	// from the skinned surface right now, regardless of pipe or particle speed.
+	// CCD is still used to DETECT the contact; we discard its hit position for correction.
 
-	// ── Approach-aware normal correction (thin-shell fix) ─────────────────
-	// For a thin-shell mesh (pipe wall only 1-2 voxels thick) the central-
-	// difference gradient step spans the ENTIRE wall. When the particle enters
-	// the far voxel of the wall, the gradient flips: it now points OUTWARD
-	// (toward outside), the same direction the particle is travelling.
-	// SolveCollisions then pushes the particle FURTHER through the wall.
-	//
-	// Diagnostic confirmed this exact failure: at snap 3 the particle was
-	// inside the wall (sdf=-0.003) moving in +Z, and the gradient pointed +Z,
-	// so the 0.3mm positional correction advanced the particle further instead
-	// of pushing it back.
-	//
-	// Fix: after computing the gradient normal, check whether it AGREES with
-	// the particle's approach direction. If yes → the gradient has flipped →
-	// negate it so the correction always opposes the incoming motion.
-	//
-	// Threshold 0.1 avoids flipping on grazing contacts (tangential motion).
-	// Only applied when particle is inside the wall (sdfContact < 0), where
-	// the gradient flip can occur. Outside the wall the gradient is reliable.
+	float3 predictLocal = mul(w2l, float4(pEnd, 1.0)).xyz;
+	float  sdfPredict   = SampleSdf(s, predictLocal);
+	float3 gradPredict  = SdfGradient(s, predictLocal);
+	float  gradLen      = length(gradPredict);
+	float3 nrmLocal     = gradLen > EPSILON ? gradPredict / gradLen : float3(0, 1, 0);
+
+	// ── Approach-aware flip: thin-shell normal correction ─────────────────
+	// Diagnostic snap 3: inside wall (sdf=-0.003), gradient pointed +Z (outward),
+	// correction pushed particle FORWARD through wall. Fix: if gradient agrees
+	// with approach direction, negate it. Threshold 0.1 skips grazing contacts.
 	float3 approachLocal = localEnd - localStart;
 	float  approachLen   = length(approachLocal);
-	if (sdfContact < 0.0 && approachLen > EPSILON)
+	if (sdfPredict < 0.0 && approachLen > EPSILON)
 	{
 		float3 approachDir = approachLocal / approachLen;
 		if (dot(nrmLocal, approachDir) > 0.1)
@@ -315,14 +318,13 @@ void SdfDetect(uint3 id : SV_DispatchThreadID)
 	}
 
 	// Transform normal local→world via inverse-transpose of w2l.
-	// For rigid bodies (orthogonal transforms) this equals transpose(w2l).
 	float3x3 w2l3     = (float3x3)w2l;
 	float3   nrmWorld = normalize(mul(transpose(w2l3), nrmLocal));
 
-	// Contact point on the surface (push outward by sdfContact which is negative inside)
-	float3 cp = contactWorld - sdfContact * nrmWorld;
+	// Surface point: project pEnd onto the surface along the normal.
+	float3 cp = pEnd - sdfPredict * nrmWorld;
 
-	// ── Emit constraint ───────────────────────────────────────────────────
+	// ── Emit constraint ──────────────────────────────────────────────
 	uint slot;
 	InterlockedAdd(_ColSize[0], 1u, slot);
 	if (slot >= MAX_CONSTRAINTS)
@@ -336,13 +338,8 @@ void SdfDetect(uint3 id : SV_DispatchThreadID)
 	c.colType      = s.colType;
 	c.dynSlot      = s.dynSlot;
 	c.rbInvMass    = s.rbInvMass;
-	// Encode contactSkin as NEGATIVE sphereRadius.
-	// SolveCollisions checks: sphereRadius < 0 → SDF contact.
-	// It shifts pen by contactSkin so the skin zone becomes a positional
-	// correction zone, not just velocity damping. This is critical for
-	// thin-shell meshes where the wall SDF depth << contactSkin: without
-	// this shift, particles drift through the skin zone uncorrected and
-	// reach the wall with enough elastic momentum to tunnel through.
+	// Negative sphereRadius encodes contactSkin for SolveCollisions:
+	// pen = sdfAtPredict - contactSkin  (correct depth from skinned surface)
 	c.sphereRadius = -s.contactSkin;
 
 	_ColConstraints[slot] = c;
