@@ -286,6 +286,34 @@ void SdfDetect(uint3 id : SV_DispatchThreadID)
 	float  gradLen   = length(gradLocal);
 	float3 nrmLocal  = gradLen > EPSILON ? gradLocal / gradLen : float3(0, 1, 0);
 
+	// ── Approach-aware normal correction (thin-shell fix) ─────────────────
+	// For a thin-shell mesh (pipe wall only 1-2 voxels thick) the central-
+	// difference gradient step spans the ENTIRE wall. When the particle enters
+	// the far voxel of the wall, the gradient flips: it now points OUTWARD
+	// (toward outside), the same direction the particle is travelling.
+	// SolveCollisions then pushes the particle FURTHER through the wall.
+	//
+	// Diagnostic confirmed this exact failure: at snap 3 the particle was
+	// inside the wall (sdf=-0.003) moving in +Z, and the gradient pointed +Z,
+	// so the 0.3mm positional correction advanced the particle further instead
+	// of pushing it back.
+	//
+	// Fix: after computing the gradient normal, check whether it AGREES with
+	// the particle's approach direction. If yes → the gradient has flipped →
+	// negate it so the correction always opposes the incoming motion.
+	//
+	// Threshold 0.1 avoids flipping on grazing contacts (tangential motion).
+	// Only applied when particle is inside the wall (sdfContact < 0), where
+	// the gradient flip can occur. Outside the wall the gradient is reliable.
+	float3 approachLocal = localEnd - localStart;
+	float  approachLen   = length(approachLocal);
+	if (sdfContact < 0.0 && approachLen > EPSILON)
+	{
+		float3 approachDir = approachLocal / approachLen;
+		if (dot(nrmLocal, approachDir) > 0.1)
+			nrmLocal = -nrmLocal;
+	}
+
 	// Transform normal local→world via inverse-transpose of w2l.
 	// For rigid bodies (orthogonal transforms) this equals transpose(w2l).
 	float3x3 w2l3     = (float3x3)w2l;
@@ -308,7 +336,14 @@ void SdfDetect(uint3 id : SV_DispatchThreadID)
 	c.colType      = s.colType;
 	c.dynSlot      = s.dynSlot;
 	c.rbInvMass    = s.rbInvMass;
-	c.sphereRadius = 0.0; // plane mode
+	// Encode contactSkin as NEGATIVE sphereRadius.
+	// SolveCollisions checks: sphereRadius < 0 → SDF contact.
+	// It shifts pen by contactSkin so the skin zone becomes a positional
+	// correction zone, not just velocity damping. This is critical for
+	// thin-shell meshes where the wall SDF depth << contactSkin: without
+	// this shift, particles drift through the skin zone uncorrected and
+	// reach the wall with enough elastic momentum to tunnel through.
+	c.sphereRadius = -s.contactSkin;
 
 	_ColConstraints[slot] = c;
 }

@@ -540,6 +540,19 @@ void SolveCollisions(uint3 id : SV_DispatchThreadID)
 		nrm = dist > EPSILON ? toParticle / dist : c.normal;
 		pen = dist - c.sphereRadius;
 	}
+	else if (c.sphereRadius < 0.0)
+	{
+		// SDF contact: sphereRadius encodes -contactSkin (set in SdfDetect).
+		// Shift pen by contactSkin so the full skin zone triggers positional
+		// correction, not just velocity damping. Without this, elastic forces
+		// rebuild the particle's inward velocity each substep while it drifts
+		// through the 20mm skin zone uncorrected, arriving at the 11mm wall
+		// with enough momentum to tunnel through.
+		// pen < 0 now means: particle is within contactSkin of the surface.
+		float planeDist  = dot(c.contactPt, nrm);
+		float contactSkin = -c.sphereRadius;
+		pen = dot(pos, nrm) - planeDist - contactSkin;
+	}
 	else
 	{
 		float planeDist = dot(c.contactPt, nrm);
